@@ -1,0 +1,35 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024" role="img" aria-label="Crabber">
+  <title>Crabber</title>
+  <!-- Фон: графит -->
+  <rect x="0" y="0" width="1024" height="1024" rx="228" fill="#1B1B1F"/>
+  <g fill="none" stroke="#E0592A" stroke-linecap="round">
+    <!-- Руки -->
+    <path d="M 282 500 Q 196 474 186 392" stroke-width="44"/>
+    <path d="M 742 500 Q 828 474 838 392" stroke-width="44"/>
+    <!-- Лапки -->
+    <path d="M 268 610 L 176 658" stroke-width="36"/>
+    <path d="M 268 672 L 190 738" stroke-width="36"/>
+    <path d="M 756 610 L 848 658" stroke-width="36"/>
+    <path d="M 756 672 L 834 738" stroke-width="36"/>
+    <!-- Стебельки глаз -->
+    <path d="M 436 430 L 408 318" stroke-width="30"/>
+    <path d="M 588 430 L 616 318" stroke-width="30"/>
+  </g>
+  <!-- Клешни -->
+  <circle cx="180" cy="322" r="86" fill="#E0592A"/>
+  <path d="M 180 322 L 112 214 L 232 210 Z" fill="#1B1B1F"/>
+  <circle cx="844" cy="322" r="86" fill="#E0592A"/>
+  <path d="M 844 322 L 912 214 L 792 210 Z" fill="#1B1B1F"/>
+  <!-- Тело-облачко с хвостиком -->
+  <rect x="252" y="414" width="520" height="330" rx="165" fill="#E0592A"/>
+  <path d="M 330 700 L 292 846 L 470 736 Z" fill="#E0592A"/>
+  <!-- Глаза -->
+  <circle cx="404" cy="292" r="52" fill="#FFF4EC"/>
+  <circle cx="414" cy="300" r="24" fill="#1B1B1F"/>
+  <circle cx="620" cy="292" r="52" fill="#FFF4EC"/>
+  <circle cx="630" cy="300" r="24" fill="#1B1B1F"/>
+  <!-- Индикатор «печатает…» -->
+  <circle cx="422" cy="580" r="34" fill="#1B1B1F"/>
+  <circle cx="512" cy="580" r="34" fill="#1B1B1F"/>
+  <circle cx="602" cy="580" r="34" fill="#1B1B1F"/>
+</svg>
