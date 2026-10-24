@@ -66,6 +66,8 @@ pub struct Settings {
     pub blind_trust: bool,
     /// Interface scale, 1.0 = 100 %.
     pub ui_scale: f32,
+    /// Launch at login. Read from the OS (registry / autostart file), not stored in app.db.
+    pub autostart: bool,
 }
 
 impl Settings {
@@ -78,6 +80,7 @@ impl Settings {
             auto_download: flag("auto_download"),
             blind_trust: flag("blind_trust"),
             ui_scale: s.get("ui_scale").and_then(|v| v.parse().ok()).filter(|v: &f32| (0.5..=2.0).contains(v)).unwrap_or(1.0),
+            autostart: desktop::autostart(),
         }
     }
     fn save(&self, s: &Store) {
@@ -1270,6 +1273,39 @@ impl App {
             }
             self.request_download(&url);
         }
+    }
+
+    /// "Save as": copies the downloaded file, or downloads straight to the chosen path.
+    pub fn save_attachment_as(&mut self, url: String, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(sess) = self.sess.as_ref() else { return };
+        let src = sess.store.file_for(&url).filter(|p| p.is_file());
+        let dir = dirs::download_dir().unwrap_or_else(store::data_dir);
+        let dest = cx.prompt_for_new_path(&dir, Some(&file_name(&url)));
+        cx.spawn_in(window, async move |this, cx| {
+            let dest = match dest.await {
+                Ok(Ok(Some(dest))) => dest,
+                // Linux without xdg-desktop-portal: no dialog at all, so say why.
+                Ok(Err(e)) => {
+                    let _ = this.update_in(cx, |_, window, cx| window.push_notification(format!("Не удалось открыть диалог сохранения: {e}"), cx));
+                    return;
+                }
+                _ => return,
+            };
+            let _ = this.update_in(cx, |app, window, cx| match src {
+                Some(src) => {
+                    if let Err(e) = std::fs::copy(&src, &dest) {
+                        window.push_notification(format!("Не удалось сохранить: {e}"), cx);
+                    }
+                }
+                None => {
+                    if let Some(sess) = app.sess.as_mut() {
+                        sess.failed.remove(&url);
+                        sess.send(Cmd::Download { url, path: dest });
+                    }
+                }
+            });
+        })
+        .detach();
     }
 
     pub fn cycle_show(&mut self, cx: &mut Context<Self>) {

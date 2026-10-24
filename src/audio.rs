@@ -192,16 +192,25 @@ pub fn tone(incoming: bool) -> Tone {
     Tone(tx)
 }
 
-/// Ringback is 425 Hz, 1 s on / 4 s off; the incoming ring is two 0.4 s chirps every 3 s.
+/// Kalimba motifs: the incoming ring every 3 s, the ringback (two soft notes) every 2.5 s.
 fn ring_sample(incoming: bool, t: f64) -> f32 {
-    let (period, bursts, freqs): (f64, &[(f64, f64)], &[f64]) =
-        if incoming { (3.0, &[(0.0, 0.4), (0.6, 1.0)], &[660.0, 880.0]) } else { (5.0, &[(0.0, 1.0)], &[425.0]) };
+    use std::f64::consts::TAU;
+    // (start s, MIDI note)
+    const RING: &[(f64, f64)] = &[(0.0, 79.), (0.14, 84.), (0.28, 86.), (0.42, 91.), (0.7, 86.), (0.84, 91.)]; // G5 C6 D6 G6, D6 G6
+    const RINGBACK: &[(f64, f64)] = &[(0.0, 86.), (0.25, 79.)]; // D6, G5
+    let (period, notes, gain) = if incoming { (3.0, RING, 0.169) } else { (2.5, RINGBACK, 0.17) };
     let p = t % period;
-    let Some(&(a, b)) = bursts.iter().find(|(a, b)| (*a..*b).contains(&p)) else { return 0.0 };
-    // 10 ms fade in/out so bursts do not click.
-    let env = ((p - a).min(b - p) / 0.01).min(1.0);
-    let s = freqs.iter().map(|f| (std::f64::consts::TAU * f * t).sin()).sum::<f64>() / freqs.len() as f64;
-    (0.25 * env * s) as f32
+    let s: f64 = notes
+        .iter()
+        .filter(|(a, _)| p >= *a)
+        .map(|&(a, n)| {
+            let (dt, f) = (p - a, 440. * 2f64.powf((n - 69.) / 12.));
+            let env = |attack: f64, decay: f64| (dt / attack).min(1.) * (-dt / decay).exp();
+            // Metal tine: fundamental + an inharmonic overtone that dies fast.
+            env(0.002, 0.45) * (TAU * f * dt).sin() + 0.5 * env(0.001, 0.05) * (TAU * f * 5.4 * dt).sin()
+        })
+        .sum();
+    (gain * s) as f32
 }
 
 fn build_tone<T>(device: &cpal::Device, config: StreamConfig, incoming: bool) -> Result<cpal::Stream, String>
@@ -296,12 +305,12 @@ mod tests {
     #[test]
     fn ring_patterns() {
         let peak = |incoming, from: f64, to: f64| (0..((to - from) * 8000.) as usize).map(|i| ring_sample(incoming, from + i as f64 / 8000.).abs()).fold(0f32, f32::max);
-        assert!(peak(false, 0.1, 0.9) > 0.2, "ringback on");
-        assert_eq!(peak(false, 1.0, 5.0), 0.0, "ringback pause");
-        assert!(peak(false, 5.1, 5.9) > 0.2, "ringback repeats");
-        assert!(peak(true, 0.1, 0.3) > 0.1 && peak(true, 0.7, 0.9) > 0.1, "two chirps");
-        assert_eq!(peak(true, 0.4, 0.6), 0.0, "gap between chirps");
-        assert_eq!(peak(true, 1.0, 3.0), 0.0, "ring pause");
+        for (incoming, period) in [(true, 3.0), (false, 2.5)] {
+            assert!(peak(incoming, 0.0, 0.2) > 0.1, "{incoming}: motif plays");
+            assert!(peak(incoming, 0.0, period) < 0.6, "{incoming}: no clipping");
+            assert!(peak(incoming, period - 0.3, period) < 0.02, "{incoming}: fades out before repeating");
+            assert!(peak(incoming, period, period + 0.2) > 0.1, "{incoming}: repeats");
+        }
     }
 
     #[test]

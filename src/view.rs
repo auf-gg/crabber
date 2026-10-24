@@ -1,4 +1,7 @@
 //! Rendering. Telegram-like layout: chat list on the left, conversation on the right.
+use std::cell::{Cell, RefCell};
+use std::rc::Rc;
+
 use chrono::{Datelike, Local, TimeZone};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::{
@@ -118,12 +121,57 @@ struct Selectable {
     id: ElementId,
     text: SharedString,
     styled: StyledText,
+    /// Clickable URLs: byte range in `text` and the address it opens.
+    links: Vec<(std::ops::Range<usize>, SharedString)>,
 }
 
 impl Selectable {
     fn new(id: impl Into<ElementId>, text: String, highlights: Vec<(std::ops::Range<usize>, HighlightStyle)>) -> Self {
         let text = SharedString::from(text);
-        Self { id: id.into(), styled: StyledText::new(text.clone()).with_highlights(highlights), text }
+        Self { id: id.into(), styled: StyledText::new(text.clone()).with_highlights(highlights), text, links: vec![] }
+    }
+
+    fn links(mut self, links: Vec<(std::ops::Range<usize>, SharedString)>) -> Self {
+        self.links = links;
+        self
+    }
+
+    /// Hand cursor over links; a click (press and release on the same link, nothing selected) opens it.
+    fn paint_links(&self, id: &GlobalElementId, layout: &TextLayout, hitbox: &Hitbox, window: &mut Window) {
+        let pressed = window.with_element_state(id, |s: Option<Rc<RefCell<Option<SharedString>>>>, _| {
+            let s = s.unwrap_or_default();
+            (s.clone(), s)
+        });
+        let link_at = Rc::new({
+            let (layout, links) = (layout.clone(), self.links.clone());
+            move |p: Point<Pixels>| layout.index_for_position(p).ok().and_then(|ix| links.iter().find(|(r, _)| r.contains(&ix)).map(|(_, u)| u.clone()))
+        });
+        let hovering = link_at(window.mouse_position()).is_some();
+        if hovering {
+            window.set_cursor_style(CursorStyle::PointingHand, hitbox);
+        }
+        let at = link_at.clone();
+        window.on_mouse_event(move |ev: &MouseMoveEvent, phase, window, _| {
+            if phase == DispatchPhase::Bubble && at(ev.position).is_some() != hovering {
+                window.refresh();
+            }
+        });
+        let (at, down, hb) = (link_at.clone(), pressed.clone(), hitbox.clone());
+        window.on_mouse_event(move |ev: &MouseDownEvent, phase, window, _| {
+            if phase == DispatchPhase::Bubble && ev.button == MouseButton::Left && hb.is_hovered(window) {
+                *down.borrow_mut() = at(ev.position);
+            }
+        });
+        let hb = hitbox.clone();
+        window.on_mouse_event(move |ev: &MouseUpEvent, phase, window, cx| {
+            if phase != DispatchPhase::Bubble {
+                return;
+            }
+            let Some(url) = pressed.borrow_mut().take() else { return };
+            if hb.is_hovered(window) && link_at(ev.position).as_ref() == Some(&url) && base::TextSelection::selected_text(window, cx).is_empty() {
+                cx.open_url(&url);
+            }
+        });
     }
 }
 
@@ -136,7 +184,7 @@ impl IntoElement for Selectable {
 
 impl Element for Selectable {
     type RequestLayoutState = base::TextSelectionHandle;
-    type PrepaintState = ();
+    type PrepaintState = Hitbox;
 
     fn id(&self) -> Option<ElementId> {
         Some(self.id.clone())
@@ -159,15 +207,19 @@ impl Element for Selectable {
         (self.styled.request_layout(id, iid, window, cx).0, handle)
     }
 
-    fn prepaint(&mut self, id: Option<&GlobalElementId>, iid: Option<&InspectorElementId>, bounds: Bounds<Pixels>, handle: &mut Self::RequestLayoutState, window: &mut Window, cx: &mut gpui_kit::App) {
+    fn prepaint(&mut self, id: Option<&GlobalElementId>, iid: Option<&InspectorElementId>, bounds: Bounds<Pixels>, handle: &mut Self::RequestLayoutState, window: &mut Window, cx: &mut gpui_kit::App) -> Hitbox {
         self.styled.prepaint(id, iid, bounds, &mut (), window, cx);
         let hitbox = window.insert_hitbox(bounds, HitboxBehavior::Normal);
-        let reg = base::TextSelectionRegistration::new(hitbox, bounds).with_text_bounds(vec![bounds]).with_rendered_element(handle, window, cx);
+        let reg = base::TextSelectionRegistration::new(hitbox.clone(), bounds).with_text_bounds(vec![bounds]).with_rendered_element(handle, window, cx);
         handle.register(reg, window, cx);
+        hitbox
     }
 
-    fn paint(&mut self, id: Option<&GlobalElementId>, iid: Option<&InspectorElementId>, bounds: Bounds<Pixels>, handle: &mut Self::RequestLayoutState, _: &mut (), window: &mut Window, cx: &mut gpui_kit::App) {
+    fn paint(&mut self, id: Option<&GlobalElementId>, iid: Option<&InspectorElementId>, bounds: Bounds<Pixels>, handle: &mut Self::RequestLayoutState, hitbox: &mut Hitbox, window: &mut Window, cx: &mut gpui_kit::App) {
         let layout = self.styled.layout().clone();
+        if !self.links.is_empty() {
+            self.paint_links(id.expect("Selectable has an id"), &layout, hitbox, window);
+        }
         let before = base::TextSelection::selected_text(window, cx);
         let projection = handle.update_runs(&[base::TextSelectionRun::new(self.text.clone(), layout.clone(), bounds)], cx);
         if before != base::TextSelection::selected_text(window, cx) {
@@ -203,22 +255,44 @@ fn copy_message_selection(compose: &Entity<TextareaState>, window: &mut Window, 
     take
 }
 
-/// Plain text with `inline code` shaded.
+/// Plain text with `inline code` shaded and http(s) links underlined and clickable.
 fn rich_text(id: ElementId, text: &str, code_bg: Hsla) -> AnyElement {
-    let parts: Vec<&str> = text.split('`').collect();
+    let mut parts: Vec<&str> = text.split('`').collect();
     if parts.len() < 3 || parts.len().is_multiple_of(2) {
-        return Selectable::new(id, text.to_string(), vec![]).into_any_element();
+        parts = vec![text];
     }
     let mut plain = String::new();
     let mut highlights = vec![];
+    let mut links = vec![];
     for (i, part) in parts.iter().enumerate() {
         let start = plain.len();
         plain.push_str(part);
-        if i % 2 == 1 && !part.is_empty() {
-            highlights.push((start..plain.len(), HighlightStyle { background_color: Some(code_bg), ..Default::default() }));
+        if i % 2 == 1 {
+            if !part.is_empty() {
+                highlights.push((start..plain.len(), HighlightStyle { background_color: Some(code_bg), ..Default::default() }));
+            }
+            continue;
+        }
+        for r in url_ranges(part) {
+            let r = start + r.start..start + r.end;
+            let underline = UnderlineStyle { thickness: px(1.), ..Default::default() };
+            highlights.push((r.clone(), HighlightStyle { underline: Some(underline), ..Default::default() }));
+            links.push((r.clone(), SharedString::from(plain[r].to_string())));
         }
     }
-    Selectable::new(id, plain, highlights).into_any_element()
+    Selectable::new(id, plain, highlights).links(links).into_any_element()
+}
+
+/// Byte ranges of http(s) URLs in `text`, without trailing punctuation.
+fn url_ranges(text: &str) -> Vec<std::ops::Range<usize>> {
+    text.split_whitespace()
+        .filter_map(|w| {
+            let at = w.find("https://").or_else(|| w.find("http://"))?;
+            let url = w[at..].trim_end_matches([',', '.', ')', '!', '?', ';', ':', '"', '\'', '»']);
+            let start = w.as_ptr() as usize - text.as_ptr() as usize + at;
+            (url.len() > "https://".len()).then(|| start..start + url.len())
+        })
+        .collect()
 }
 
 /// Whether the chat is scrolled up from its last message. `ListState::is_scrolled_to_end`
@@ -1203,19 +1277,28 @@ impl App {
                 })),
             )
             .child(div().pt_1().text_xs().text_color(t.muted_foreground).child("Также Ctrl + «+» / «−», Ctrl + 0 — сбросить"))
+            .child(section("СИСТЕМА"))
+            .child(
+                h_flex().gap_3().py_1().items_center().child(row("Запускать при входе в систему", "Crabber будет открываться автоматически после входа в Windows или Linux")).child(
+                    Switch::new("set-autostart").checked(s.autostart).on_click(cx.listener(|this, v: &bool, w, cx| {
+                        crate::desktop::set_autostart(*v);
+                        this.update_settings(w, cx, |st| st.autostart = crate::desktop::autostart())
+                    })),
+                ),
+            )
             .child(section("УВЕДОМЛЕНИЯ"))
             .child(
-                h_flex().gap_3().py_1().items_center().child(row("Уведомления Windows", "Всплывающие уведомления о новых сообщениях с быстрым ответом")).child(
-                    Switch::new("set-notify").checked(s.notify).on_click(cx.listener(|this, v: &bool, w, cx| {
-                        let v = *v;
+                h_flex().gap_3().py_1().items_center().child(row("Отключить уведомления", "Не показывать всплывающие уведомления о новых сообщениях")).child(
+                    Switch::new("set-notify").checked(!s.notify).on_click(cx.listener(|this, v: &bool, w, cx| {
+                        let v = !*v;
                         this.update_settings(w, cx, |st| st.notify = v)
                     })),
                 ),
             )
             .child(
-                h_flex().gap_3().py_1().items_center().child(row("Показывать текст", "Иначе в уведомлении только «Новое сообщение»")).child(
-                    Switch::new("set-notify-text").checked(s.notify_text).on_click(cx.listener(|this, v: &bool, w, cx| {
-                        let v = *v;
+                h_flex().gap_3().py_1().items_center().child(row("Скрывать текст в уведомлениях", "В уведомлении будет только «Новое сообщение»")).child(
+                    Switch::new("set-notify-text").checked(!s.notify_text).on_click(cx.listener(|this, v: &bool, w, cx| {
+                        let v = !*v;
                         this.update_settings(w, cx, |st| st.notify_text = v)
                     })),
                 ),
@@ -1259,7 +1342,7 @@ impl App {
             })
             .child(section("ФАЙЛЫ"))
             .child(
-                h_flex().gap_3().py_1().items_center().child(row("Загружать фото и текстовые файлы сразу", "Иначе — по нажатию на вложение")).child(
+                h_flex().gap_3().py_1().items_center().child(row("Показывать превью фото и текстовых файлов", "Скачивать их автоматически и показывать прямо в чате. Если выключено, файл скачивается только по нажатию")).child(
                     Switch::new("set-autodl").checked(s.auto_download).on_click(cx.listener(|this, v: &bool, w, cx| {
                         let v = *v;
                         this.update_settings(w, cx, |st| st.auto_download = v)
@@ -1417,11 +1500,20 @@ impl App {
             );
         }
         if let Some(url) = m.url.clone() {
+            let open = url.clone();
             items.push(
                 item("mm-open", IconName::Image, "Открыть", false)
                     .on_click(cx.listener(move |this, _, w, cx| {
                         this.msg_menu = None;
-                        this.open_attachment(url.clone(), w, cx);
+                        this.open_attachment(open.clone(), w, cx);
+                    }))
+                    .into_any_element(),
+            );
+            items.push(
+                item("mm-save", IconName::Download, "Сохранить как…", false)
+                    .on_click(cx.listener(move |this, _, w, cx| {
+                        this.msg_menu = None;
+                        this.save_attachment_as(url.clone(), w, cx);
                     }))
                     .into_any_element(),
             );
@@ -1708,8 +1800,11 @@ impl App {
     fn render_viewer(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let viewer = self.viewer.as_ref()?;
         let t = cx.theme().clone();
+        // Picture size for the click-outside check; None = the content fills its whole box.
+        let mut dims = None;
         let (title, path, body) = match viewer {
             Viewer::Image { path, url, gallery } => {
+                dims = self.img_dims.get(path).copied().or_else(|| image::image_dimensions(path).ok().map(|(w, h)| (w as f32, h as f32)));
                 let pos = gallery.iter().position(|u| u == url);
                 let body = div()
                     .size_full()
@@ -1720,10 +1815,16 @@ impl App {
                         div().size_full().flex().items_center().justify_center().text_color(white()).child("Загрузка...").into_any_element()
                     })
                     .when(pos.is_some_and(|i| i > 0), |d| {
-                        d.child(overlay_icon("viewer-prev", IconName::ChevronLeft).absolute().left_0().top(relative(0.5)).on_click(cx.listener(|this, _, _, cx| this.viewer_step(-1, cx))))
+                        d.child(overlay_icon("viewer-prev", IconName::ChevronLeft).absolute().left_0().top(relative(0.5)).on_click(cx.listener(|this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.viewer_step(-1, cx)
+                        })))
                     })
                     .when(pos.is_some_and(|i| i + 1 < gallery.len()), |d| {
-                        d.child(overlay_icon("viewer-next", IconName::ChevronRight).absolute().right_0().top(relative(0.5)).on_click(cx.listener(|this, _, _, cx| this.viewer_step(1, cx))))
+                        d.child(overlay_icon("viewer-next", IconName::ChevronRight).absolute().right_0().top(relative(0.5)).on_click(cx.listener(|this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.viewer_step(1, cx)
+                        })))
                     });
                 let title = match pos {
                     Some(i) if gallery.len() > 1 => format!("{} · {} из {}", file_name(url), i + 1, gallery.len()),
@@ -1748,6 +1849,27 @@ impl App {
                 (name.clone(), path.clone(), body)
             }
         };
+        // Where the picture (or text) is drawn, captured at prepaint; a click anywhere else closes the viewer.
+        let content = Rc::new(Cell::new(Bounds::default()));
+        let measure = {
+            let content = content.clone();
+            canvas(
+                move |b: Bounds<Pixels>, _, _| {
+                    content.set(match dims {
+                        // object_fit(Contain): scaled to fit and centred.
+                        Some((w, h)) if w > 0. && h > 0. => {
+                            let k = (b.size.width / px(w)).min(b.size.height / px(h));
+                            let sz = size(px(w * k), px(h * k));
+                            Bounds::new(b.center() - point(sz.width / 2., sz.height / 2.), sz)
+                        }
+                        _ => b,
+                    })
+                },
+                |_, _, _, _| {},
+            )
+            .absolute()
+            .inset_0()
+        };
         Some(
             v_flex()
                 .id("viewer")
@@ -1757,6 +1879,12 @@ impl App {
                 .inset_0()
                 .bg(hsla(0., 0., 0., 0.88))
                 .track_focus(&self.viewer_focus)
+                .on_click(cx.listener(move |this, ev: &ClickEvent, _, cx| {
+                    if !content.get().contains(&ev.position()) {
+                        this.viewer = None;
+                        cx.notify();
+                    }
+                }))
                 .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _, cx| {
                     match ev.keystroke.key.as_str() {
                         "escape" => {
@@ -1775,14 +1903,17 @@ impl App {
                         .items_center()
                         .text_color(white())
                         .child(div().flex_1().truncate().font_weight(FontWeight::SEMIBOLD).child(title))
-                        .child(overlay_icon("viewer-folder", IconName::FolderOpen).on_click(move |_, _, cx| cx.reveal_path(&path)))
+                        .child(overlay_icon("viewer-folder", IconName::FolderOpen).on_click(move |_, _, cx| {
+                            cx.stop_propagation();
+                            cx.reveal_path(&path)
+                        }))
                         .child(overlay_icon("viewer-close", IconName::X).on_click(cx.listener(|this, _, _, cx| {
                             this.viewer = None;
                             cx.notify();
                         }))),
                 )
                 // Absolute child of a sized box: otherwise the image grows to its own height and overflows.
-                .child(div().flex_1().min_h_0().px_6().pb_6().child(div().relative().size_full().child(body)))
+                .child(div().flex_1().min_h_0().px_6().pb_6().child(div().relative().size_full().child(body).child(measure)))
                 .into_any_element(),
         )
     }
@@ -1932,6 +2063,37 @@ mod tests {
         assert_eq!(initials("bitcoin_casino"), "BC");
         assert_eq!(initials("Bob"), "B");
         assert_eq!(initials("иван петров"), "ИП");
+    }
+
+    #[test]
+    fn urls_in_text() {
+        let t = "см. https://a.io/x?y=1, и (http://b.ru). не ссылка: http:// ok";
+        let found: Vec<&str> = super::url_ranges(t).into_iter().map(|r| &t[r]).collect();
+        assert_eq!(found, ["https://a.io/x?y=1", "http://b.ru"]);
+    }
+
+    #[test]
+    fn link_click_opens_url() {
+        use gpui_kit::*;
+        struct V;
+        impl Render for V {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div().w(px(400.)).child(super::rich_text("m".into(), "https://example.com tail", black()))
+            }
+        }
+        let mut cx = TestAppContext::single();
+        cx.update(gpui_kit::init);
+        let window = cx.add_window(|window, cx| {
+            let view = cx.new(|_| V);
+            base::Root::new(view, window, cx)
+        });
+        let cx = &mut VisualTestContext::from_window(window.into(), &cx);
+        cx.update(|window, cx| drop(window.draw(cx)));
+        // Click on the plain word after the link: nothing opens.
+        cx.simulate_click(point(px(390.), px(8.)), Modifiers::default());
+        assert_eq!(cx.opened_url(), None);
+        cx.simulate_click(point(px(10.), px(8.)), Modifiers::default());
+        assert_eq!(cx.opened_url().as_deref(), Some("https://example.com"));
     }
 
     #[test]

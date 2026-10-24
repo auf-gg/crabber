@@ -46,7 +46,7 @@ mod imp {
     use windows::Foundation::{IPropertyValue, TypedEventHandler};
     use windows::UI::Notifications::{ToastActivatedEventArgs, ToastNotification, ToastNotificationManager, ToastNotifier};
     use windows::Win32::Foundation::HWND;
-    use windows::Win32::System::Registry::{HKEY_CURRENT_USER, REG_SZ, RegSetKeyValueW};
+    use windows::Win32::System::Registry::{HKEY_CURRENT_USER, REG_SZ, RRF_RT_REG_SZ, RegDeleteKeyValueW, RegGetValueW, RegSetKeyValueW};
     use windows::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID;
     use windows::Win32::UI::WindowsAndMessaging::{IsIconic, IsWindowVisible, SW_HIDE, SW_RESTORE, SetForegroundWindow, ShowWindow};
     use windows::core::{HSTRING, IInspectable, Interface};
@@ -80,6 +80,28 @@ mod imp {
 
     fn wide(s: &str) -> Vec<u16> {
         s.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    const RUN_KEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+
+    /// Launch at login: a value under the per-user Run key.
+    pub fn autostart() -> bool {
+        let (key, name) = (wide(RUN_KEY), wide("Crabber"));
+        unsafe { RegGetValueW(HKEY_CURRENT_USER, windows::core::PCWSTR(key.as_ptr()), windows::core::PCWSTR(name.as_ptr()), RRF_RT_REG_SZ, None, None, None).is_ok() }
+    }
+
+    pub fn set_autostart(on: bool) {
+        let (key, name) = (wide(RUN_KEY), wide("Crabber"));
+        let (key, name) = (windows::core::PCWSTR(key.as_ptr()), windows::core::PCWSTR(name.as_ptr()));
+        unsafe {
+            if !on {
+                let _ = RegDeleteKeyValueW(HKEY_CURRENT_USER, key, name);
+                return;
+            }
+            let Ok(exe) = std::env::current_exe() else { return };
+            let data = wide(&format!("\"{}\"", exe.display()));
+            let _ = RegSetKeyValueW(HKEY_CURRENT_USER, key, name, REG_SZ.0, Some(data.as_ptr() as *const _), (data.len() * 2) as u32);
+        }
     }
 
     /// Registers the app identity so toasts show our name and icon (no installer/shortcut needed).
@@ -248,6 +270,27 @@ mod imp {
     static EVENTS: OnceLock<UnboundedSender<DesktopEvent>> = OnceLock::new();
     static ICON: OnceLock<String> = OnceLock::new();
 
+    /// Launch at login: an XDG autostart entry.
+    fn autostart_file() -> Option<std::path::PathBuf> {
+        dirs::config_dir().map(|d| d.join("autostart").join("crabber.desktop"))
+    }
+
+    pub fn autostart() -> bool {
+        autostart_file().is_some_and(|f| f.is_file())
+    }
+
+    pub fn set_autostart(on: bool) {
+        let Some(file) = autostart_file() else { return };
+        if !on {
+            let _ = std::fs::remove_file(&file);
+            return;
+        }
+        let Ok(exe) = std::env::current_exe() else { return };
+        let entry = format!("[Desktop Entry]\nType=Application\nName=Crabber\nExec=\"{}\"\nIcon=crabber\nTerminal=false\nX-GNOME-Autostart-enabled=true\n", exe.display());
+        let _ = file.parent().map(std::fs::create_dir_all);
+        let _ = std::fs::write(&file, entry);
+    }
+
     fn send(ev: DesktopEvent) {
         if let Some(tx) = EVENTS.get() {
             let _ = tx.unbounded_send(ev);
@@ -377,9 +420,13 @@ mod imp {
     pub fn show_window(_: &mut gpui_kit::Window) {}
     pub fn toggle_window(_: &mut gpui_kit::Window) {}
     pub fn notify(_: &str, _: &str, _: &str, _: Option<&std::path::Path>) {}
+    pub fn autostart() -> bool {
+        false
+    }
+    pub fn set_autostart(_: bool) {}
 }
 
-pub use imp::{Tray, hide_window, notify, set_window, show_window, toggle_window};
+pub use imp::{Tray, autostart, hide_window, notify, set_autostart, set_window, show_window, toggle_window};
 
 /// The sender lets the app raise its own events (an incoming call shows the window).
 pub fn init(data_dir: &std::path::Path) -> (Option<Tray>, UnboundedSender<DesktopEvent>, UnboundedReceiver<DesktopEvent>) {
