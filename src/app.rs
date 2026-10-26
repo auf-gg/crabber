@@ -1246,6 +1246,15 @@ impl App {
         cx.notify();
     }
 
+    /// Double click: puts our `emoji` on, never takes it off.
+    pub fn add_reaction(&mut self, msg_id: &str, emoji: &str, cx: &mut Context<Self>) {
+        let Some(sess) = self.sess.as_ref() else { return };
+        let me = sess.selected.as_deref().map(|p| sess.my_sender(p)).unwrap_or_default();
+        if !sess.reactions.get(msg_id).into_iter().flatten().any(|(s, e)| *s == me && e == emoji) {
+            self.toggle_reaction(msg_id, emoji, cx);
+        }
+    }
+
     /// Adds or removes our `emoji` on a message of the open chat (XEP-0444).
     pub fn toggle_reaction(&mut self, msg_id: &str, emoji: &str, cx: &mut Context<Self>) {
         self.msg_menu = None;

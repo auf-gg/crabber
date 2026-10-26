@@ -1174,6 +1174,17 @@ impl App {
                     cx.notify();
                 }),
             )
+            .when(!is_call(&m), |d| {
+                let id = m.msg_id.clone();
+                d.on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
+                        if ev.click_count == 2 {
+                            this.add_reaction(&id, "❤️", cx);
+                        }
+                    }),
+                )
+            })
             .max_w(relative(0.68))
             .min_w(dp(72.))
             .px_3()
