@@ -15,7 +15,7 @@ use gpui_kit::*;
 use crabber::call::{CallCmd, CallEv, CallState};
 use crabber::store::{self, ChatRow, Msg, Store};
 use crabber::e2e::DeviceInfo;
-use crabber::xmpp::{self, Account, Bookmark, Cmd, Ev};
+use crabber::xmpp::{self, Account, Bookmark, Cmd, Ev, Reply};
 use tokio_xmpp::jid::BareJid;
 use tokio_xmpp::parsers::presence::Show;
 
@@ -141,6 +141,12 @@ pub struct Session {
     pub editing: Option<String>,
     /// Reactions of the open chat: msg_id -> (sender, emoji).
     pub reactions: HashMap<String, Vec<(String, String)>>,
+    /// Message we are answering in the composer (XEP-0461).
+    pub replying: Option<Msg>,
+    /// XEP-0490 read marker per chat (stanza-id), from any of our devices.
+    pub mds: HashMap<String, String>,
+    /// XEP-0191 blocked JIDs; `None` until the server answered (or it has no blocking).
+    pub blocked: Option<HashSet<String>>,
 }
 
 impl Session {
@@ -548,6 +554,9 @@ impl App {
             pgp_contacts: HashMap::new(),
             editing: None,
             reactions: HashMap::new(),
+            replying: None,
+            mds: HashMap::new(),
+            blocked: None,
         };
         for peer in sess.chats.iter().map(|c| c.peer.clone()).chain([jid]).collect::<Vec<_>>() {
             sess.load_avatar(&peer);
@@ -671,6 +680,8 @@ impl App {
         } else if let Some(sess) = self.sess.as_mut().filter(|s| s.editing.is_some()) {
             sess.editing = None;
             self.compose.update(cx, |s, cx| s.set_value("", window, cx));
+        } else if let Some(sess) = self.sess.as_mut().filter(|s| s.replying.is_some()) {
+            sess.replying = None;
         } else if !self.search.read(cx).value().is_empty() {
             self.search.update(cx, |s, cx| s.set_value("", window, cx));
             self.run_search(cx);
@@ -865,9 +876,12 @@ impl App {
                         sess.requests.push(jid);
                     }
                 }
-                Ev::Message { peer, groupchat, msg, archive_id, live, sid } => {
+                Ev::Message { peer, groupchat, mut msg, archive_id, live, sid } => {
                     if let Some(id) = archive_id {
                         sess.store.set("mam_last", &id);
+                    }
+                    if let Some(r) = msg.reply_to.take() {
+                        msg.reply_to = Some(sess.store.resolve(&peer, &r).unwrap_or(r));
                     }
                     let inserted = sess.store.insert_msg(&peer, &msg);
                     // Our own groupchat messages learn their stanza-id from the room's echo.
@@ -886,7 +900,10 @@ impl App {
                         continue;
                     }
                     let viewing = sess.selected.as_deref() == Some(&peer) && active;
-                    if notify && live && !msg.outgoing && !viewing {
+                    // Already read on another device (XEP-0490)?
+                    let read_ts = read_marker_ts(sess, &peer);
+                    let seen = read_ts.is_some_and(|t| msg.ts <= t);
+                    if notify && live && !msg.outgoing && !viewing && !seen {
                         let title = if groupchat { format!("{} — {}", sess.display_name(&peer), msg.sender) } else { sess.display_name(&peer) };
                         let body = match &msg.url {
                             Some(u) if is_image(u) => "Фото".to_string(),
@@ -896,8 +913,13 @@ impl App {
                         };
                         desktop::notify(&peer, &title, &body, Some(&store::avatar_path(&sess.dir, &peer)));
                     }
+                    let marker = sid.is_some() && sess.mds.get(&peer) == sid.as_ref();
+                    // The marked message itself arrived: recount, earlier ones were counted as unread.
+                    let recount = marker.then(|| sess.store.incoming_after(&peer, msg.ts));
                     let chat = sess.ensure_chat(&peer, groupchat);
-                    if !msg.outgoing && !viewing {
+                    if let Some(n) = recount {
+                        chat.unread = n;
+                    } else if !msg.outgoing && !viewing && !seen {
                         chat.unread += 1;
                     }
                     if chat.last.as_ref().is_none_or(|l| l.ts <= msg.ts) {
@@ -916,6 +938,31 @@ impl App {
                     }
                 }
                 Ev::Correct { peer, id, sender, body } => apply_correction(sess, &peer, &id, &sender, &body),
+                Ev::Mds { peer, sid } => {
+                    sess.mds.insert(peer.clone(), sid);
+                    if let Some(ts) = read_marker_ts(sess, &peer) {
+                        let n = sess.store.incoming_after(&peer, ts);
+                        if let Some(c) = sess.chat_mut(&peer)
+                            && c.unread != n
+                        {
+                            c.unread = n;
+                            sess.save(&peer);
+                        }
+                    }
+                }
+                Ev::Blocklist(list) => sess.blocked = Some(list.into_iter().collect()),
+                Ev::Blocked { jid, on } => {
+                    let set = sess.blocked.get_or_insert_default();
+                    match jid {
+                        Some(j) if on => {
+                            set.insert(j);
+                        }
+                        Some(j) => {
+                            set.remove(&j);
+                        }
+                        None => set.clear(),
+                    }
+                }
                 Ev::Reactions { peer, id, sender, emojis } => {
                     if let Some(msg_id) = sess.store.resolve(&peer, &id) {
                         sess.store.set_reactions(&peer, &msg_id, &sender, &emojis);
@@ -1118,6 +1165,7 @@ impl App {
         sess.history = sess.store.history(&peer, limit);
         sess.reactions = sess.store.reactions(&peer);
         sess.editing = None;
+        sess.replying = None;
         self.messages.set_follow_mode(FollowMode::Tail);
         sess.selected = Some(peer);
         sess.typing_sent = None;
@@ -1188,19 +1236,20 @@ impl App {
         let Some(sess) = self.sess.as_mut() else { return };
         let Some(peer) = sess.selected.clone() else { return };
         let editing = sess.editing.take();
+        let replying = sess.replying.take();
         for path in std::mem::take(&mut sess.pending) {
             self.send_file(path);
         }
         match editing {
             Some(id) => self.send_correction(&peer, id, body),
-            None if !body.trim().is_empty() => self.send_body(&peer, body),
+            None if !body.trim().is_empty() => self.send_body(&peer, body, replying),
             None => {}
         }
         self.compose.update(cx, |s, cx| s.set_value("", window, cx));
         cx.notify();
     }
 
-    fn send_body(&mut self, peer: &str, body: String) {
+    fn send_body(&mut self, peer: &str, body: String, replying: Option<Msg>) {
         let Some(sess) = self.sess.as_mut() else { return };
         let peer = peer.to_string();
         let groupchat = sess.chat(&peer).is_some_and(|c| c.is_room);
@@ -1208,8 +1257,43 @@ impl App {
         let id = xmpp::new_id();
         sess.typing_sent = None;
         let enc = sess.chat(&peer).map(|c| c.enc.clone()).unwrap_or_default();
-        sess.send(Cmd::Send { to: peer.clone(), id: id.clone(), body: body.clone(), groupchat, enc });
-        self.push_outgoing(&peer, Msg { msg_id: id, sender, outgoing: true, body, url: None, ts: now_ms(), status: 0, enc: 0, edited: false });
+        let reply = replying.as_ref().map(|r| reply_for(sess, &peer, groupchat, r));
+        sess.send(Cmd::Send { to: peer.clone(), id: id.clone(), body: body.clone(), groupchat, enc, reply });
+        let reply_to = replying.map(|r| r.msg_id);
+        self.push_outgoing(&peer, Msg { msg_id: id, sender, outgoing: true, body, url: None, ts: now_ms(), status: 0, enc: 0, edited: false, reply_to });
+    }
+
+    /// "Reply" from the message menu.
+    pub fn start_reply(&mut self, m: &Msg, window: &mut Window, cx: &mut Context<Self>) {
+        self.msg_menu = None;
+        let Some(sess) = self.sess.as_mut() else { return };
+        if sess.editing.take().is_some() {
+            self.compose.update(cx, |s, cx| s.set_value("", window, cx));
+        }
+        sess.replying = Some(m.clone());
+        self.compose.update(cx, |s, cx| s.focus(window, cx));
+        cx.notify();
+    }
+
+    pub fn cancel_reply(&mut self, cx: &mut Context<Self>) {
+        if let Some(sess) = self.sess.as_mut() {
+            sess.replying = None;
+        }
+        cx.notify();
+    }
+
+    /// XEP-0191: (un)block a contact; `spam` also reports it (XEP-0377).
+    pub fn block(&mut self, jid: String, block: bool, spam: bool, cx: &mut Context<Self>) {
+        let Some(sess) = self.sess.as_mut() else { return };
+        sess.requests.retain(|j| *j != jid);
+        let set = sess.blocked.get_or_insert_default();
+        if block {
+            set.insert(jid.clone());
+        } else {
+            set.remove(&jid);
+        }
+        sess.send(Cmd::Block { jid, block, spam });
+        cx.notify();
     }
 
     fn send_correction(&mut self, peer: &str, id: String, body: String) {
@@ -1230,6 +1314,7 @@ impl App {
         self.msg_menu = None;
         let Some(sess) = self.sess.as_mut() else { return };
         sess.editing = Some(m.msg_id.clone());
+        sess.replying = None;
         let body = m.body.clone();
         self.compose.update(cx, |s, cx| {
             s.set_value(body, window, cx);
@@ -1289,7 +1374,7 @@ impl App {
                 }
             }
             DesktopEvent::Reply(peer, text) => {
-                self.send_body(&peer, text.trim().to_string());
+                self.send_body(&peer, text.trim().to_string(), None);
                 if let Some(sess) = self.sess.as_mut() {
                     read_chat(sess, &peer);
                 }
@@ -1356,7 +1441,7 @@ impl App {
         sess.uploads.insert(id.clone(), path.clone());
         let enc = sess.chat(&peer).map(|c| c.enc.clone()).unwrap_or_default();
         sess.send(Cmd::Upload { to: peer.clone(), id: id.clone(), path, groupchat, enc });
-        self.push_outgoing(&peer, Msg { msg_id: id, sender, outgoing: true, body: format!("Отправка файла {name}..."), url: None, ts: now_ms(), status: 0, enc: 0, edited: false });
+        self.push_outgoing(&peer, Msg { msg_id: id, sender, outgoing: true, body: format!("Отправка файла {name}..."), url: None, ts: now_ms(), status: 0, enc: 0, edited: false, reply_to: None });
     }
 
     pub fn change_avatar(&mut self, cx: &mut Context<Self>) {
@@ -1639,7 +1724,7 @@ impl App {
             None => "Пропущенный звонок".to_string(),
         };
         let sender = if c.outgoing { me } else { c.peer.clone() };
-        let msg = Msg { msg_id: format!("{CALL_ID}{}", xmpp::new_id()), sender, outgoing: c.outgoing, body, url: None, ts: now_ms(), status: 2, enc: 0, edited: false };
+        let msg = Msg { msg_id: format!("{CALL_ID}{}", xmpp::new_id()), sender, outgoing: c.outgoing, body, url: None, ts: now_ms(), status: 2, enc: 0, edited: false, reply_to: None };
         self.push_outgoing(&c.peer, msg);
     }
 }
@@ -1658,6 +1743,13 @@ fn read_chat(sess: &mut Session, peer: &str) {
     if chat.unread > 0 {
         chat.unread = 0;
         sess.save(peer);
+    }
+    // XEP-0490: tell our other devices how far we read.
+    if let Some(sid) = sess.store.last_sid(peer)
+        && sess.mds.get(peer) != Some(&sid)
+    {
+        sess.mds.insert(peer.to_string(), sid.clone());
+        sess.send(Cmd::MarkDisplayed { peer: peer.to_string(), sid, groupchat: is_room });
     }
     if is_room {
         return;
@@ -1711,6 +1803,26 @@ fn apply_contact(sess: &mut Session, c: xmpp::Contact) {
         chat.name = c.name;
     }
     sess.save(&c.jid);
+}
+
+/// Time of the message our XEP-0490 read marker points at, if we have it.
+fn read_marker_ts(sess: &Session, peer: &str) -> Option<i64> {
+    let sid = sess.mds.get(peer)?;
+    let id = sess.store.resolve(peer, sid)?;
+    sess.store.msg(peer, &id).map(|m| m.ts)
+}
+
+/// XEP-0461 reference to `r` plus the quoted fallback for clients without replies.
+fn reply_for(sess: &Session, peer: &str, groupchat: bool, r: &Msg) -> Reply {
+    let (id, to) = if groupchat {
+        (sess.store.sid(peer, &r.msg_id).unwrap_or_else(|| r.msg_id.clone()), format!("{peer}/{}", r.sender))
+    } else {
+        (r.msg_id.clone(), if r.outgoing { sess.me.clone() } else { peer.to_string() })
+    };
+    let name = if groupchat { r.sender.clone() } else if r.outgoing { sess.localpart() } else { sess.display_name(peer) };
+    let text: String = r.url.clone().unwrap_or_else(|| r.body.clone()).lines().take(3).collect::<Vec<_>>().join("\n").chars().take(200).collect();
+    let quote = format!("> {name}: {}\n", text.replace('\n', "\n> "));
+    Reply { id, to, quote }
 }
 
 fn apply_correction(sess: &mut Session, peer: &str, id: &str, sender: &str, body: &str) {

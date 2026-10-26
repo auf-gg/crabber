@@ -80,11 +80,29 @@ pub struct Bookmark {
     pub nick: String,
 }
 
+/// XEP-0461: the message we answer. `quote` is the XEP-0428 fallback text put before the body.
+#[derive(Clone, Debug)]
+pub struct Reply {
+    /// Its id: the room's stanza-id in groups, the message id otherwise.
+    pub id: String,
+    /// Its author: occupant JID in groups, bare JID otherwise.
+    pub to: String,
+    pub quote: String,
+}
+
+pub const NS_REPLY: &str = "urn:xmpp:reply:0";
+const NS_FALLBACK: &str = "urn:xmpp:fallback:0";
+const NS_SID: &str = "urn:xmpp:sid:0";
+
 pub enum Cmd {
     /// Sent by the UI after `Ev::Online`: MAM catch-up point and rooms to rejoin.
     Sync { mam_after: Option<String>, rooms: Vec<(String, String, Option<i64>)> },
     /// `enc`: chat encryption mode — "auto" | "omemo" | "pgp" | "plain".
-    Send { to: String, id: String, body: String, groupchat: bool, enc: String },
+    Send { to: String, id: String, body: String, groupchat: bool, enc: String, reply: Option<Reply> },
+    /// XEP-0490: we read chat `peer` up to the message with stanza-id `sid`.
+    MarkDisplayed { peer: String, sid: String, groupchat: bool },
+    /// XEP-0191 (un)block; `spam` adds an XEP-0377 spam report.
+    Block { jid: String, block: bool, spam: bool },
     /// XEP-0308: new text for our message `replace` (its msg_id).
     Correct { to: String, replace: String, body: String, groupchat: bool, enc: String },
     /// XEP-0444: our full set of reactions to message `id` (MUC stanza-id in groups).
@@ -126,7 +144,7 @@ pub enum Ev {
     Presence { jid: String, online: bool },
     SubscribeRequest { jid: String },
     /// `live`: arrived just now (not from MAM, offline storage or MUC history) — worth a notification.
-    /// `sid`: stanza-id the room assigned (groupchat only).
+    /// `sid`: stanza-id the room (groups) or our archive (1:1) assigned.
     Message { peer: String, groupchat: bool, msg: Msg, archive_id: Option<String>, live: bool, sid: Option<String> },
     /// XEP-0308: `sender` replaced the text of their message `id`.
     Correct { peer: String, id: String, sender: String, body: String },
@@ -136,6 +154,12 @@ pub enum Ev {
     Bookmarks(Option<Vec<Bookmark>>),
     BookmarkAdded(Bookmark),
     BookmarkRemoved { room: String },
+    /// XEP-0490: chat `peer` was read (on any device) up to stanza-id `sid`.
+    Mds { peer: String, sid: String },
+    /// XEP-0191 blocklist at login.
+    Blocklist(Vec<String>),
+    /// Server push: `jid` (un)blocked on some device; `None` with `on: false` = everyone unblocked.
+    Blocked { jid: Option<String>, on: bool },
     Receipt { peer: String, id: String },
     Displayed { peer: String, id: String, by_me: bool },
     Typing { peer: String, who: String, on: bool },
@@ -228,6 +252,8 @@ struct State {
     pgp_presence: Arc<Mutex<Option<String>>>,
     /// Contacts whose signed presence we already looked at this session.
     pgp_seen: HashSet<String>,
+    /// XEP-0084 avatar hash we already have per contact.
+    pep_avatars: HashMap<String, String>,
 }
 
 async fn run(acc: Account, mut cmds: UnboundedReceiver<Cmd>, ev: UnboundedSender<Ev>) {
@@ -252,6 +278,7 @@ async fn run(acc: Account, mut cmds: UnboundedReceiver<Cmd>, ev: UnboundedSender
         e2e: None,
         pgp_presence: Arc::new(Mutex::new(None)),
         pgp_seen: HashSet::new(),
+        pep_avatars: HashMap::new(),
     };
     match e2e::E2e::open(&st.dir, &acc.jid.to_string()) {
         Ok(e) => {
@@ -328,6 +355,9 @@ fn disco_info(node: Option<String>) -> DiscoInfoResult {
         ns::MESSAGE_CORRECT,
         ns::REACTIONS,
         "urn:xmpp:bookmarks:1+notify",
+        "urn:xmpp:mds:displayed:0+notify",
+        "urn:xmpp:avatar:metadata+notify",
+        NS_REPLY,
     ];
     DiscoInfoResult {
         node,
@@ -398,15 +428,17 @@ impl State {
         tokio::spawn(async move { fetch_avatar(&net, &dir, &me).await });
         let net = self.net.clone();
         tokio::spawn(async move {
-            let req = Element::builder("pubsub", ns::PUBSUB).append(Element::builder("items", ns::PUBSUB).attr(nc("node"), ns::BOOKMARKS2)).build();
-            match net.iq(None, IqRequest::Get(req)).await {
-                Ok(el) => {
-                    let list = el.as_ref().and_then(|e| e.get_child("items", ns::PUBSUB)).map(|i| i.children().filter_map(bookmark).collect()).unwrap_or_default();
-                    net.emit(Ev::Bookmarks(Some(list)));
-                }
+            match own_items(&net, ns::BOOKMARKS2).await {
+                Ok(items) => net.emit(Ev::Bookmarks(Some(items.iter().filter_map(bookmark).collect()))),
                 Err(e) if e == "ItemNotFound" => net.emit(Ev::Bookmarks(None)),
                 // No PEP bookmarks on this server: rooms stay local-only.
                 Err(e) => eprintln!("bookmarks: {e}"),
+            }
+            for (peer, sid) in own_items(&net, ns::MDS).await.unwrap_or_default().iter().filter_map(mds_item) {
+                net.emit(Ev::Mds { peer, sid });
+            }
+            if let Ok(Some(el)) = net.iq(None, IqRequest::Get(Element::builder("blocklist", ns::BLOCKING).build())).await {
+                net.emit(Ev::Blocklist(el.children().filter_map(|i| i.attr("jid")).map(String::from).collect()));
             }
         });
         if let Some(e2e) = self.e2e.clone() {
@@ -423,9 +455,32 @@ impl State {
                     self.join(room, nick, since, None);
                 }
             }
-            Cmd::Send { to, id, body, groupchat, enc } => self.send_text(to, id, body, groupchat, enc, None),
+            Cmd::Send { to, id, body, groupchat, enc, reply } => self.send_text(to, id, body, groupchat, enc, None, reply),
             // The correction gets its own stanza id; errors about it then match no stored message.
-            Cmd::Correct { to, replace, body, groupchat, enc } => self.send_text(to, new_id(), body, groupchat, enc, Some(replace)),
+            Cmd::Correct { to, replace, body, groupchat, enc } => self.send_text(to, new_id(), body, groupchat, enc, Some(replace), None),
+            Cmd::MarkDisplayed { peer, sid, groupchat } => {
+                let by = if groupchat { peer.clone() } else { self.me.to_string() };
+                let el = Element::builder("displayed", ns::MDS).append(Element::builder("stanza-id", NS_SID).attr(nc("id"), sid).attr(nc("by"), by)).build();
+                let net = self.net.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = publish_private(&net, ns::MDS, &peer, el).await {
+                        eprintln!("mds publish: {e}");
+                    }
+                });
+            }
+            Cmd::Block { jid, block, spam } => {
+                let mut item = Element::builder("item", ns::BLOCKING).attr(nc("jid"), jid);
+                if spam {
+                    item = item.append(Element::builder("report", "urn:xmpp:reporting:1").attr(nc("reason"), "urn:xmpp:reporting:spam"));
+                }
+                let req = Element::builder(if block { "block" } else { "unblock" }, ns::BLOCKING).append(item).build();
+                let net = self.net.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = net.iq(None, IqRequest::Set(req)).await {
+                        net.emit(Ev::Error(format!("Не удалось изменить блокировку: {e}")));
+                    }
+                });
+            }
             Cmd::React { to, id, emojis, groupchat } => {
                 let mut m = Message::new_with_type(if groupchat { MessageType::Groupchat } else { MessageType::Chat }, jid(&to).map(Jid::from))
                     .with_payload(Reactions { id, reactions: emojis.into_iter().map(|emoji| Reaction { emoji }).collect() })
@@ -437,21 +492,7 @@ impl State {
                 let net = self.net.clone();
                 tokio::spawn(async move {
                     let conf = Conference { autojoin: true, name: (!b.name.is_empty()).then_some(b.name), nick: b.nick.parse().ok(), password: None, extensions: None };
-                    let field = |var: &str, value: &str| Element::builder("field", ns::DATA_FORMS).attr(nc("var"), var).append(Element::builder("value", ns::DATA_FORMS).append(value));
-                    // XEP-0402 node options; whitelist keeps the room list private.
-                    let options = Element::builder("x", ns::DATA_FORMS)
-                        .attr(nc("type"), "submit")
-                        .append(field("FORM_TYPE", "http://jabber.org/protocol/pubsub#publish-options"))
-                        .append(field("pubsub#persist_items", "true"))
-                        .append(field("pubsub#max_items", "max"))
-                        .append(field("pubsub#send_last_published_item", "never"))
-                        .append(field("pubsub#access_model", "whitelist"));
-                    let item = Element::builder("item", ns::PUBSUB).attr(nc("id"), b.room).append(Element::from(conf));
-                    let req = Element::builder("pubsub", ns::PUBSUB)
-                        .append(Element::builder("publish", ns::PUBSUB).attr(nc("node"), ns::BOOKMARKS2).append(item))
-                        .append(Element::builder("publish-options", ns::PUBSUB).append(options))
-                        .build();
-                    if let Err(e) = net.iq(None, IqRequest::Set(req)).await {
+                    if let Err(e) = publish_private(&net, ns::BOOKMARKS2, &b.room, Element::from(conf)).await {
                         eprintln!("bookmark publish: {e}");
                     }
                 });
@@ -638,6 +679,13 @@ impl State {
                         photo: Some(Photo { type_: PhotoType { data: mime(&path).into() }, binval: Binval { data: data.clone() } }),
                         payloads: vec![],
                     };
+                    let hash = caps::hash_caps(&data, Algo::Sha_1).map(|h| h.to_hex()).unwrap_or_default();
+                    let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &data);
+                    let pep = publish(&net, ns::AVATAR_DATA, &hash, Element::builder("data", ns::AVATAR_DATA).append(b64).build()).await;
+                    if pep.is_ok() {
+                        let info = Element::builder("info", ns::AVATAR_METADATA).attr(nc("id"), hash.as_str()).attr(nc("bytes"), data.len().to_string()).attr(nc("type"), mime(&path));
+                        let _ = publish(&net, ns::AVATAR_METADATA, &hash, Element::builder("metadata", ns::AVATAR_METADATA).append(info).build()).await;
+                    }
                     match net.iq(None, IqRequest::Set(vcard.into())).await {
                         Ok(_) => {
                             let _ = tokio::fs::write(store::avatar_path(&dir, &me), data).await;
@@ -745,11 +793,23 @@ impl State {
         self.net.send(self.presence().with_to(full).with_payload(Muc::new().with_history(history)));
     }
 
-    /// Text message, encrypted per `enc`; `replace` makes it an XEP-0308 correction.
-    fn send_text(&self, to: String, id: String, body: String, groupchat: bool, enc: String, replace: Option<String>) {
-        let fix = move |m: Message| match &replace {
-            Some(r) => m.with_payload(Replace { id: Id(r.clone()) }),
-            None => m,
+    /// Text message, encrypted per `enc`; `replace` makes it an XEP-0308 correction, `reply` an XEP-0461 answer.
+    #[allow(clippy::too_many_arguments)]
+    fn send_text(&self, to: String, id: String, body: String, groupchat: bool, enc: String, replace: Option<String>, reply: Option<Reply>) {
+        let body = match &reply {
+            Some(r) => format!("{}{body}", r.quote),
+            None => body,
+        };
+        let fix = move |mut m: Message| {
+            if let Some(r) = &replace {
+                m = m.with_payload(Replace { id: Id(r.clone()) });
+            }
+            if let Some(r) = &reply {
+                let end = r.quote.chars().count().to_string();
+                m.payloads.push(Element::builder("reply", NS_REPLY).attr(nc("to"), r.to.as_str()).attr(nc("id"), r.id.as_str()).build());
+                m.payloads.push(Element::builder("fallback", NS_FALLBACK).attr(nc("for"), NS_REPLY).append(Element::builder("body", NS_FALLBACK).attr(nc("start"), "0").attr(nc("end"), end)).build());
+            }
+            m
         };
         let Some(e2e) = self.e2e.clone().filter(|_| !groupchat && enc != "plain") else {
             return self.net.send(fix(chat_message(&to, &id, body, None, groupchat)));
@@ -796,6 +856,16 @@ impl State {
                         for item in &roster.items {
                             self.net.emit(Ev::RosterItem(contact(item)));
                         }
+                    }
+                    Iq::Result { from: None, to: from, id, payload: None }
+                } else if (payload.is("block", ns::BLOCKING) || payload.is("unblock", ns::BLOCKING)) && from_server {
+                    let on = payload.name() == "block";
+                    let jids: Vec<String> = payload.children().filter_map(|i| i.attr("jid")).map(String::from).collect();
+                    if jids.is_empty() && !on {
+                        self.net.emit(Ev::Blocked { jid: None, on });
+                    }
+                    for j in jids {
+                        self.net.emit(Ev::Blocked { jid: Some(j), on });
                     }
                     Iq::Result { from: None, to: from, id, payload: None }
                 } else if payload.is("jingle", ns::JINGLE) {
@@ -977,10 +1047,35 @@ impl State {
             }
             return;
         }
+        let pep = m.payloads.iter().find(|p| p.is("event", e2e::NS_PUBSUB_EVENT)).and_then(|e| e.get_child("items", e2e::NS_PUBSUB_EVENT));
+        // XEP-0084: a contact (or we, from another device) changed their avatar.
+        if let Some(items) = pep.filter(|i| i.attr("node") == Some(ns::AVATAR_METADATA)) {
+            let who = from.to_bare().to_string();
+            let info = items.children().find_map(|i| i.get_child("metadata", ns::AVATAR_METADATA)).and_then(|md| {
+                // Prefer the PNG every publisher must provide; skip infos that point to an external URL.
+                let infos: Vec<&Element> = md.children().filter(|c| c.is("info", ns::AVATAR_METADATA) && c.attr("url").is_none()).collect();
+                infos.iter().find(|i| i.attr("type") == Some("image/png")).or(infos.first()).and_then(|i| i.attr("id")).map(String::from)
+            });
+            if let Some(hash) = info
+                && self.pep_avatars.get(&who) != Some(&hash)
+            {
+                self.pep_avatars.insert(who.clone(), hash.clone());
+                let (net, dir) = (self.net.clone(), self.dir.clone());
+                tokio::spawn(async move { fetch_pep_avatar(&net, &dir, &who, &hash).await });
+            }
+            return;
+        }
+        // XEP-0490: read state from our other devices.
+        if let Some(items) = pep.filter(|i| i.attr("node") == Some(ns::MDS)) {
+            if outgoing_carbon {
+                for (peer, sid) in items.children().filter_map(mds_item) {
+                    self.net.emit(Ev::Mds { peer, sid });
+                }
+            }
+            return;
+        }
         // XEP-0402 bookmark changes from our other devices; only our own account may send them.
-        if let Some(items) = m.payloads.iter().find(|p| p.is("event", e2e::NS_PUBSUB_EVENT)).and_then(|e| e.get_child("items", e2e::NS_PUBSUB_EVENT))
-            && items.attr("node") == Some(ns::BOOKMARKS2)
-        {
+        if let Some(items) = pep.filter(|i| i.attr("node") == Some(ns::BOOKMARKS2)) {
             if outgoing_carbon {
                 for c in items.children() {
                     match (c.name(), bookmark(c)) {
@@ -1101,6 +1196,10 @@ impl State {
             return;
         }
         let Some(mut body) = msg_body(&m) else { return };
+        let reply_to = m.payloads.iter().find(|p| p.is("reply", NS_REPLY)).and_then(|p| p.attr("id")).map(String::from);
+        if reply_to.is_some() {
+            body = strip_fallback(&body, &m.payloads, NS_REPLY);
+        }
         // Encrypted with something we cannot read: show that instead of the fallback text.
         if enc == 0
             && let Some(ns) = m.payloads.iter().find(|p| p.is("encryption", e2e::NS_EME)).and_then(|p| p.attr("namespace"))
@@ -1136,6 +1235,8 @@ impl State {
         let stanza_id = stanza_ids.iter().find(|s| s.by.to_bare() == self.me).map(|s| s.id.clone());
         let sid = stanza_ids.iter().find(|s| groupchat && s.by.to_bare() == from.to_bare()).map(|s| s.id.clone());
         let archive_id = if groupchat { None } else { archived.as_ref().map(|a| a.0.clone()).or(stanza_id) };
+        // 1:1: our archive's id, which XEP-0490 read markers point at.
+        let sid = if groupchat { sid } else { archive_id.clone() };
         let origin = m.payloads.iter().find_map(|p| OriginId::try_from(p.clone()).ok()).map(|o| o.id);
         let msg_id = origin
             .or(m.id.as_ref().map(|i| i.0.clone()))
@@ -1145,7 +1246,7 @@ impl State {
         self.net.emit(Ev::Message {
             peer,
             groupchat,
-            msg: Msg { msg_id, sender, outgoing, body, url, ts, status: if outgoing { 1 } else { 0 }, enc, edited: false },
+            msg: Msg { msg_id, sender, outgoing, body, url, ts, status: if outgoing { 1 } else { 0 }, enc, edited: false, reply_to },
             archive_id,
             live: live && delay_ts.is_none(),
             sid,
@@ -1230,6 +1331,80 @@ fn contact(i: &RosterItem) -> Contact {
         Subscription::Remove => "remove",
     };
     Contact { jid: i.jid.to_string(), name: i.name.clone().unwrap_or_default(), subscription: subscription.into() }
+}
+
+/// Items of one of our own PEP nodes.
+async fn own_items(net: &Net, node: &str) -> Result<Vec<Element>, String> {
+    let req = Element::builder("pubsub", ns::PUBSUB).append(Element::builder("items", ns::PUBSUB).attr(nc("node"), node)).build();
+    let el = net.iq(None, IqRequest::Get(req)).await?;
+    Ok(el.as_ref().and_then(|e| e.get_child("items", ns::PUBSUB)).map(|i| i.children().filter(|c| c.name() == "item").cloned().collect()).unwrap_or_default())
+}
+
+async fn publish(net: &Net, node: &str, item_id: &str, payload: Element) -> Result<(), String> {
+    let item = Element::builder("item", ns::PUBSUB).attr(nc("id"), item_id).append(payload);
+    let req = Element::builder("pubsub", ns::PUBSUB).append(Element::builder("publish", ns::PUBSUB).attr(nc("node"), node).append(item)).build();
+    net.iq(None, IqRequest::Set(req)).await.map(|_| ())
+}
+
+/// Publishes to a private multi-item node (XEP-0402 bookmarks, XEP-0490 read markers).
+async fn publish_private(net: &Net, node: &str, item_id: &str, payload: Element) -> Result<(), String> {
+    let field = |var: &str, value: &str| Element::builder("field", ns::DATA_FORMS).attr(nc("var"), var).append(Element::builder("value", ns::DATA_FORMS).append(value));
+    // Whitelist keeps the node readable only by us; no fallback without it.
+    let options = Element::builder("x", ns::DATA_FORMS)
+        .attr(nc("type"), "submit")
+        .append(field("FORM_TYPE", "http://jabber.org/protocol/pubsub#publish-options"))
+        .append(field("pubsub#persist_items", "true"))
+        .append(field("pubsub#max_items", "max"))
+        .append(field("pubsub#send_last_published_item", "never"))
+        .append(field("pubsub#access_model", "whitelist"));
+    let item = Element::builder("item", ns::PUBSUB).attr(nc("id"), item_id).append(payload);
+    let req = Element::builder("pubsub", ns::PUBSUB)
+        .append(Element::builder("publish", ns::PUBSUB).attr(nc("node"), node).append(item))
+        .append(Element::builder("publish-options", ns::PUBSUB).append(options))
+        .build();
+    net.iq(None, IqRequest::Set(req)).await.map(|_| ())
+}
+
+/// XEP-0490 item: (chat JID, stanza-id it was read up to).
+fn mds_item(item: &Element) -> Option<(String, String)> {
+    let peer = item.attr("id")?;
+    let sid = item.get_child("displayed", ns::MDS)?.get_child("stanza-id", NS_SID)?.attr("id")?;
+    Some((peer.to_string(), sid.to_string()))
+}
+
+/// XEP-0428: `body` without the code points another XEP marked as fallback for `for_ns`.
+fn strip_fallback(body: &str, payloads: &[Element], for_ns: &str) -> String {
+    let mut drop = vec![false; body.chars().count()];
+    for f in payloads.iter().filter(|p| p.is("fallback", NS_FALLBACK) && p.attr("for") == Some(for_ns)) {
+        let ranges: Vec<&Element> = f.children().filter(|c| c.is("body", NS_FALLBACK)).collect();
+        if ranges.is_empty() {
+            return String::new(); // the whole body is fallback
+        }
+        for r in ranges {
+            let start = r.attr("start").and_then(|v| v.parse().ok()).unwrap_or(0usize);
+            let end = r.attr("end").and_then(|v| v.parse().ok()).unwrap_or(drop.len()).min(drop.len());
+            drop.iter_mut().take(end).skip(start).for_each(|d| *d = true);
+        }
+    }
+    body.chars().zip(drop).filter(|(_, d)| !d).map(|(c, _)| c).collect::<String>().trim_start_matches('\n').to_string()
+}
+
+/// XEP-0084: downloads the avatar `hash` of `who` and stores it if it matches.
+async fn fetch_pep_avatar(net: &Net, dir: &std::path::Path, who: &str, hash: &str) {
+    let Ok(to) = Jid::from_str(who) else { return };
+    let req = Element::builder("pubsub", ns::PUBSUB)
+        .append(Element::builder("items", ns::PUBSUB).attr(nc("node"), ns::AVATAR_DATA).append(Element::builder("item", ns::PUBSUB).attr(nc("id"), hash)))
+        .build();
+    let Ok(Some(el)) = net.iq(Some(to), IqRequest::Get(req)).await else { return };
+    let Some(b64) = el.get_child("items", ns::PUBSUB).and_then(|i| i.children().find_map(|c| c.get_child("data", ns::AVATAR_DATA))).map(|d| d.text()) else { return };
+    let clean: String = b64.chars().filter(|c| !c.is_whitespace()).collect();
+    let Ok(data) = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, clean) else { return };
+    if caps::hash_caps(&data, Algo::Sha_1).map(|h| h.to_hex()).as_deref() != Ok(hash) {
+        return;
+    }
+    if tokio::fs::write(store::avatar_path(dir, who), data).await.is_ok() {
+        net.emit(Ev::Avatar { jid: who.to_string() });
+    }
 }
 
 /// Pubsub item of the XEP-0402 node (`<item id=room><conference/></item>`); `None` unless autojoin.
@@ -1346,6 +1521,15 @@ mod caps_tests {
         let s = super::caps_string(&super::disco_info(None));
         assert!(s.starts_with("client/pc/en/Crabber<"));
         assert!(s.contains("<eu.siacs.conversations.axolotl<eu.siacs.conversations.axolotl.devicelist+notify<"), "{s}");
+    }
+
+    #[test]
+    fn reply_fallback_is_cut() {
+        let fb: super::Element = "<fallback xmlns='urn:xmpp:fallback:0' for='urn:xmpp:reply:0'><body start='0' end='9'/></fallback>".parse().unwrap();
+        assert_eq!(super::strip_fallback("> Боб: hi\nответ", &[fb.clone()], super::NS_REPLY), "ответ", "offsets count code points");
+        assert_eq!(super::strip_fallback("> Боб: hi\nответ", &[fb], "urn:other"), "> Боб: hi\nответ");
+        let mds: super::Element = "<item xmlns='http://jabber.org/protocol/pubsub' id='bob@x'><displayed xmlns='urn:xmpp:mds:displayed:0'><stanza-id xmlns='urn:xmpp:sid:0' id='S1' by='me@x'/></displayed></item>".parse().unwrap();
+        assert_eq!(super::mds_item(&mds), Some(("bob@x".into(), "S1".into())));
     }
 
     #[test]

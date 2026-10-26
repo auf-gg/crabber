@@ -92,6 +92,8 @@ pub struct Msg {
     pub enc: u8,
     /// Corrected after sending (XEP-0308).
     pub edited: bool,
+    /// XEP-0461: local id of the message this one answers (or the raw id if we don't have it).
+    pub reply_to: Option<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -138,6 +140,7 @@ impl Store {
         let _ = db.execute_batch("ALTER TABLE messages ADD COLUMN edited INTEGER NOT NULL DEFAULT 0");
         // MUC-assigned stanza-id (XEP-0359): what groupchat reactions point at.
         let _ = db.execute_batch("ALTER TABLE messages ADD COLUMN sid TEXT");
+        let _ = db.execute_batch("ALTER TABLE messages ADD COLUMN reply_to TEXT");
         // SQLite's LOWER/LIKE only fold ASCII; search needs Cyrillic too.
         db.create_scalar_function("ulower", 1, rusqlite::functions::FunctionFlags::SQLITE_UTF8 | rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC, |ctx| {
             Ok(ctx.get::<String>(0)?.to_lowercase())
@@ -199,8 +202,8 @@ impl Store {
     pub fn insert_msg(&self, peer: &str, m: &Msg) -> bool {
         self.db
             .execute(
-                "INSERT OR IGNORE INTO messages(peer, msg_id, sender, outgoing, body, url, ts, status, enc) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
-                params![peer, m.msg_id, m.sender, m.outgoing, m.body, m.url, m.ts, m.status, m.enc],
+                "INSERT OR IGNORE INTO messages(peer, msg_id, sender, outgoing, body, url, ts, status, enc, reply_to) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+                params![peer, m.msg_id, m.sender, m.outgoing, m.body, m.url, m.ts, m.status, m.enc, m.reply_to],
             )
             .map(|n| n > 0)
             .unwrap_or(false)
@@ -249,6 +252,11 @@ impl Store {
         let _ = self.db.execute("UPDATE messages SET sid=?3 WHERE peer=?1 AND msg_id=?2", params![peer, msg_id, sid]);
     }
 
+    /// Stanza-id of the newest message that has one (what XEP-0490 markers point at).
+    pub fn last_sid(&self, peer: &str) -> Option<String> {
+        self.db.query_row("SELECT sid FROM messages WHERE peer=?1 AND sid IS NOT NULL ORDER BY ts DESC LIMIT 1", [peer], |r| r.get(0)).optional().ok().flatten()
+    }
+
     pub fn sid(&self, peer: &str, msg_id: &str) -> Option<String> {
         self.db.query_row("SELECT sid FROM messages WHERE peer=?1 AND msg_id=?2", [peer, msg_id], |r| r.get(0)).optional().ok().flatten().flatten()
     }
@@ -281,10 +289,24 @@ impl Store {
         out
     }
 
+    /// One message by local id (e.g. the original of a reply that is not loaded).
+    pub fn msg(&self, peer: &str, msg_id: &str) -> Option<Msg> {
+        self.db
+            .query_row("SELECT msg_id, sender, outgoing, body, url, ts, status, enc, edited, reply_to FROM messages WHERE peer=?1 AND msg_id=?2", [peer, msg_id], row_to_msg)
+            .optional()
+            .ok()
+            .flatten()
+    }
+
+    /// Incoming messages newer than `ts`: the unread count after a read marker.
+    pub fn incoming_after(&self, peer: &str, ts: i64) -> u32 {
+        self.db.query_row("SELECT COUNT(*) FROM messages WHERE peer=?1 AND outgoing=0 AND ts>?2", params![peer, ts], |r| r.get(0)).unwrap_or(0)
+    }
+
     pub fn history(&self, peer: &str, limit: usize) -> Vec<Msg> {
         let mut stmt = self
             .db
-            .prepare("SELECT msg_id, sender, outgoing, body, url, ts, status, enc, edited FROM messages WHERE peer=?1 ORDER BY ts DESC, rowid DESC LIMIT ?2")
+            .prepare("SELECT msg_id, sender, outgoing, body, url, ts, status, enc, edited, reply_to FROM messages WHERE peer=?1 ORDER BY ts DESC, rowid DESC LIMIT ?2")
             .unwrap();
         let mut v: Vec<Msg> = stmt
             .query_map(params![peer, limit as i64], row_to_msg)
@@ -306,12 +328,12 @@ impl Store {
         let mut stmt = self
             .db
             .prepare(
-                "SELECT peer, msg_id, sender, outgoing, body, url, ts, status, enc, edited FROM messages
+                "SELECT peer, msg_id, sender, outgoing, body, url, ts, status, enc, edited, reply_to FROM messages
                  WHERE url IS NULL AND ulower(body) LIKE ?1 ESCAPE '\\' AND (?3 IS NULL OR peer = ?3) ORDER BY ts DESC LIMIT ?2",
             )
             .unwrap();
         stmt.query_map(params![format!("%{escaped}%"), limit as i64, peer], |r| {
-            Ok((r.get(0)?, Msg { msg_id: r.get(1)?, sender: r.get(2)?, outgoing: r.get(3)?, body: r.get(4)?, url: r.get(5)?, ts: r.get(6)?, status: r.get(7)?, enc: r.get(8)?, edited: r.get(9)? }))
+            Ok((r.get(0)?, Msg { msg_id: r.get(1)?, sender: r.get(2)?, outgoing: r.get(3)?, body: r.get(4)?, url: r.get(5)?, ts: r.get(6)?, status: r.get(7)?, enc: r.get(8)?, edited: r.get(9)?, reply_to: r.get(10)? }))
         })
         .unwrap()
         .filter_map(Result::ok)
@@ -327,7 +349,7 @@ impl Store {
     pub fn attachments(&self, peer: &str) -> Vec<Msg> {
         let mut stmt = self
             .db
-            .prepare("SELECT msg_id, sender, outgoing, body, url, ts, status, enc, edited FROM messages WHERE peer=?1 AND url IS NOT NULL ORDER BY ts")
+            .prepare("SELECT msg_id, sender, outgoing, body, url, ts, status, enc, edited, reply_to FROM messages WHERE peer=?1 AND url IS NOT NULL ORDER BY ts")
             .unwrap();
         stmt.query_map([peer], row_to_msg).unwrap().filter_map(Result::ok).collect()
     }
@@ -336,7 +358,7 @@ impl Store {
     pub fn link_messages(&self, peer: &str) -> Vec<Msg> {
         let mut stmt = self
             .db
-            .prepare("SELECT msg_id, sender, outgoing, body, url, ts, status, enc, edited FROM messages WHERE peer=?1 AND url IS NULL AND (body LIKE '%http://%' OR body LIKE '%https://%') ORDER BY ts DESC LIMIT 500")
+            .prepare("SELECT msg_id, sender, outgoing, body, url, ts, status, enc, edited, reply_to FROM messages WHERE peer=?1 AND url IS NULL AND (body LIKE '%http://%' OR body LIKE '%https://%') ORDER BY ts DESC LIMIT 500")
             .unwrap();
         stmt.query_map([peer], row_to_msg).unwrap().filter_map(Result::ok).collect()
     }
@@ -410,6 +432,7 @@ fn row_to_msg(r: &rusqlite::Row<'_>) -> rusqlite::Result<Msg> {
         status: r.get(6)?,
         enc: r.get(7)?,
         edited: r.get(8)?,
+        reply_to: r.get(9)?,
     })
 }
 
@@ -418,7 +441,7 @@ mod tests {
     use super::*;
 
     fn msg(id: &str, ts: i64, outgoing: bool) -> Msg {
-        Msg { msg_id: id.into(), sender: "a".into(), outgoing, body: id.into(), url: None, ts, status: 0, enc: 0, edited: false }
+        Msg { msg_id: id.into(), sender: "a".into(), outgoing, body: id.into(), url: None, ts, status: 0, enc: 0, edited: false, reply_to: None }
     }
 
     #[test]

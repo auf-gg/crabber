@@ -91,7 +91,7 @@ fn start_bot() -> Bot {
 
 fn send(tx: &UnboundedSender<Cmd>, to: &str, body: &str) -> String {
     let id = xmpp::new_id();
-    tx.unbounded_send(Cmd::Send { to: to.into(), id: id.clone(), body: body.into(), groupchat: false, enc: "omemo".into() }).unwrap();
+    tx.unbounded_send(Cmd::Send { to: to.into(), id: id.clone(), body: body.into(), groupchat: false, enc: "omemo".into(), reply: None }).unwrap();
     id
 }
 

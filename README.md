@@ -37,7 +37,7 @@ Crabber stands on each.
 | [0049](https://xmpp.org/extensions/xep-0049.html) | Private XML Storage | ❌ | |
 | [0054](https://xmpp.org/extensions/xep-0054.html) | vcard-temp | 🟡 | Avatars only |
 | [0065](https://xmpp.org/extensions/xep-0065.html) | SOCKS5 Bytestreams | ❌ | Jingle file transfer |
-| [0084](https://xmpp.org/extensions/xep-0084.html) | User Avatar (PEP) | ❌ | vCard avatars only |
+| [0084](https://xmpp.org/extensions/xep-0084.html) | User Avatar (PEP) | ✅ | Ours is published to both PEP and vCard |
 | [0085](https://xmpp.org/extensions/xep-0085.html) | Chat State Notifications | ✅ | Typing indicator |
 | [0086](https://xmpp.org/extensions/xep-0086.html) | Error Condition Mappings | ❌ | Legacy error codes |
 | [0092](https://xmpp.org/extensions/xep-0092.html) | Software Version | ❌ | |
@@ -49,7 +49,7 @@ Crabber stands on each.
 | [0172](https://xmpp.org/extensions/xep-0172.html) | User Nickname | ❌ | |
 | [0176](https://xmpp.org/extensions/xep-0176.html) | Jingle ICE-UDP Transport | ✅ | |
 | [0184](https://xmpp.org/extensions/xep-0184.html) | Message Delivery Receipts | ✅ | |
-| [0191](https://xmpp.org/extensions/xep-0191.html) | Blocking Command | ❌ | |
+| [0191](https://xmpp.org/extensions/xep-0191.html) | Blocking Command | ✅ | Contact card, chat banner, subscription requests |
 | [0198](https://xmpp.org/extensions/xep-0198.html) | Stream Management | ✅ | Provided by tokio-xmpp |
 | [0199](https://xmpp.org/extensions/xep-0199.html) | XMPP Ping | 🟡 | Answers pings, does not send them |
 | [0202](https://xmpp.org/extensions/xep-0202.html) | Entity Time | ❌ | |
@@ -77,7 +77,7 @@ Crabber stands on each.
 | [0357](https://xmpp.org/extensions/xep-0357.html) | Push Notifications | ❌ | Mobile-oriented, low priority on desktop |
 | [0363](https://xmpp.org/extensions/xep-0363.html) | HTTP File Upload | ✅ | |
 | [0368](https://xmpp.org/extensions/xep-0368.html) | SRV records for XMPP over TLS | ❌ | STARTTLS only |
-| [0377](https://xmpp.org/extensions/xep-0377.html) | Spam Reporting | ❌ | |
+| [0377](https://xmpp.org/extensions/xep-0377.html) | Spam Reporting | ✅ | Sent with a block |
 | [0384](https://xmpp.org/extensions/xep-0384.html) | OMEMO Encryption | ✅ | Legacy v0.3 namespace |
 | [0386](https://xmpp.org/extensions/xep-0386.html) | Bind 2 | ❌ | |
 | [0388](https://xmpp.org/extensions/xep-0388.html) | Extensible SASL Profile (SASL2) | ❌ | SCRAM over classic SASL |
@@ -92,15 +92,16 @@ Crabber stands on each.
 | [0411](https://xmpp.org/extensions/xep-0411.html) | Bookmarks Conversion | ❌ | |
 | [0421](https://xmpp.org/extensions/xep-0421.html) | Occupant identifiers for semi-anonymous MUCs | ❌ | |
 | [0425](https://xmpp.org/extensions/xep-0425.html) | Moderated Message Retraction | ❌ | |
-| [0428](https://xmpp.org/extensions/xep-0428.html) | Fallback Indication | ❌ | |
+| [0428](https://xmpp.org/extensions/xep-0428.html) | Fallback Indication | 🟡 | Reply quotes only |
 | [0440](https://xmpp.org/extensions/xep-0440.html) | SASL Channel-Binding Type Capability | 🟡 | `tls-exporter` binding, capability not read |
 | [0444](https://xmpp.org/extensions/xep-0444.html) | Message Reactions | ✅ | Quick set in the message menu; groups use the room's stanza-id |
 | [0454](https://xmpp.org/extensions/xep-0454.html) | OMEMO Media Sharing | ✅ | `aesgcm://` links |
 | [0455](https://xmpp.org/extensions/xep-0455.html) | Service Outage Status | ❌ | |
+| [0461](https://xmpp.org/extensions/xep-0461.html) | Message Replies | ✅ | Quote with jump to the original; fallback quote for other clients |
 | [0474](https://xmpp.org/extensions/xep-0474.html) | SASL SCRAM Downgrade Protection | ❌ | |
 | [0484](https://xmpp.org/extensions/xep-0484.html) | Fast Authentication Streamlining Tokens | ❌ | |
 | [0486](https://xmpp.org/extensions/xep-0486.html) | MUC Avatars | ❌ | |
-| [0490](https://xmpp.org/extensions/xep-0490.html) | Message Displayed Synchronization | ❌ | Read state is not synced between devices |
+| [0490](https://xmpp.org/extensions/xep-0490.html) | Message Displayed Synchronization | ✅ | Unread counters follow other devices |
 
 Also implemented: XEP-0066 (Out of Band Data),
 XEP-0203 (Delayed Delivery), XEP-0334 (Message Processing Hints),

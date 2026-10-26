@@ -644,7 +644,8 @@ impl App {
         );
 
         let requests = sess.requests.iter().map(|jid| {
-            let (a, d) = (jid.clone(), jid.clone());
+            let (a, d, sp) = (jid.clone(), jid.clone(), jid.clone());
+            let can_block = sess.blocked.is_some();
             v_flex()
                 .mx_2()
                 .mb_2()
@@ -657,7 +658,13 @@ impl App {
                     h_flex()
                         .gap_2()
                         .child(Button::new(SharedString::from(format!("acc-{jid}"))).primary().small().label("Принять").on_click(cx.listener(move |this, _, _, cx| this.answer_request(a.clone(), true, cx))))
-                        .child(Button::new(SharedString::from(format!("rej-{jid}"))).ghost().small().label("Отклонить").on_click(cx.listener(move |this, _, _, cx| this.answer_request(d.clone(), false, cx)))),
+                        .child(Button::new(SharedString::from(format!("rej-{jid}"))).ghost().small().label("Отклонить").on_click(cx.listener(move |this, _, _, cx| this.answer_request(d.clone(), false, cx))))
+                        .when(can_block, |d| {
+                            d.child(Button::new(SharedString::from(format!("spam-{jid}"))).ghost().small().label("Спам").tooltip("Пожаловаться и заблокировать").on_click(cx.listener(move |this, _, _, cx| {
+                                this.answer_request(sp.clone(), false, cx);
+                                this.block(sp.clone(), true, true, cx);
+                            })))
+                        }),
                 )
         });
 
@@ -955,7 +962,7 @@ impl App {
             }))
         });
 
-        let editing = sess.editing.as_ref().and_then(|id| sess.history.iter().find(|m| m.msg_id == *id)).map(|m| {
+        let bar = |icon: IconName, title: String, text: String| {
             h_flex()
                 .flex_shrink_0()
                 .px_4()
@@ -965,15 +972,42 @@ impl App {
                 .bg(p.panel)
                 .border_t_1()
                 .border_color(p.border)
-                .child(Icon::new(IconName::Pencil).small().text_color(p.accent))
+                .child(Icon::new(icon).small().text_color(p.accent))
                 .child(
                     v_flex()
                         .flex_1()
                         .min_w_0()
-                        .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).text_color(p.accent).child("Изменение сообщения"))
-                        .child(div().text_sm().text_color(p.muted).truncate().child(m.body.replace('\n', " "))),
+                        .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).text_color(p.accent).truncate().child(title))
+                        .child(div().text_sm().text_color(p.muted).truncate().child(text.replace('\n', " "))),
                 )
+        };
+        let editing = sess.editing.as_ref().and_then(|id| sess.history.iter().find(|m| m.msg_id == *id)).map(|m| {
+            bar(IconName::Pencil, "Изменение сообщения".into(), m.body.clone())
                 .child(Button::new("edit-cancel").ghost().xsmall().icon(IconName::X).tooltip("Отменить").on_click(cx.listener(|this, _, w, cx| this.cancel_edit(w, cx))))
+        });
+        let replying = sess.replying.as_ref().map(|m| {
+            let who = if m.outgoing { "себе".to_string() } else if chat.is_room { m.sender.clone() } else { sess.display_name(&peer) };
+            bar(IconName::Reply, format!("Ответ {who}"), m.url.clone().unwrap_or_else(|| m.body.clone()))
+                .child(Button::new("reply-cancel").ghost().xsmall().icon(IconName::X).tooltip("Отменить").on_click(cx.listener(|this, _, _, cx| this.cancel_reply(cx))))
+        });
+        let editing = editing.or(replying);
+        let blocked = !chat.is_room && sess.blocked.as_ref().is_some_and(|b| b.contains(&peer));
+        let blocked_bar = blocked.then(|| {
+            let jid = peer.clone();
+            h_flex()
+                .flex_shrink_0()
+                .px_4()
+                .py_2()
+                .gap_3()
+                .items_center()
+                .justify_center()
+                .bg(p.panel)
+                .border_t_1()
+                .border_color(p.border)
+                .text_sm()
+                .text_color(p.muted)
+                .child("Вы заблокировали этот контакт")
+                .child(Button::new("unblock").small().ghost().label("Разблокировать").on_click(cx.listener(move |this, _, _, cx| this.block(jid.clone(), false, false, cx))))
         });
 
         let composer = h_flex()
@@ -1056,7 +1090,8 @@ impl App {
             }))
             .children(pending)
             .children(editing)
-            .child(composer)
+            .children(blocked_bar)
+            .when(!blocked, |d| d.child(composer))
             .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| this.add_pending(paths.0.iter().cloned(), cx)))
             .drag_over::<ExternalPaths>(move |s, _, _, _| s.opacity(0.85))
             .into_any_element()
@@ -1078,6 +1113,21 @@ impl App {
         let (bg, fg, meta_c) = if m.outgoing { (p.bubble_out, p.bubble_out_text, p.meta_out) } else { (p.bubble_in, p.bubble_in_text, p.muted) };
         let code = hsla(0., 0., if p.dark || m.outgoing { 0. } else { 0.5 }, 0.18);
 
+        let quote = m.reply_to.as_ref().map(|id| {
+            let orig = sess.history.iter().find(|q| q.msg_id == *id).cloned().or_else(|| sess.store.msg(sess.selected.as_deref().unwrap_or_default(), id));
+            let who = match &orig {
+                Some(o) if o.outgoing => "Вы".to_string(),
+                Some(o) if is_room => o.sender.clone(),
+                Some(_) => sess.selected.as_deref().map(|p| sess.display_name(p)).unwrap_or_default(),
+                None => "Сообщение".to_string(),
+            };
+            let text = match &orig {
+                Some(o) if o.url.is_some() => "Файл".to_string(),
+                Some(o) => o.body.replace('\n', " "),
+                None => "недоступно".to_string(),
+            };
+            (id.clone(), orig.map(|o| o.ts), who, text, sess.selected.clone().unwrap_or_default())
+        });
         // (emoji, count, ours) in first-seen order.
         let me = sess.selected.as_deref().map(|p| sess.my_sender(p)).unwrap_or_default();
         let mut chips: Vec<(String, usize, bool)> = vec![];
@@ -1198,6 +1248,23 @@ impl App {
             .when(!m.outgoing && last_in_group, |d| d.rounded_bl(tail))
             .when(!p.dark, |d| d.shadow_sm())
             .when(show_sender, |b| b.child(div().text_sm().font_weight(FontWeight::SEMIBOLD).text_color(sender_color(&m.sender)).child(m.sender.clone())))
+            .children(quote.map(|(id, ts, who, text, peer)| {
+                h_flex()
+                    .id(SharedString::from(format!("q-{}", m.msg_id)))
+                    .gap_2()
+                    .pr_2()
+                    .rounded_md()
+                    .bg(code)
+                    .cursor_pointer()
+                    .child(div().w(px(3.)).h(dp(36.)).rounded_l_md().bg(if m.outgoing { fg } else { sender_color(&who) }))
+                    .child(
+                        v_flex()
+                            .min_w_0()
+                            .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).truncate().child(who))
+                            .child(div().text_sm().opacity(0.8).truncate().child(text)),
+                    )
+                    .when_some(ts, |d, ts| d.on_click(cx.listener(move |this, _, w, cx| this.open_message(peer.clone(), id.clone(), ts, w, cx))))
+            }))
             .child(content)
             .children(reactions)
             .child(meta);
@@ -1586,6 +1653,14 @@ impl App {
             );
             items.push(div().h(px(1.)).my_1().bg(p.divider).into_any_element());
         }
+        if !is_call(&m) && m.status >= 0 {
+            let msg = m.clone();
+            items.push(
+                item("mm-reply", IconName::Reply, "Ответить", false)
+                    .on_click(cx.listener(move |this, _, w, cx| this.start_reply(&msg, w, cx)))
+                    .into_any_element(),
+            );
+        }
         if m.outgoing && m.url.is_none() && !is_call(&m) && m.status >= 0 {
             let msg = m.clone();
             items.push(
@@ -1781,6 +1856,7 @@ impl App {
         };
         let has_photo = sess.avatars.contains_key(&peer);
         let (pa, pc, pd) = (peer.clone(), peer.clone(), peer.clone());
+        let blocked = sess.blocked.as_ref().map(|b| b.contains(&peer));
         let body = v_flex()
             .items_center()
             .gap_2()
@@ -1809,6 +1885,32 @@ impl App {
                     .child(Icon::new(IconName::Copy).xsmall().text_color(p.muted))
                     .on_click(move |_, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(pc.clone()))),
             )
+            .when_some(blocked.filter(|_| !chat.is_room), |d, blocked| {
+                let (pb, ps) = (peer.clone(), peer.clone());
+                d.child(
+                    h_flex()
+                        .pt_4()
+                        .w_full()
+                        .gap_2()
+                        .child(
+                            Button::new("profile-block")
+                                .flex_1()
+                                .icon(IconName::Ban)
+                                .label(if blocked { "Разблокировать" } else { "Заблокировать" })
+                                .on_click(cx.listener(move |this, _, _, cx| this.block(pb.clone(), !blocked, false, cx))),
+                        )
+                        .when(!blocked, |d| {
+                            d.child(
+                                Button::new("profile-spam")
+                                    .flex_1()
+                                    .icon(IconName::TriangleAlert)
+                                    .label("Спам")
+                                    .tooltip("Пожаловаться серверу и заблокировать")
+                                    .on_click(cx.listener(move |this, _, _, cx| this.block(ps.clone(), true, true, cx))),
+                            )
+                        }),
+                )
+            })
             .child(
                 div().pt_4().w_full().child(
                     // Solid red: the theme's danger button is only a faint tint in dark mode.

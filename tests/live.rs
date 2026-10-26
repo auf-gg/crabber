@@ -90,7 +90,7 @@ fn chat_roundtrip() {
 
     // Message + delivery receipt + read marker.
     let id = xmpp::new_id();
-    a.unbounded_send(Cmd::Send { to: "bob@localhost".into(), id: id.clone(), body: "привет".into(), groupchat: false, enc: "plain".into() }).unwrap();
+    a.unbounded_send(Cmd::Send { to: "bob@localhost".into(), id: id.clone(), body: "привет".into(), groupchat: false, enc: "plain".into(), reply: None }).unwrap();
     let got = wait(&mut b_rx, |e| match e {
         Ev::Message { peer, msg, .. } if !msg.outgoing => Some((peer.clone(), msg.clone())),
         _ => None,
@@ -129,7 +129,7 @@ fn chat_roundtrip() {
     b2.unbounded_send(Cmd::Join { room: room.clone(), nick: "bob".into(), since: None, create_name: None }).unwrap();
     wait(&mut b2_rx, |e| matches!(e, Ev::RoomJoined { occupants: 2, .. }).then_some(()));
     let gid = xmpp::new_id();
-    a.unbounded_send(Cmd::Send { to: room.clone(), id: gid.clone(), body: "всем привет".into(), groupchat: true, enc: "plain".into() }).unwrap();
+    a.unbounded_send(Cmd::Send { to: room.clone(), id: gid.clone(), body: "всем привет".into(), groupchat: true, enc: "plain".into(), reply: None }).unwrap();
     let m = wait(&mut b2_rx, |e| match e {
         Ev::Message { msg, groupchat: true, .. } if msg.msg_id == gid => Some(msg.clone()),
         _ => None,
@@ -220,7 +220,7 @@ fn openpgp_xep0027_roundtrip() {
     wait(&mut b_rx, |e| matches!(e, Ev::PgpContact { fingerprint: Some(_), .. }).then_some(()));
 
     let id = xmpp::new_id();
-    a.unbounded_send(Cmd::Send { to: "bob@localhost".into(), id: id.clone(), body: "секрет по PGP".into(), groupchat: false, enc: "pgp".into() }).unwrap();
+    a.unbounded_send(Cmd::Send { to: "bob@localhost".into(), id: id.clone(), body: "секрет по PGP".into(), groupchat: false, enc: "pgp".into(), reply: None }).unwrap();
     wait(&mut a_rx, |e| matches!(e, Ev::SentEncrypted { id: i, enc: 2, .. } if *i == id).then_some(()));
     let got = wait(&mut b_rx, |e| match e {
         Ev::Message { msg, .. } if msg.msg_id == id => Some(msg.clone()),
@@ -251,7 +251,7 @@ fn omemo_crabber_to_crabber() {
 
     let send = |tx: &UnboundedSender<Cmd>, rx: &mut UnboundedReceiver<Ev>, to: &str, body: &str| {
         let id = xmpp::new_id();
-        tx.unbounded_send(Cmd::Send { to: to.into(), id: id.clone(), body: body.into(), groupchat: false, enc: "omemo".into() }).unwrap();
+        tx.unbounded_send(Cmd::Send { to: to.into(), id: id.clone(), body: body.into(), groupchat: false, enc: "omemo".into(), reply: None }).unwrap();
         wait(rx, |e| match e {
             Ev::SentEncrypted { id: i, .. } if *i == id => Some(()),
             Ev::SendFailed { id: i, error, .. } if *i == id => panic!("send failed: {error}"),
@@ -289,7 +289,7 @@ fn omemo_multi_device() {
     std::thread::sleep(Duration::from_secs(2));
     let send = |tx: &UnboundedSender<Cmd>, rx: &mut UnboundedReceiver<Ev>, to: &str, body: &str| {
         let id = xmpp::new_id();
-        tx.unbounded_send(Cmd::Send { to: to.into(), id: id.clone(), body: body.into(), groupchat: false, enc: "omemo".into() }).unwrap();
+        tx.unbounded_send(Cmd::Send { to: to.into(), id: id.clone(), body: body.into(), groupchat: false, enc: "omemo".into(), reply: None }).unwrap();
         wait(rx, |e| match e {
             Ev::SentEncrypted { id: i, .. } if *i == id => Some(()),
             Ev::SendFailed { id: i, error, .. } if *i == id => panic!("send failed: {error}"),
