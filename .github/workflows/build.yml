@@ -1,0 +1,179 @@
+# Build artifacts for all platforms:
+#   Linux  x86_64 / aarch64 — tar.gz (binary, .desktop, icon, install.sh)
+#   Windows x86_64 / aarch64 — portable .zip + NSIS installer setup.exe
+# Pushing a v* tag additionally creates a GitHub Release with all artifacts.
+
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+env:
+  RUSTUP_AUTO_INSTALL: '1'  # rustup installs the toolchain from rust-toolchain.toml
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            platform: linux
+            arch: x86_64
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            platform: linux
+            arch: aarch64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            platform: windows
+            arch: x86_64
+          - os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            platform: windows
+            arch: aarch64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux dependencies
+        if: matrix.platform == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config clang libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
+            libx11-xcb-dev libxcb1-dev libfontconfig-dev libfreetype-dev \
+            libasound2-dev libvulkan-dev libdbus-1-dev
+
+      - name: Install rustup
+        shell: bash
+        run: |
+          if ! command -v rustup >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+              | sh -s -- -y --profile minimal --default-toolchain none
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          fi
+
+      - name: Resolve Rust toolchain
+        shell: bash
+        run: |
+          rustc --version
+          cargo --version
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release --locked --bin crabber
+
+      - name: Package (Linux)
+        if: matrix.platform == 'linux'
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n1)"
+          pkg="crabber-${version}-${{ matrix.arch }}-linux"
+          mkdir -p "$pkg"
+          cp target/release/crabber LICENSE "$pkg/"
+          cp icon.png "$pkg/crabber.png"
+
+          cat > "$pkg/crabber.desktop" <<'EOF'
+          [Desktop Entry]
+          Type=Application
+          Name=Crabber
+          Comment=XMPP messenger
+          Exec=crabber
+          Icon=crabber
+          Terminal=false
+          Categories=Network;InstantMessaging;Chat;
+          EOF
+
+          cat > "$pkg/install.sh" <<'EOF'
+          #!/bin/sh
+          # Installs Crabber for the current user (~/.local).
+          set -e
+          cd "$(dirname "$0")"
+          install -Dm755 crabber "$HOME/.local/bin/crabber"
+          install -Dm644 crabber.png "$HOME/.local/share/icons/hicolor/1024x1024/apps/crabber.png"
+          install -Dm644 crabber.desktop "$HOME/.local/share/applications/crabber.desktop"
+          echo "Crabber installed: ~/.local/bin/crabber"
+          EOF
+          chmod +x "$pkg/install.sh"
+
+          tar -czf "${pkg}.tar.gz" "$pkg"
+
+      - name: Package portable (Windows)
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: |
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"$').Matches[0].Groups[1].Value
+          $pkg = "crabber-$version-${{ matrix.arch }}-windows-portable"
+          New-Item -ItemType Directory -Force $pkg | Out-Null
+          Copy-Item target/release/crabber.exe $pkg/
+          Copy-Item LICENSE $pkg/
+          Compress-Archive -Path $pkg -DestinationPath "$pkg.zip"
+
+      - name: Build installer (Windows)
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: |
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"$').Matches[0].Groups[1].Value
+          $makensis = @(
+            (Get-Command makensis -ErrorAction SilentlyContinue).Source,
+            "C:\Program Files (x86)\NSIS\makensis.exe",
+            "C:\Program Files\NSIS\makensis.exe"
+          ) | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
+          if (-not $makensis) {
+            choco install nsis -y --no-progress
+            $makensis = "C:\Program Files (x86)\NSIS\makensis.exe"
+          }
+          & $makensis `
+            "-DVERSION=$version" `
+            "-DARCH=${{ matrix.arch }}" `
+            "-DOUTFILE=$(Join-Path $PWD "crabber-$version-${{ matrix.arch }}-setup.exe")" `
+            "-DBINDIR=$(Join-Path $PWD 'target/release')" `
+            "-DICON=$(Join-Path $PWD 'assets/crabber.ico')" `
+            "-DLICENSEFILE=$(Join-Path $PWD 'LICENSE')" `
+            dist/windows/installer.nsi
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: crabber-${{ matrix.platform }}-${{ matrix.arch }}
+          path: |
+            crabber-*-linux.tar.gz
+            crabber-*-windows-portable.zip
+            crabber-*-setup.exe
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # gh release create --verify-tag needs the tag in a local git repo
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: release
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ github.ref_name }}" \
+            --title "Crabber ${{ github.ref_name }}" \
+            --generate-notes --verify-tag \
+            release/*
