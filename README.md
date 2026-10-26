@@ -33,7 +33,7 @@ Crabber stands on each.
 | [0030](https://xmpp.org/extensions/xep-0030.html) | Service Discovery | ✅ | |
 | [0045](https://xmpp.org/extensions/xep-0045.html) | Multi-User Chat | 🟡 | Join, create, invite; no moderation or role management |
 | [0047](https://xmpp.org/extensions/xep-0047.html) | In-Band Bytestreams | ❌ | Jingle file transfer fallback |
-| [0048](https://xmpp.org/extensions/xep-0048.html) | Bookmarks | ❌ | Joined rooms are not synced to the server |
+| [0048](https://xmpp.org/extensions/xep-0048.html) | Bookmarks | ❌ | Legacy; rooms sync via XEP-0402 |
 | [0049](https://xmpp.org/extensions/xep-0049.html) | Private XML Storage | ❌ | |
 | [0054](https://xmpp.org/extensions/xep-0054.html) | vcard-temp | 🟡 | Avatars only |
 | [0065](https://xmpp.org/extensions/xep-0065.html) | SOCKS5 Bytestreams | ❌ | Jingle file transfer |
@@ -64,7 +64,7 @@ Crabber stands on each.
 | [0280](https://xmpp.org/extensions/xep-0280.html) | Message Carbons | ✅ | |
 | [0293](https://xmpp.org/extensions/xep-0293.html) | Jingle RTP Feedback Negotiation | ✅ | |
 | [0294](https://xmpp.org/extensions/xep-0294.html) | Jingle RTP Header Extensions Negotiation | ✅ | |
-| [0308](https://xmpp.org/extensions/xep-0308.html) | Last Message Correction | ❌ | |
+| [0308](https://xmpp.org/extensions/xep-0308.html) | Last Message Correction | ✅ | Text messages; edits only from the original sender |
 | [0313](https://xmpp.org/extensions/xep-0313.html) | Message Archive Management | ✅ | |
 | [0317](https://xmpp.org/extensions/xep-0317.html) | Hats | ❌ | |
 | [0319](https://xmpp.org/extensions/xep-0319.html) | Last User Interaction in Presence | ❌ | |
@@ -87,14 +87,14 @@ Crabber stands on each.
 | [0393](https://xmpp.org/extensions/xep-0393.html) | Message Styling | 🟡 | Code blocks and inline code only |
 | [0396](https://xmpp.org/extensions/xep-0396.html) | Jingle Encrypted Transports - OMEMO | ❌ | |
 | [0398](https://xmpp.org/extensions/xep-0398.html) | User Avatar to vCard-Based Avatars Conversion | ❌ | |
-| [0402](https://xmpp.org/extensions/xep-0402.html) | PEP Native Bookmarks | ❌ | |
+| [0402](https://xmpp.org/extensions/xep-0402.html) | PEP Native Bookmarks | ✅ | Joined rooms sync between devices |
 | [0410](https://xmpp.org/extensions/xep-0410.html) | MUC Self-Ping | ❌ | |
 | [0411](https://xmpp.org/extensions/xep-0411.html) | Bookmarks Conversion | ❌ | |
 | [0421](https://xmpp.org/extensions/xep-0421.html) | Occupant identifiers for semi-anonymous MUCs | ❌ | |
 | [0425](https://xmpp.org/extensions/xep-0425.html) | Moderated Message Retraction | ❌ | |
 | [0428](https://xmpp.org/extensions/xep-0428.html) | Fallback Indication | ❌ | |
 | [0440](https://xmpp.org/extensions/xep-0440.html) | SASL Channel-Binding Type Capability | 🟡 | `tls-exporter` binding, capability not read |
-| [0444](https://xmpp.org/extensions/xep-0444.html) | Message Reactions | ❌ | |
+| [0444](https://xmpp.org/extensions/xep-0444.html) | Message Reactions | ✅ | Quick set in the message menu; groups use the room's stanza-id |
 | [0454](https://xmpp.org/extensions/xep-0454.html) | OMEMO Media Sharing | ✅ | `aesgcm://` links |
 | [0455](https://xmpp.org/extensions/xep-0455.html) | Service Outage Status | ❌ | |
 | [0474](https://xmpp.org/extensions/xep-0474.html) | SASL SCRAM Downgrade Protection | ❌ | |

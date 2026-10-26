@@ -90,6 +90,8 @@ pub struct Msg {
     pub status: i32,
     /// 0 = plain, 1 = OMEMO, 2 = OpenPGP
     pub enc: u8,
+    /// Corrected after sending (XEP-0308).
+    pub edited: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -126,11 +128,16 @@ impl Store {
                 nick TEXT NOT NULL DEFAULT '', unread INTEGER NOT NULL DEFAULT 0,
                 in_roster INTEGER NOT NULL DEFAULT 0, subscription TEXT NOT NULL DEFAULT '');
              CREATE TABLE IF NOT EXISTS kv(k TEXT PRIMARY KEY, v TEXT NOT NULL);
-             CREATE TABLE IF NOT EXISTS files(url TEXT PRIMARY KEY, path TEXT NOT NULL);",
+             CREATE TABLE IF NOT EXISTS files(url TEXT PRIMARY KEY, path TEXT NOT NULL);
+             CREATE TABLE IF NOT EXISTS reactions(peer TEXT NOT NULL, msg_id TEXT NOT NULL, sender TEXT NOT NULL, emoji TEXT NOT NULL,
+                UNIQUE(peer, msg_id, sender, emoji));",
         )?;
         // Columns added after the first release; "duplicate column" errors mean already migrated.
         let _ = db.execute_batch("ALTER TABLE messages ADD COLUMN enc INTEGER NOT NULL DEFAULT 0");
         let _ = db.execute_batch("ALTER TABLE chats ADD COLUMN enc TEXT NOT NULL DEFAULT ''");
+        let _ = db.execute_batch("ALTER TABLE messages ADD COLUMN edited INTEGER NOT NULL DEFAULT 0");
+        // MUC-assigned stanza-id (XEP-0359): what groupchat reactions point at.
+        let _ = db.execute_batch("ALTER TABLE messages ADD COLUMN sid TEXT");
         // SQLite's LOWER/LIKE only fold ASCII; search needs Cyrillic too.
         db.create_scalar_function("ulower", 1, rusqlite::functions::FunctionFlags::SQLITE_UTF8 | rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC, |ctx| {
             Ok(ctx.get::<String>(0)?.to_lowercase())
@@ -231,10 +238,53 @@ impl Store {
         let _ = self.db.execute("UPDATE messages SET url=?3, body=?3 WHERE peer=?1 AND msg_id=?2", params![peer, msg_id, url]);
     }
 
+    /// XEP-0308: replaces the text of a message, only if `sender` wrote it.
+    pub fn correct(&self, peer: &str, msg_id: &str, sender: &str, body: &str) -> bool {
+        self.db
+            .execute("UPDATE messages SET body=?4, edited=1 WHERE peer=?1 AND msg_id=?2 AND sender=?3 AND url IS NULL", params![peer, msg_id, sender, body])
+            .is_ok_and(|n| n > 0)
+    }
+
+    pub fn set_sid(&self, peer: &str, msg_id: &str, sid: &str) {
+        let _ = self.db.execute("UPDATE messages SET sid=?3 WHERE peer=?1 AND msg_id=?2", params![peer, msg_id, sid]);
+    }
+
+    pub fn sid(&self, peer: &str, msg_id: &str) -> Option<String> {
+        self.db.query_row("SELECT sid FROM messages WHERE peer=?1 AND msg_id=?2", [peer, msg_id], |r| r.get(0)).optional().ok().flatten().flatten()
+    }
+
+    /// Local id of the message that `id` (our id or the MUC stanza-id) refers to.
+    pub fn resolve(&self, peer: &str, id: &str) -> Option<String> {
+        self.db
+            .query_row("SELECT msg_id FROM messages WHERE peer=?1 AND (msg_id=?2 OR sid=?2) LIMIT 1", [peer, id], |r| r.get(0))
+            .optional()
+            .ok()
+            .flatten()
+    }
+
+    /// XEP-0444: `emojis` is the sender's full set for the message (empty removes all).
+    pub fn set_reactions(&self, peer: &str, msg_id: &str, sender: &str, emojis: &[String]) {
+        let _ = self.db.execute("DELETE FROM reactions WHERE peer=?1 AND msg_id=?2 AND sender=?3", [peer, msg_id, sender]);
+        for e in emojis {
+            let _ = self.db.execute("INSERT OR IGNORE INTO reactions(peer, msg_id, sender, emoji) VALUES(?1,?2,?3,?4)", [peer, msg_id, sender, e]);
+        }
+    }
+
+    /// msg_id -> (sender, emoji) of a chat, in arrival order.
+    pub fn reactions(&self, peer: &str) -> std::collections::HashMap<String, Vec<(String, String)>> {
+        let mut out: std::collections::HashMap<String, Vec<(String, String)>> = Default::default();
+        let mut stmt = self.db.prepare("SELECT msg_id, sender, emoji FROM reactions WHERE peer=?1 ORDER BY rowid").unwrap();
+        let rows = stmt.query_map([peer], |r| Ok((r.get::<_, String>(0)?, r.get(1)?, r.get(2)?))).unwrap();
+        for (id, sender, emoji) in rows.filter_map(Result::ok) {
+            out.entry(id).or_default().push((sender, emoji));
+        }
+        out
+    }
+
     pub fn history(&self, peer: &str, limit: usize) -> Vec<Msg> {
         let mut stmt = self
             .db
-            .prepare("SELECT msg_id, sender, outgoing, body, url, ts, status, enc FROM messages WHERE peer=?1 ORDER BY ts DESC, rowid DESC LIMIT ?2")
+            .prepare("SELECT msg_id, sender, outgoing, body, url, ts, status, enc, edited FROM messages WHERE peer=?1 ORDER BY ts DESC, rowid DESC LIMIT ?2")
             .unwrap();
         let mut v: Vec<Msg> = stmt
             .query_map(params![peer, limit as i64], row_to_msg)
@@ -256,12 +306,12 @@ impl Store {
         let mut stmt = self
             .db
             .prepare(
-                "SELECT peer, msg_id, sender, outgoing, body, url, ts, status, enc FROM messages
+                "SELECT peer, msg_id, sender, outgoing, body, url, ts, status, enc, edited FROM messages
                  WHERE url IS NULL AND ulower(body) LIKE ?1 ESCAPE '\\' AND (?3 IS NULL OR peer = ?3) ORDER BY ts DESC LIMIT ?2",
             )
             .unwrap();
         stmt.query_map(params![format!("%{escaped}%"), limit as i64, peer], |r| {
-            Ok((r.get(0)?, Msg { msg_id: r.get(1)?, sender: r.get(2)?, outgoing: r.get(3)?, body: r.get(4)?, url: r.get(5)?, ts: r.get(6)?, status: r.get(7)?, enc: r.get(8)? }))
+            Ok((r.get(0)?, Msg { msg_id: r.get(1)?, sender: r.get(2)?, outgoing: r.get(3)?, body: r.get(4)?, url: r.get(5)?, ts: r.get(6)?, status: r.get(7)?, enc: r.get(8)?, edited: r.get(9)? }))
         })
         .unwrap()
         .filter_map(Result::ok)
@@ -277,7 +327,7 @@ impl Store {
     pub fn attachments(&self, peer: &str) -> Vec<Msg> {
         let mut stmt = self
             .db
-            .prepare("SELECT msg_id, sender, outgoing, body, url, ts, status, enc FROM messages WHERE peer=?1 AND url IS NOT NULL ORDER BY ts")
+            .prepare("SELECT msg_id, sender, outgoing, body, url, ts, status, enc, edited FROM messages WHERE peer=?1 AND url IS NOT NULL ORDER BY ts")
             .unwrap();
         stmt.query_map([peer], row_to_msg).unwrap().filter_map(Result::ok).collect()
     }
@@ -286,7 +336,7 @@ impl Store {
     pub fn link_messages(&self, peer: &str) -> Vec<Msg> {
         let mut stmt = self
             .db
-            .prepare("SELECT msg_id, sender, outgoing, body, url, ts, status, enc FROM messages WHERE peer=?1 AND url IS NULL AND (body LIKE '%http://%' OR body LIKE '%https://%') ORDER BY ts DESC LIMIT 500")
+            .prepare("SELECT msg_id, sender, outgoing, body, url, ts, status, enc, edited FROM messages WHERE peer=?1 AND url IS NULL AND (body LIKE '%http://%' OR body LIKE '%https://%') ORDER BY ts DESC LIMIT 500")
             .unwrap();
         stmt.query_map([peer], row_to_msg).unwrap().filter_map(Result::ok).collect()
     }
@@ -334,11 +384,18 @@ impl Store {
     /// Removes one message locally (the server archive and the peer keep theirs).
     pub fn delete_msg(&self, peer: &str, msg_id: &str) {
         let _ = self.db.execute("DELETE FROM messages WHERE peer=?1 AND msg_id=?2", params![peer, msg_id]);
+        let _ = self.db.execute("DELETE FROM reactions WHERE peer=?1 AND msg_id=?2", params![peer, msg_id]);
+    }
+
+    /// Drops the chat from the list but keeps its messages.
+    pub fn forget_chat(&self, peer: &str) {
+        let _ = self.db.execute("DELETE FROM chats WHERE peer=?1", [peer]);
     }
 
     pub fn delete_chat(&self, peer: &str) {
         let _ = self.db.execute("DELETE FROM chats WHERE peer=?1", [peer]);
         let _ = self.db.execute("DELETE FROM messages WHERE peer=?1", [peer]);
+        let _ = self.db.execute("DELETE FROM reactions WHERE peer=?1", [peer]);
     }
 }
 
@@ -352,6 +409,7 @@ fn row_to_msg(r: &rusqlite::Row<'_>) -> rusqlite::Result<Msg> {
         ts: r.get(5)?,
         status: r.get(6)?,
         enc: r.get(7)?,
+        edited: r.get(8)?,
     })
 }
 
@@ -360,7 +418,7 @@ mod tests {
     use super::*;
 
     fn msg(id: &str, ts: i64, outgoing: bool) -> Msg {
-        Msg { msg_id: id.into(), sender: "a".into(), outgoing, body: id.into(), url: None, ts, status: 0, enc: 0 }
+        Msg { msg_id: id.into(), sender: "a".into(), outgoing, body: id.into(), url: None, ts, status: 0, enc: 0, edited: false }
     }
 
     #[test]
@@ -376,6 +434,26 @@ mod tests {
         let h = s.history("bob", 10);
         assert_eq!(h.iter().map(|m| (m.msg_id.as_str(), m.status)).collect::<Vec<_>>(), [("1", 2), ("2", 2), ("3", 0)]);
         assert_eq!(s.history("bob", 2).first().unwrap().msg_id, "2", "limit keeps the newest");
+    }
+
+    #[test]
+    fn corrections_and_reactions() {
+        let s = Store::open(Path::new(":memory:")).unwrap();
+        s.insert_msg("room", &msg("1", 10, false));
+        assert!(!s.correct("room", "1", "mallory", "x"), "only the author may correct");
+        assert!(s.correct("room", "1", "a", "fixed"));
+        let m = s.history("room", 1).pop().unwrap();
+        assert_eq!((m.body.as_str(), m.edited), ("fixed", true));
+
+        s.set_sid("room", "1", "sid-1");
+        assert_eq!(s.resolve("room", "sid-1").as_deref(), Some("1"));
+        assert_eq!(s.resolve("room", "1").as_deref(), Some("1"));
+        s.set_reactions("room", "1", "bob", &["👍".into(), "❤".into()]);
+        s.set_reactions("room", "1", "bob", &["👍".into()]);
+        s.set_reactions("room", "1", "eve", &["👍".into()]);
+        assert_eq!(s.reactions("room")["1"], [("bob".into(), "👍".into()), ("eve".into(), "👍".into())]);
+        s.delete_msg("room", "1");
+        assert!(s.reactions("room").is_empty());
     }
 
     #[test]

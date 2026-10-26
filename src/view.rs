@@ -954,6 +954,27 @@ impl App {
             }))
         });
 
+        let editing = sess.editing.as_ref().and_then(|id| sess.history.iter().find(|m| m.msg_id == *id)).map(|m| {
+            h_flex()
+                .flex_shrink_0()
+                .px_4()
+                .pt_2()
+                .gap_3()
+                .items_center()
+                .bg(p.panel)
+                .border_t_1()
+                .border_color(p.border)
+                .child(Icon::new(IconName::Pencil).small().text_color(p.accent))
+                .child(
+                    v_flex()
+                        .flex_1()
+                        .min_w_0()
+                        .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).text_color(p.accent).child("Изменение сообщения"))
+                        .child(div().text_sm().text_color(p.muted).truncate().child(m.body.replace('\n', " "))),
+                )
+                .child(Button::new("edit-cancel").ghost().xsmall().icon(IconName::X).tooltip("Отменить").on_click(cx.listener(|this, _, w, cx| this.cancel_edit(w, cx))))
+        });
+
         let composer = h_flex()
             .flex_shrink_0()
             .px_3()
@@ -961,7 +982,7 @@ impl App {
             .gap_2()
             .items_end()
             .bg(p.panel)
-            .when(pending.is_none(), |d| d.border_t_1().border_color(p.border))
+            .when(pending.is_none() && editing.is_none(), |d| d.border_t_1().border_color(p.border))
             .child(Button::new("attach").ghost().icon(IconName::Paperclip).tooltip("Прикрепить файл").on_click(cx.listener(|this, _, _, cx| this.attach(cx))))
             .child(
                 div()
@@ -1033,6 +1054,7 @@ impl App {
                 )
             }))
             .children(pending)
+            .children(editing)
             .child(composer)
             .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| this.add_pending(paths.0.iter().cloned(), cx)))
             .drag_over::<ExternalPaths>(move |s, _, _, _| s.opacity(0.85))
@@ -1055,6 +1077,32 @@ impl App {
         let (bg, fg, meta_c) = if m.outgoing { (p.bubble_out, p.bubble_out_text, p.meta_out) } else { (p.bubble_in, p.bubble_in_text, p.muted) };
         let code = hsla(0., 0., if p.dark || m.outgoing { 0. } else { 0.5 }, 0.18);
 
+        // (emoji, count, ours) in first-seen order.
+        let me = sess.selected.as_deref().map(|p| sess.my_sender(p)).unwrap_or_default();
+        let mut chips: Vec<(String, usize, bool)> = vec![];
+        for (who, e) in sess.reactions.get(&m.msg_id).into_iter().flatten() {
+            match chips.iter_mut().find(|c| c.0 == *e) {
+                Some(c) => {
+                    c.1 += 1;
+                    c.2 |= *who == me;
+                }
+                None => chips.push((e.clone(), 1, *who == me)),
+            }
+        }
+        let reactions = (!chips.is_empty()).then(|| {
+            h_flex().flex_wrap().gap_1().pt_0p5().children(chips.into_iter().map(|(e, n, mine)| {
+                let (id, emoji) = (m.msg_id.clone(), e.clone());
+                div()
+                    .id(SharedString::from(format!("re-{}-{e}", m.msg_id)))
+                    .px_1p5()
+                    .rounded_full()
+                    .text_sm()
+                    .cursor_pointer()
+                    .bg(if mine { p.accent.opacity(0.3) } else { code })
+                    .child(format!("{e} {n}"))
+                    .on_click(cx.listener(move |this, _, _, cx| this.toggle_reaction(&id, &emoji, cx)))
+            }))
+        });
         let content = match &m.url {
             _ if is_call(&m) => h_flex().gap_2().items_center().child(Icon::new(IconName::Phone).small()).child(m.body.clone()).into_any_element(),
             Some(url) => self.render_attachment(url, &m, cx),
@@ -1109,6 +1157,7 @@ impl App {
             .items_center()
             .text_xs()
             .text_color(meta_c)
+            .when(m.edited, |d| d.child("изменено"))
             .when(m.enc > 0, |d| d.child(Icon::new(IconName::Lock).xsmall()))
             .child(local(m.ts).format("%H:%M").to_string())
             .children(ticks);
@@ -1138,6 +1187,7 @@ impl App {
             .when(!p.dark, |d| d.shadow_sm())
             .when(show_sender, |b| b.child(div().text_sm().font_weight(FontWeight::SEMIBOLD).text_color(sender_color(&m.sender)).child(m.sender.clone())))
             .child(content)
+            .children(reactions)
             .child(meta);
 
         v_flex()
@@ -1487,6 +1537,34 @@ impl App {
                 .child(label)
         };
         let mut items: Vec<AnyElement> = vec![];
+        if !is_call(&m) {
+            items.push(
+                h_flex()
+                    .justify_between()
+                    .children(["👍", "❤️", "😂", "😮", "😢", "🙏"].into_iter().map(|e| {
+                        let id = m.msg_id.clone();
+                        div()
+                            .id(SharedString::from(format!("mm-re-{e}")))
+                            .px_1()
+                            .rounded_md()
+                            .cursor_pointer()
+                            .text_lg()
+                            .hover(|d| d.bg(p.hover))
+                            .child(e)
+                            .on_click(cx.listener(move |this, _, _, cx| this.toggle_reaction(&id, e, cx)))
+                    }))
+                    .into_any_element(),
+            );
+            items.push(div().h(px(1.)).my_1().bg(p.divider).into_any_element());
+        }
+        if m.outgoing && m.url.is_none() && !is_call(&m) && m.status >= 0 {
+            let msg = m.clone();
+            items.push(
+                item("mm-edit", IconName::Pencil, "Изменить", false)
+                    .on_click(cx.listener(move |this, _, w, cx| this.start_edit(&msg, w, cx)))
+                    .into_any_element(),
+            );
+        }
         if m.url.is_none() {
             let text = m.body.clone();
             items.push(

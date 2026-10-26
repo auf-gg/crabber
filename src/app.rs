@@ -15,7 +15,7 @@ use gpui_kit::*;
 use crabber::call::{CallCmd, CallEv, CallState};
 use crabber::store::{self, ChatRow, Msg, Store};
 use crabber::e2e::DeviceInfo;
-use crabber::xmpp::{self, Account, Cmd, Ev};
+use crabber::xmpp::{self, Account, Bookmark, Cmd, Ev};
 use tokio_xmpp::jid::BareJid;
 use tokio_xmpp::parsers::presence::Show;
 
@@ -137,6 +137,10 @@ pub struct Session {
     pub pgp_own: Option<(String, String)>,
     /// Contact -> (fingerprint of the stored key, key id seen in their presence).
     pub pgp_contacts: HashMap<String, (Option<String>, Option<String>)>,
+    /// Our message being corrected in the composer (XEP-0308).
+    pub editing: Option<String>,
+    /// Reactions of the open chat: msg_id -> (sender, emoji).
+    pub reactions: HashMap<String, Vec<(String, String)>>,
 }
 
 impl Session {
@@ -178,6 +182,18 @@ impl Session {
     }
     fn sort_chats(&mut self) {
         self.chats.sort_by_key(|c| std::cmp::Reverse(c.last.as_ref().map_or(0, |m| m.ts)));
+    }
+    /// How we appear as a sender in this chat: our nick in groups, our JID otherwise.
+    pub fn my_sender(&self, peer: &str) -> String {
+        match self.chat(peer) {
+            Some(c) if c.is_room => c.nick.clone(),
+            _ => self.me.clone(),
+        }
+    }
+    fn publish_bookmark(&self, room: &str) {
+        if let Some(c) = self.chat(room) {
+            self.send(Cmd::Bookmark(Bookmark { room: room.to_string(), name: c.name.clone(), nick: c.nick.clone() }));
+        }
     }
     fn load_avatar(&mut self, jid: &str) {
         let path = store::avatar_path(&self.dir, jid);
@@ -527,6 +543,8 @@ impl App {
             e2e_devices: HashMap::new(),
             pgp_own: None,
             pgp_contacts: HashMap::new(),
+            editing: None,
+            reactions: HashMap::new(),
         };
         for peer in sess.chats.iter().map(|c| c.peer.clone()).chain([jid]).collect::<Vec<_>>() {
             sess.load_avatar(&peer);
@@ -647,6 +665,9 @@ impl App {
         } else if self.viewer.take().is_some() {
             // Back to whatever was under the viewer (e.g. the media panel).
         } else if self.modal.take().is_some() {
+        } else if let Some(sess) = self.sess.as_mut().filter(|s| s.editing.is_some()) {
+            sess.editing = None;
+            self.compose.update(cx, |s, cx| s.set_value("", window, cx));
         } else if !self.search.read(cx).value().is_empty() {
             self.search.update(cx, |s, cx| s.set_value("", window, cx));
             self.run_search(cx);
@@ -841,11 +862,16 @@ impl App {
                         sess.requests.push(jid);
                     }
                 }
-                Ev::Message { peer, groupchat, msg, archive_id, live } => {
+                Ev::Message { peer, groupchat, msg, archive_id, live, sid } => {
                     if let Some(id) = archive_id {
                         sess.store.set("mam_last", &id);
                     }
-                    if !sess.store.insert_msg(&peer, &msg) {
+                    let inserted = sess.store.insert_msg(&peer, &msg);
+                    // Our own groupchat messages learn their stanza-id from the room's echo.
+                    if let Some(sid) = &sid {
+                        sess.store.set_sid(&peer, &msg.msg_id, sid);
+                    }
+                    if !inserted {
                         // Duplicate: MUC echo / carbon of something we sent confirms delivery.
                         if msg.outgoing && sess.store.set_status(&peer, &msg.msg_id, 1) {
                             update_history(sess, &peer, |m| {
@@ -884,6 +910,39 @@ impl App {
                         let pos = sess.history.iter().rposition(|m| m.ts <= msg.ts).map_or(0, |p| p + 1);
                         sess.history.insert(pos, msg);
                         self.messages.splice(pos..pos, 1);
+                    }
+                }
+                Ev::Correct { peer, id, sender, body } => apply_correction(sess, &peer, &id, &sender, &body),
+                Ev::Reactions { peer, id, sender, emojis } => {
+                    if let Some(msg_id) = sess.store.resolve(&peer, &id) {
+                        sess.store.set_reactions(&peer, &msg_id, &sender, &emojis);
+                        if sess.selected.as_deref() == Some(&peer) {
+                            sess.reactions = sess.store.reactions(&peer);
+                        }
+                    }
+                }
+                Ev::Bookmarks(list) => {
+                    // After the first sync a room missing on the server was left on another device.
+                    let synced = sess.store.get("bookmarks_synced").is_some() && list.is_some();
+                    let list = list.unwrap_or_default();
+                    let remote: HashSet<String> = list.iter().map(|b| b.room.clone()).collect();
+                    let missing: Vec<String> = sess.chats.iter().filter(|c| c.is_room && !remote.contains(&c.peer)).map(|c| c.peer.clone()).collect();
+                    for room in missing {
+                        if synced {
+                            forget_room(sess, &mut self.messages, &room);
+                        } else {
+                            sess.publish_bookmark(&room);
+                        }
+                    }
+                    for b in list {
+                        add_bookmark(sess, b);
+                    }
+                    sess.store.set("bookmarks_synced", "1");
+                }
+                Ev::BookmarkAdded(b) => add_bookmark(sess, b),
+                Ev::BookmarkRemoved { room } => {
+                    if sess.chat(&room).is_some_and(|c| c.is_room) {
+                        forget_room(sess, &mut self.messages, &room);
                     }
                 }
                 Ev::Receipt { peer, id } => {
@@ -934,6 +993,7 @@ impl App {
                         let nick = sess.localpart();
                         sess.ensure_chat(&room, true);
                         sess.send(Cmd::Join { room: room.clone(), nick, since: None, create_name: None });
+                        sess.publish_bookmark(&room);
                         notes.push(format!("{from} добавил вас в группу {room}"));
                     }
                 }
@@ -1053,6 +1113,8 @@ impl App {
     fn select_with(&mut self, peer: String, limit: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(sess) = self.sess.as_mut() else { return };
         sess.history = sess.store.history(&peer, limit);
+        sess.reactions = sess.store.reactions(&peer);
+        sess.editing = None;
         self.messages.set_follow_mode(FollowMode::Tail);
         sess.selected = Some(peer);
         sess.typing_sent = None;
@@ -1122,11 +1184,14 @@ impl App {
         let body = self.compose.read(cx).value().trim_end().to_string();
         let Some(sess) = self.sess.as_mut() else { return };
         let Some(peer) = sess.selected.clone() else { return };
+        let editing = sess.editing.take();
         for path in std::mem::take(&mut sess.pending) {
             self.send_file(path);
         }
-        if !body.trim().is_empty() {
-            self.send_body(&peer, body);
+        match editing {
+            Some(id) => self.send_correction(&peer, id, body),
+            None if !body.trim().is_empty() => self.send_body(&peer, body),
+            None => {}
         }
         self.compose.update(cx, |s, cx| s.set_value("", window, cx));
         cx.notify();
@@ -1141,7 +1206,62 @@ impl App {
         sess.typing_sent = None;
         let enc = sess.chat(&peer).map(|c| c.enc.clone()).unwrap_or_default();
         sess.send(Cmd::Send { to: peer.clone(), id: id.clone(), body: body.clone(), groupchat, enc });
-        self.push_outgoing(&peer, Msg { msg_id: id, sender, outgoing: true, body, url: None, ts: now_ms(), status: 0, enc: 0 });
+        self.push_outgoing(&peer, Msg { msg_id: id, sender, outgoing: true, body, url: None, ts: now_ms(), status: 0, enc: 0, edited: false });
+    }
+
+    fn send_correction(&mut self, peer: &str, id: String, body: String) {
+        let Some(sess) = self.sess.as_mut() else { return };
+        let unchanged = sess.history.iter().any(|m| m.msg_id == id && m.body == body);
+        if body.trim().is_empty() || unchanged {
+            return;
+        }
+        let groupchat = sess.chat(peer).is_some_and(|c| c.is_room);
+        let enc = sess.chat(peer).map(|c| c.enc.clone()).unwrap_or_default();
+        let sender = sess.my_sender(peer);
+        sess.send(Cmd::Correct { to: peer.to_string(), replace: id.clone(), body: body.clone(), groupchat, enc });
+        apply_correction(sess, peer, &id, &sender, &body);
+    }
+
+    /// "Edit" from the message menu: loads our text into the composer.
+    pub fn start_edit(&mut self, m: &Msg, window: &mut Window, cx: &mut Context<Self>) {
+        self.msg_menu = None;
+        let Some(sess) = self.sess.as_mut() else { return };
+        sess.editing = Some(m.msg_id.clone());
+        let body = m.body.clone();
+        self.compose.update(cx, |s, cx| {
+            s.set_value(body, window, cx);
+            s.focus(window, cx);
+        });
+        cx.notify();
+    }
+
+    pub fn cancel_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(sess) = self.sess.as_mut() {
+            sess.editing = None;
+        }
+        self.compose.update(cx, |s, cx| s.set_value("", window, cx));
+        cx.notify();
+    }
+
+    /// Adds or removes our `emoji` on a message of the open chat (XEP-0444).
+    pub fn toggle_reaction(&mut self, msg_id: &str, emoji: &str, cx: &mut Context<Self>) {
+        self.msg_menu = None;
+        let Some(sess) = self.sess.as_mut() else { return };
+        let Some(peer) = sess.selected.clone() else { return };
+        let me = sess.my_sender(&peer);
+        let mut mine: Vec<String> = sess.reactions.get(msg_id).into_iter().flatten().filter(|(s, _)| *s == me).map(|(_, e)| e.clone()).collect();
+        if let Some(ix) = mine.iter().position(|e| e == emoji) {
+            mine.remove(ix);
+        } else {
+            mine.push(emoji.to_string());
+        }
+        let groupchat = sess.chat(&peer).is_some_and(|c| c.is_room);
+        // Groups address messages by the room's stanza-id.
+        let id = if groupchat { sess.store.sid(&peer, msg_id).unwrap_or_else(|| msg_id.to_string()) } else { msg_id.to_string() };
+        sess.send(Cmd::React { to: peer.clone(), id, emojis: mine.clone(), groupchat });
+        sess.store.set_reactions(&peer, msg_id, &me, &mine);
+        sess.reactions = sess.store.reactions(&peer);
+        cx.notify();
     }
 
     fn on_desktop(&mut self, ev: DesktopEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -1223,7 +1343,7 @@ impl App {
         sess.uploads.insert(id.clone(), path.clone());
         let enc = sess.chat(&peer).map(|c| c.enc.clone()).unwrap_or_default();
         sess.send(Cmd::Upload { to: peer.clone(), id: id.clone(), path, groupchat, enc });
-        self.push_outgoing(&peer, Msg { msg_id: id, sender, outgoing: true, body: format!("Отправка файла {name}..."), url: None, ts: now_ms(), status: 0, enc: 0 });
+        self.push_outgoing(&peer, Msg { msg_id: id, sender, outgoing: true, body: format!("Отправка файла {name}..."), url: None, ts: now_ms(), status: 0, enc: 0, edited: false });
     }
 
     pub fn change_avatar(&mut self, cx: &mut Context<Self>) {
@@ -1389,6 +1509,7 @@ impl App {
                 chat.name = v2.clone();
                 sess.save(&room);
                 sess.send(Cmd::Join { room: room.clone(), nick, since: None, create_name: Some(v2) });
+                sess.publish_bookmark(&room);
                 self.select(room, window, cx);
             }
             Some(Modal::JoinGroup) => {
@@ -1401,6 +1522,7 @@ impl App {
                 sess.ensure_chat(&v2, true);
                 sess.save(&v2);
                 sess.send(Cmd::Join { room: v2.clone(), nick, since: sess.store.last_ts(&v2), create_name: None });
+                sess.publish_bookmark(&v2);
                 self.select(v2, window, cx);
             }
             other => self.modal = other,
@@ -1504,7 +1626,7 @@ impl App {
             None => "Пропущенный звонок".to_string(),
         };
         let sender = if c.outgoing { me } else { c.peer.clone() };
-        let msg = Msg { msg_id: format!("{CALL_ID}{}", xmpp::new_id()), sender, outgoing: c.outgoing, body, url: None, ts: now_ms(), status: 2, enc: 0 };
+        let msg = Msg { msg_id: format!("{CALL_ID}{}", xmpp::new_id()), sender, outgoing: c.outgoing, body, url: None, ts: now_ms(), status: 2, enc: 0, edited: false };
         self.push_outgoing(&c.peer, msg);
     }
 }
@@ -1576,6 +1698,48 @@ fn apply_contact(sess: &mut Session, c: xmpp::Contact) {
         chat.name = c.name;
     }
     sess.save(&c.jid);
+}
+
+fn apply_correction(sess: &mut Session, peer: &str, id: &str, sender: &str, body: &str) {
+    if !sess.store.correct(peer, id, sender, body) {
+        return;
+    }
+    let fix = |m: &mut Msg| {
+        if m.msg_id == id {
+            m.body = body.to_string();
+            m.edited = true;
+        }
+    };
+    update_history(sess, peer, fix);
+    if let Some(last) = sess.chat_mut(peer).and_then(|c| c.last.as_mut()) {
+        fix(last);
+    }
+}
+
+/// A bookmarked room (from the server) we are not in yet: add and join it.
+fn add_bookmark(sess: &mut Session, b: Bookmark) {
+    if sess.chat(&b.room).is_some() {
+        return;
+    }
+    let nick = if b.nick.is_empty() { sess.localpart() } else { b.nick };
+    let chat = sess.ensure_chat(&b.room, true);
+    chat.name = b.name;
+    chat.nick = nick.clone();
+    sess.save(&b.room);
+    let since = sess.store.last_ts(&b.room);
+    sess.send(Cmd::Join { room: b.room, nick, since, create_name: None });
+}
+
+/// Room left on another device: leave here too. History stays in the database for a rejoin.
+fn forget_room(sess: &mut Session, messages: &mut ListState, room: &str) {
+    sess.send(Cmd::Leave { room: room.to_string() });
+    sess.store.forget_chat(room);
+    sess.chats.retain(|c| c.peer != room);
+    if sess.selected.as_deref() == Some(room) {
+        sess.selected = None;
+        sess.history.clear();
+        messages.reset(0);
+    }
 }
 
 fn update_history(sess: &mut Session, peer: &str, f: impl FnMut(&mut Msg)) {

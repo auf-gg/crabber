@@ -13,6 +13,7 @@ use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
 use futures::channel::oneshot;
 use tokio_xmpp::minidom::Element;
 use tokio_xmpp::parsers::{
+    bookmarks2::Conference,
     caps::{self, Caps},
     carbons,
     chatstates::ChatState,
@@ -25,6 +26,7 @@ use tokio_xmpp::parsers::{
     jid::{BareJid, Jid},
     mam::{self, QueryId},
     message::{Id, Lang, Message, MessageType},
+    message_correct::Replace,
     muc::{
         Muc,
         muc::History,
@@ -34,6 +36,7 @@ use tokio_xmpp::parsers::{
     oob::Oob,
     ping::Ping,
     presence::{Presence, Show, Type as PresenceType},
+    reactions::{Reaction, Reactions},
     receipts::{Received, Request as ReceiptRequest},
     roster::{Item as RosterItem, Roster, Subscription},
     rsm::SetQuery,
@@ -69,11 +72,25 @@ pub struct Contact {
     pub subscription: String,
 }
 
+/// XEP-0402 room bookmark with autojoin set.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Bookmark {
+    pub room: String,
+    pub name: String,
+    pub nick: String,
+}
+
 pub enum Cmd {
     /// Sent by the UI after `Ev::Online`: MAM catch-up point and rooms to rejoin.
     Sync { mam_after: Option<String>, rooms: Vec<(String, String, Option<i64>)> },
     /// `enc`: chat encryption mode — "auto" | "omemo" | "pgp" | "plain".
     Send { to: String, id: String, body: String, groupchat: bool, enc: String },
+    /// XEP-0308: new text for our message `replace` (its msg_id).
+    Correct { to: String, replace: String, body: String, groupchat: bool, enc: String },
+    /// XEP-0444: our full set of reactions to message `id` (MUC stanza-id in groups).
+    React { to: String, id: String, emojis: Vec<String>, groupchat: bool },
+    /// XEP-0402: store the room on the server so other devices join it too.
+    Bookmark(Bookmark),
     Upload { to: String, id: String, path: PathBuf, groupchat: bool, enc: String },
     Download { url: String, path: PathBuf },
     Typing { to: String, on: bool },
@@ -109,7 +126,16 @@ pub enum Ev {
     Presence { jid: String, online: bool },
     SubscribeRequest { jid: String },
     /// `live`: arrived just now (not from MAM, offline storage or MUC history) — worth a notification.
-    Message { peer: String, groupchat: bool, msg: Msg, archive_id: Option<String>, live: bool },
+    /// `sid`: stanza-id the room assigned (groupchat only).
+    Message { peer: String, groupchat: bool, msg: Msg, archive_id: Option<String>, live: bool, sid: Option<String> },
+    /// XEP-0308: `sender` replaced the text of their message `id`.
+    Correct { peer: String, id: String, sender: String, body: String },
+    /// XEP-0444: `sender`'s full reaction set for message `id`.
+    Reactions { peer: String, id: String, sender: String, emojis: Vec<String> },
+    /// Server bookmarks at login; `None`: the account has no bookmarks node yet.
+    Bookmarks(Option<Vec<Bookmark>>),
+    BookmarkAdded(Bookmark),
+    BookmarkRemoved { room: String },
     Receipt { peer: String, id: String },
     Displayed { peer: String, id: String, by_me: bool },
     Typing { peer: String, who: String, on: bool },
@@ -299,6 +325,9 @@ fn disco_info(node: Option<String>) -> DiscoInfoResult {
         omemo::NS,
         "eu.siacs.conversations.axolotl.devicelist+notify",
         e2e::NS_EME,
+        ns::MESSAGE_CORRECT,
+        ns::REACTIONS,
+        "urn:xmpp:bookmarks:1+notify",
     ];
     DiscoInfoResult {
         node,
@@ -367,6 +396,19 @@ impl State {
         let dir = self.dir.clone();
         let me = self.me.to_string();
         tokio::spawn(async move { fetch_avatar(&net, &dir, &me).await });
+        let net = self.net.clone();
+        tokio::spawn(async move {
+            let req = Element::builder("pubsub", ns::PUBSUB).append(Element::builder("items", ns::PUBSUB).attr(nc("node"), ns::BOOKMARKS2)).build();
+            match net.iq(None, IqRequest::Get(req)).await {
+                Ok(el) => {
+                    let list = el.as_ref().and_then(|e| e.get_child("items", ns::PUBSUB)).map(|i| i.children().filter_map(bookmark).collect()).unwrap_or_default();
+                    net.emit(Ev::Bookmarks(Some(list)));
+                }
+                Err(e) if e == "ItemNotFound" => net.emit(Ev::Bookmarks(None)),
+                // No PEP bookmarks on this server: rooms stay local-only.
+                Err(e) => eprintln!("bookmarks: {e}"),
+            }
+        });
         if let Some(e2e) = self.e2e.clone() {
             tokio::spawn(e2e::on_online(e2e, self.net.clone()));
         }
@@ -381,29 +423,36 @@ impl State {
                     self.join(room, nick, since, None);
                 }
             }
-            Cmd::Send { to, id, body, groupchat, enc } => {
-                let Some(e2e) = self.e2e.clone().filter(|_| !groupchat && enc != "plain") else {
-                    return self.send_message(&to, id, body, None, groupchat);
-                };
+            Cmd::Send { to, id, body, groupchat, enc } => self.send_text(to, id, body, groupchat, enc, None),
+            // The correction gets its own stanza id; errors about it then match no stored message.
+            Cmd::Correct { to, replace, body, groupchat, enc } => self.send_text(to, new_id(), body, groupchat, enc, Some(replace)),
+            Cmd::React { to, id, emojis, groupchat } => {
+                let mut m = Message::new_with_type(if groupchat { MessageType::Groupchat } else { MessageType::Chat }, jid(&to).map(Jid::from))
+                    .with_payload(Reactions { id, reactions: emojis.into_iter().map(|emoji| Reaction { emoji }).collect() })
+                    .with_payloads(vec![Element::builder("store", "urn:xmpp:hints").build()]);
+                m.id = Some(Id(new_id()));
+                self.net.send(m);
+            }
+            Cmd::Bookmark(b) => {
                 let net = self.net.clone();
                 tokio::spawn(async move {
-                    if enc == "pgp" {
-                        match pgp_encrypt(&e2e, &to, &body).await {
-                            Ok(payload) => {
-                                net.send(pgp_message(&to, &id, payload));
-                                net.emit(Ev::SentEncrypted { peer: to, id, enc: 2 });
-                            }
-                            Err(error) => net.emit(Ev::SendFailed { peer: to, id, error }),
-                        }
-                        return;
-                    }
-                    match encrypt_for(&e2e, &net, &to, &enc, &body).await {
-                        Ok(Some(el)) => {
-                            net.send(encrypted_message(&to, &id, el));
-                            net.emit(Ev::SentEncrypted { peer: to, id, enc: 1 });
-                        }
-                        Ok(None) => net.send(chat_message(&to, &id, body, None, false)),
-                        Err(error) => net.emit(Ev::SendFailed { peer: to, id, error }),
+                    let conf = Conference { autojoin: true, name: (!b.name.is_empty()).then_some(b.name), nick: b.nick.parse().ok(), password: None, extensions: None };
+                    let field = |var: &str, value: &str| Element::builder("field", ns::DATA_FORMS).attr(nc("var"), var).append(Element::builder("value", ns::DATA_FORMS).append(value));
+                    // XEP-0402 node options; whitelist keeps the room list private.
+                    let options = Element::builder("x", ns::DATA_FORMS)
+                        .attr(nc("type"), "submit")
+                        .append(field("FORM_TYPE", "http://jabber.org/protocol/pubsub#publish-options"))
+                        .append(field("pubsub#persist_items", "true"))
+                        .append(field("pubsub#max_items", "max"))
+                        .append(field("pubsub#send_last_published_item", "never"))
+                        .append(field("pubsub#access_model", "whitelist"));
+                    let item = Element::builder("item", ns::PUBSUB).attr(nc("id"), b.room).append(Element::from(conf));
+                    let req = Element::builder("pubsub", ns::PUBSUB)
+                        .append(Element::builder("publish", ns::PUBSUB).attr(nc("node"), ns::BOOKMARKS2).append(item))
+                        .append(Element::builder("publish-options", ns::PUBSUB).append(options))
+                        .build();
+                    if let Err(e) = net.iq(None, IqRequest::Set(req)).await {
+                        eprintln!("bookmark publish: {e}");
                     }
                 });
             }
@@ -558,6 +607,14 @@ impl State {
                 {
                     self.net.send(Presence::unavailable().with_to(full));
                 }
+                let retract = Element::builder("pubsub", ns::PUBSUB)
+                    .append(Element::builder("retract", ns::PUBSUB).attr(nc("node"), ns::BOOKMARKS2).attr(nc("notify"), "true").append(Element::builder("item", ns::PUBSUB).attr(nc("id"), room)))
+                    .build();
+                let net = self.net.clone();
+                tokio::spawn(async move {
+                    // item-not-found when it was never bookmarked: nothing to do.
+                    let _ = net.iq(None, IqRequest::Set(retract)).await;
+                });
             }
             Cmd::Invite { room, jid: j } => {
                 let Some(r) = jid(&room) else { return };
@@ -688,8 +745,36 @@ impl State {
         self.net.send(self.presence().with_to(full).with_payload(Muc::new().with_history(history)));
     }
 
-    fn send_message(&self, to: &str, id: String, body: String, url: Option<String>, groupchat: bool) {
-        self.net.send(chat_message(to, &id, body, url, groupchat));
+    /// Text message, encrypted per `enc`; `replace` makes it an XEP-0308 correction.
+    fn send_text(&self, to: String, id: String, body: String, groupchat: bool, enc: String, replace: Option<String>) {
+        let fix = move |m: Message| match &replace {
+            Some(r) => m.with_payload(Replace { id: Id(r.clone()) }),
+            None => m,
+        };
+        let Some(e2e) = self.e2e.clone().filter(|_| !groupchat && enc != "plain") else {
+            return self.net.send(fix(chat_message(&to, &id, body, None, groupchat)));
+        };
+        let net = self.net.clone();
+        tokio::spawn(async move {
+            if enc == "pgp" {
+                match pgp_encrypt(&e2e, &to, &body).await {
+                    Ok(payload) => {
+                        net.send(fix(pgp_message(&to, &id, payload)));
+                        net.emit(Ev::SentEncrypted { peer: to, id, enc: 2 });
+                    }
+                    Err(error) => net.emit(Ev::SendFailed { peer: to, id, error }),
+                }
+                return;
+            }
+            match encrypt_for(&e2e, &net, &to, &enc, &body).await {
+                Ok(Some(el)) => {
+                    net.send(fix(encrypted_message(&to, &id, el)));
+                    net.emit(Ev::SentEncrypted { peer: to, id, enc: 1 });
+                }
+                Ok(None) => net.send(fix(chat_message(&to, &id, body, None, false))),
+                Err(error) => net.emit(Ev::SendFailed { peer: to, id, error }),
+            }
+        });
     }
 
     fn reply_iq(&self, iq: Iq) {
@@ -892,6 +977,26 @@ impl State {
             }
             return;
         }
+        // XEP-0402 bookmark changes from our other devices; only our own account may send them.
+        if let Some(items) = m.payloads.iter().find(|p| p.is("event", e2e::NS_PUBSUB_EVENT)).and_then(|e| e.get_child("items", e2e::NS_PUBSUB_EVENT))
+            && items.attr("node") == Some(ns::BOOKMARKS2)
+        {
+            if outgoing_carbon {
+                for c in items.children() {
+                    match (c.name(), bookmark(c)) {
+                        ("item", Some(b)) => self.net.emit(Ev::BookmarkAdded(b)),
+                        // autojoin=false means "left" for other clients.
+                        ("item" | "retract", None) => {
+                            if let Some(room) = c.attr("id") {
+                                self.net.emit(Ev::BookmarkRemoved { room: room.to_string() });
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            return;
+        }
         let groupchat = m.type_ == MessageType::Groupchat;
 
         // Calls: XEP-0353 propose/proceed/accept/reject/retract.
@@ -943,6 +1048,11 @@ impl State {
                 let on = state == ChatState::Composing;
                 self.net.emit(Ev::Typing { peer: peer.clone(), who: sender.clone(), on });
             }
+        }
+        if let Some(r) = m.payloads.iter().find_map(|p| Reactions::try_from(p.clone()).ok()) {
+            let emojis = r.reactions.into_iter().map(|x| x.emoji).collect();
+            self.net.emit(Ev::Reactions { peer, id: r.id, sender, emojis });
+            return;
         }
 
         // OMEMO: decrypt off the loop, then process the plaintext as a normal message.
@@ -1013,15 +1123,18 @@ impl State {
         {
             self.net.send(Message::chat(Some(from.clone())).with_payload(Received { id: id.0.clone() }));
         }
+        if let Some(r) = m.payloads.iter().find_map(|p| Replace::try_from(p.clone()).ok()) {
+            if url.is_none() {
+                self.net.emit(Ev::Correct { peer, id: r.id.0, sender, body });
+            }
+            return;
+        }
 
         let delay_ts = m.payloads.iter().find_map(|p| Delay::try_from(p.clone()).ok()).map(|d| d.stamp.0.timestamp_millis());
         let ts = archived.as_ref().and_then(|a| a.1).or(delay_ts).unwrap_or_else(now_ms);
-        let stanza_id = m
-            .payloads
-            .iter()
-            .filter_map(|p| StanzaId::try_from(p.clone()).ok())
-            .find(|s| s.by.to_bare() == self.me)
-            .map(|s| s.id);
+        let stanza_ids: Vec<StanzaId> = m.payloads.iter().filter_map(|p| StanzaId::try_from(p.clone()).ok()).collect();
+        let stanza_id = stanza_ids.iter().find(|s| s.by.to_bare() == self.me).map(|s| s.id.clone());
+        let sid = stanza_ids.iter().find(|s| groupchat && s.by.to_bare() == from.to_bare()).map(|s| s.id.clone());
         let archive_id = if groupchat { None } else { archived.as_ref().map(|a| a.0.clone()).or(stanza_id) };
         let origin = m.payloads.iter().find_map(|p| OriginId::try_from(p.clone()).ok()).map(|o| o.id);
         let msg_id = origin
@@ -1032,9 +1145,10 @@ impl State {
         self.net.emit(Ev::Message {
             peer,
             groupchat,
-            msg: Msg { msg_id, sender, outgoing, body, url, ts, status: if outgoing { 1 } else { 0 }, enc },
+            msg: Msg { msg_id, sender, outgoing, body, url, ts, status: if outgoing { 1 } else { 0 }, enc, edited: false },
             archive_id,
             live: live && delay_ts.is_none(),
+            sid,
         });
     }
 }
@@ -1116,6 +1230,13 @@ fn contact(i: &RosterItem) -> Contact {
         Subscription::Remove => "remove",
     };
     Contact { jid: i.jid.to_string(), name: i.name.clone().unwrap_or_default(), subscription: subscription.into() }
+}
+
+/// Pubsub item of the XEP-0402 node (`<item id=room><conference/></item>`); `None` unless autojoin.
+fn bookmark(item: &Element) -> Option<Bookmark> {
+    let room = item.attr("id")?;
+    let conf = Conference::try_from(item.get_child("conference", ns::BOOKMARKS2)?.clone()).ok()?;
+    conf.autojoin.then(|| Bookmark { room: room.to_string(), name: conf.name.unwrap_or_default(), nick: conf.nick.map(|n| n.to_string()).unwrap_or_default() })
 }
 
 fn room_config_form(name: &str) -> Element {
@@ -1225,5 +1346,15 @@ mod caps_tests {
         let s = super::caps_string(&super::disco_info(None));
         assert!(s.starts_with("client/pc/en/Crabber<"));
         assert!(s.contains("<eu.siacs.conversations.axolotl<eu.siacs.conversations.axolotl.devicelist+notify<"), "{s}");
+    }
+
+    #[test]
+    fn bookmark_items() {
+        let item = |autojoin: &str| -> super::Element {
+            format!("<item xmlns='http://jabber.org/protocol/pubsub#event' id='r@muc.x'><conference xmlns='urn:xmpp:bookmarks:1' autojoin='{autojoin}' name='Room'><nick>me</nick></conference></item>").parse().unwrap()
+        };
+        let b = super::bookmark(&item("true")).unwrap();
+        assert_eq!((b.room.as_str(), b.name.as_str(), b.nick.as_str()), ("r@muc.x", "Room", "me"));
+        assert!(super::bookmark(&item("false")).is_none(), "not autojoin = left");
     }
 }
