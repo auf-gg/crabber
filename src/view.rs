@@ -450,6 +450,7 @@ impl Render for App {
             .when(cfg!(windows), |d| d.child(self.render_titlebar(window, cx)))
             .child(content)
             .when_some(self.render_msg_menu(window, cx), |d, m| d.child(m))
+            .when_some(self.render_emoji_picker(window, cx), |d, m| d.child(m))
     }
 }
 
@@ -1541,7 +1542,7 @@ impl App {
             items.push(
                 h_flex()
                     .justify_between()
-                    .children(["👍", "❤️", "😂", "😮", "😢", "🙏"].into_iter().map(|e| {
+                    .children(["👍", "❤️", "😂", "😮", "😢", "🙏", "🤝"].into_iter().map(|e| {
                         let id = m.msg_id.clone();
                         div()
                             .id(SharedString::from(format!("mm-re-{e}")))
@@ -1553,6 +1554,23 @@ impl App {
                             .child(e)
                             .on_click(cx.listener(move |this, _, _, cx| this.toggle_reaction(&id, e, cx)))
                     }))
+                    .child({
+                        let id = m.msg_id.clone();
+                        div()
+                            .id("mm-re-more")
+                            .p_1()
+                            .rounded_md()
+                            .cursor_pointer()
+                            .text_color(p.muted)
+                            .hover(|d| d.bg(p.hover))
+                            .child(Icon::new(IconName::Plus).small())
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.msg_menu = None;
+                                this.emoji_picker = Some((id.clone(), pos, emojis::Group::SmileysAndEmotion));
+                                cx.notify();
+                            }))
+                    })
+                    .items_center()
                     .into_any_element(),
             );
             items.push(div().h(px(1.)).my_1().bg(p.divider).into_any_element());
@@ -1616,7 +1634,7 @@ impl App {
         );
 
         let rem = window.rem_size();
-        let (w, h) = (rem * 14., rem * (2.3 * items.len() as f32 + 0.5));
+        let (w, h) = (rem * 17., rem * (2.3 * items.len() as f32 + 0.5));
         let view = window.viewport_size();
         let x = if pos.x + w > view.width { pos.x - w } else { pos.x };
         let y = if pos.y + h > view.height { (pos.y - h).max(px(0.)) } else { pos.y };
@@ -1650,6 +1668,83 @@ impl App {
                         // Clicks on items must not reach the backdrop's "close" handler first.
                         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                         .children(items),
+                )
+                .into_any_element(),
+        )
+    }
+
+    /// Every emoji, one group per tab; a click toggles it as our reaction.
+    fn render_emoji_picker(&self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let (msg_id, pos, group) = self.emoji_picker.clone()?;
+        let p = style::palette(cx);
+        let rem = window.rem_size();
+        let (w, h) = (rem * 22., rem * 20.);
+        let view = window.viewport_size();
+        let x = if pos.x + w > view.width { (pos.x - w).max(px(0.)) } else { pos.x };
+        let y = if pos.y + h > view.height { (pos.y - h).max(px(0.)) } else { pos.y };
+        let tabs = h_flex().gap_0p5().pb_1().border_b_1().border_color(p.divider).children(emojis::Group::iter().map(|g| {
+            let icon = g.emojis().next().map(|e| e.as_str()).unwrap_or("?");
+            div()
+                .id(SharedString::from(format!("ep-tab-{g:?}")))
+                .flex_1()
+                .flex()
+                .justify_center()
+                .py_0p5()
+                .rounded_md()
+                .cursor_pointer()
+                .when(g == group, |d| d.bg(p.hover))
+                .hover(|d| d.bg(p.hover))
+                .child(icon)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    if let Some(picker) = this.emoji_picker.as_mut() {
+                        picker.2 = g;
+                    }
+                    cx.notify();
+                }))
+        }));
+        let grid = div().id("ep-grid").flex_1().min_h_0().overflow_y_scroll().child(h_flex().flex_wrap().children(group.emojis().filter(|e| crate::desktop::emoji_supported(e)).map(|e| {
+            let (id, emoji) = (msg_id.clone(), e.as_str());
+            div()
+                .id(SharedString::from(format!("ep-{emoji}")))
+                .size(dp(32.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded_md()
+                .text_lg()
+                .cursor_pointer()
+                .hover(|d| d.bg(p.hover))
+                .child(emoji)
+                .on_click(cx.listener(move |this, _, _, cx| this.toggle_reaction(&id, emoji, cx)))
+        })));
+        Some(
+            div()
+                .id("emoji-picker-backdrop")
+                .absolute()
+                .inset_0()
+                .occlude()
+                .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                    this.emoji_picker = None;
+                    cx.notify();
+                }))
+                .child(
+                    v_flex()
+                        .id("emoji-picker")
+                        .absolute()
+                        .left(x)
+                        .top(y)
+                        .w(w)
+                        .h(h)
+                        .p_1()
+                        .gap_1()
+                        .rounded_lg()
+                        .bg(p.panel)
+                        .border_1()
+                        .border_color(p.divider)
+                        .shadow_xl()
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .child(tabs)
+                        .child(grid),
                 )
                 .into_any_element(),
         )

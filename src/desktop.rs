@@ -82,6 +82,26 @@ mod imp {
         s.encode_utf16().chain(std::iter::once(0)).collect()
     }
 
+    /// Windows build number (22000+ is Windows 11), 0 if unknown.
+    pub fn build() -> u32 {
+        static BUILD: OnceLock<u32> = OnceLock::new();
+        *BUILD.get_or_init(|| {
+            use windows::Win32::System::Registry::HKEY_LOCAL_MACHINE;
+            let (key, name) = (wide("SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion"), wide("CurrentBuildNumber"));
+            let mut buf = [0u16; 32];
+            let mut len = (buf.len() * 2) as u32;
+            let ok = unsafe {
+                RegGetValueW(HKEY_LOCAL_MACHINE, windows::core::PCWSTR(key.as_ptr()), windows::core::PCWSTR(name.as_ptr()), RRF_RT_REG_SZ, None, Some(buf.as_mut_ptr() as *mut _), Some(&mut len))
+            }
+            .is_ok();
+            if !ok {
+                return 0;
+            }
+            // `len` is in bytes and counts the terminating NUL.
+            String::from_utf16_lossy(&buf[..(len as usize / 2).saturating_sub(1)]).parse().unwrap_or(0)
+        })
+    }
+
     const RUN_KEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
 
     /// Launch at login: a value under the per-user Run key.
@@ -426,6 +446,22 @@ mod imp {
     pub fn set_autostart(_: bool) {}
 }
 
+/// Whether the system font can draw `e`; otherwise it shows as letters or empty boxes.
+pub fn emoji_supported(e: &emojis::Emoji) -> bool {
+    #[cfg(windows)]
+    {
+        // Segoe UI Emoji: Emoji 12.0 on Windows 10, ~15.0 on Windows 11, and no country flags on either.
+        let max = if imp::build() >= 22000 { emojis::EmojiVersion::new(15, 0) } else { emojis::EmojiVersion::new(12, 0) };
+        let flag = e.as_str().chars().any(|c| ('\u{1F1E6}'..='\u{1F1FF}').contains(&c) || ('\u{E0020}'..='\u{E007F}').contains(&c));
+        e.emoji_version() <= max && !flag
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = e;
+        true
+    }
+}
+
 pub use imp::{Tray, autostart, hide_window, notify, set_autostart, set_window, show_window, toggle_window};
 
 /// The sender lets the app raise its own events (an incoming call shows the window).
@@ -446,5 +482,15 @@ mod tests {
         let px = |v: &[u8], x: usize, y: usize| v[(y * 32 + x) * 4..(y * 32 + x) * 4 + 4].to_vec();
         assert_eq!(px(&badged, 25, 7), [0xE5, 0x39, 0x35, 0xFF], "red unread dot");
         assert_eq!(px(&plain, 0, 0)[3], 0, "transparent rounded corner");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn emoji_filter_on_windows() {
+        let ok = |s: &str| super::emoji_supported(emojis::get(s).unwrap());
+        assert!(super::imp::build() > 10000, "build number read from the registry");
+        assert!(ok("🤝") && ok("🏁"));
+        assert!(!ok("🇷🇺") && !ok("🏴󠁧󠁢󠁥󠁮󠁧󠁿"), "country flags render as letters");
+        assert_eq!(ok("🫠"), super::imp::build() >= 22000, "Emoji 14.0 only on Windows 11");
     }
 }

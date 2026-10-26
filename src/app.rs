@@ -268,6 +268,8 @@ pub struct App {
     pub logo: Arc<Image>,
     /// Right-click menu: the message and the window position it was opened at.
     pub msg_menu: Option<(Msg, Point<Pixels>)>,
+    /// Full reaction picker: message id, where it opened, the shown emoji group.
+    pub emoji_picker: Option<(String, Point<Pixels>, emojis::Group)>,
     /// Last window geometry, to restore it when re-opened from the tray.
     window_bounds: Option<WindowBounds>,
     tray: Option<desktop::Tray>,
@@ -387,6 +389,7 @@ impl App {
             root_focus: cx.focus_handle(),
             logo: Arc::new(Image::from_bytes(ImageFormat::Png, desktop::ICON_PNG.to_vec())),
             msg_menu: None,
+            emoji_picker: None,
             window_bounds: None,
             tray,
             desktop_tx,
@@ -661,7 +664,7 @@ impl App {
 
     /// Esc, innermost first: viewer, dialog, search, open chat. Returns whether it did anything.
     pub fn handle_escape(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        if self.msg_menu.take().is_some() {
+        if self.msg_menu.take().is_some() || self.emoji_picker.take().is_some() {
         } else if self.viewer.take().is_some() {
             // Back to whatever was under the viewer (e.g. the media panel).
         } else if self.modal.take().is_some() {
@@ -1246,6 +1249,7 @@ impl App {
     /// Adds or removes our `emoji` on a message of the open chat (XEP-0444).
     pub fn toggle_reaction(&mut self, msg_id: &str, emoji: &str, cx: &mut Context<Self>) {
         self.msg_menu = None;
+        self.emoji_picker = None;
         let Some(sess) = self.sess.as_mut() else { return };
         let Some(peer) = sess.selected.clone() else { return };
         let me = sess.my_sender(&peer);
