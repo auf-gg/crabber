@@ -238,6 +238,56 @@ fn save_pasted(img: &Image) -> Option<PathBuf> {
     Some(path)
 }
 
+/// Linux file managers put copied files on the clipboard as `text/uri-list`, which GPUI
+/// cannot read back as paths; the same clipboard also carries the paths as plain text.
+/// When every line of that text names an existing file, it is a file copy, not a message.
+fn clipboard_text_paths(text: &str) -> Option<Vec<PathBuf>> {
+    let mut paths = Vec::new();
+    for line in text.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        let path = if let Some(rest) = line.strip_prefix("file://") {
+            if !rest.starts_with('/') {
+                return None; // a URI with a host: no local file to attach
+            }
+            PathBuf::from(percent_decode(rest))
+        } else {
+            PathBuf::from(line)
+        };
+        if !path.is_file() {
+            return None;
+        }
+        paths.push(path);
+    }
+    (!paths.is_empty()).then_some(paths)
+}
+
+/// Decodes `%XX` escapes of a file:// URL; anything not a valid escape stays as written.
+fn percent_decode(s: &str) -> String {
+    fn hex(c: u8) -> Option<u8> {
+        match c {
+            b'0'..=b'9' => Some(c - b'0'),
+            b'a'..=b'f' => Some(c - b'a' + 10),
+            b'A'..=b'F' => Some(c - b'A' + 10),
+            _ => None,
+        }
+    }
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%'
+            && i + 2 < b.len()
+            && let (Some(hi), Some(lo)) = (hex(b[i + 1]), hex(b[i + 2]))
+        {
+            out.push(hi * 16 + lo);
+            i += 3;
+        } else {
+            out.push(b[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 pub fn is_image(url: &str) -> bool {
     // `#` carries the key of aesgcm:// links in encrypted chats.
     let path = url.split(['?', '#']).next().unwrap_or(url).to_ascii_lowercase();
@@ -1401,6 +1451,10 @@ impl App {
     pub fn paste_attachments(&mut self, cx: &mut Context<Self>) -> bool {
         let Some(item) = cx.read_from_clipboard() else { return false };
         let mut paths: Vec<PathBuf> = item.entries().iter().filter_map(|e| if let ClipboardEntry::ExternalPaths(p) = e { Some(p.0.iter().cloned()) } else { None }).flatten().collect();
+        // Linux file managers leave only the paths as text (no uri-list support in GPUI).
+        if paths.is_empty() {
+            paths = item.text().and_then(|t| clipboard_text_paths(&t)).unwrap_or_default();
+        }
         // Apps that copy a file may also put its picture on the clipboard: the file alone is enough.
         if paths.is_empty() {
             paths.extend(item.entries().iter().filter_map(|e| if let ClipboardEntry::Image(img) = e { save_pasted(img) } else { None }));
@@ -1885,5 +1939,38 @@ mod tests {
         assert!(super::is_image(url));
         assert_eq!(super::file_name(url), "image-1.png");
         assert_eq!(super::ext("https://h/a/doc.PDF?x=1"), "pdf");
+    }
+
+    #[test]
+    fn clipboard_text_becomes_paths_only_when_every_line_is_a_file() {
+        let dir = std::env::temp_dir();
+        let a = dir.join(format!("crabber-paste-{}-a.txt", std::process::id()));
+        let b = dir.join(format!("crabber-paste-{}-b.txt", std::process::id()));
+        std::fs::write(&a, b"x").unwrap();
+        std::fs::write(&b, b"y").unwrap();
+        assert_eq!(super::clipboard_text_paths(&format!("{}\r\n{}", a.display(), b.display())).unwrap(), vec![a.clone(), b.clone()]);
+        // Mixed text, missing files and empty input stay a plain paste.
+        assert!(super::clipboard_text_paths(&format!("{}\nне файл", a.display())).is_none());
+        assert!(super::clipboard_text_paths(&format!("{} 2", a.display())).is_none());
+        assert!(super::clipboard_text_paths("привет").is_none());
+        assert!(super::clipboard_text_paths("").is_none());
+        #[cfg(unix)]
+        {
+            let spaced = dir.join(format!("crabber paste {}.png", std::process::id()));
+            std::fs::write(&spaced, b"z").unwrap();
+            let url = format!("file://{}", spaced.display().to_string().replace(' ', "%20"));
+            assert_eq!(super::clipboard_text_paths(&url).unwrap(), vec![spaced.clone()]);
+            assert!(super::clipboard_text_paths("file://host/share.txt").is_none());
+            let _ = std::fs::remove_file(&spaced);
+        }
+        let _ = std::fs::remove_file(&a);
+        let _ = std::fs::remove_file(&b);
+    }
+
+    #[test]
+    fn percent_decode_handles_escapes_and_leaves_rest() {
+        assert_eq!(super::percent_decode("/a%20b/%D1%84.txt"), "/a b/ф.txt");
+        assert_eq!(super::percent_decode("/100%.txt"), "/100%.txt");
+        assert_eq!(super::percent_decode("/trailing%2"), "/trailing%2");
     }
 }
