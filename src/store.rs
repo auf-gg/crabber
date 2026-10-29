@@ -94,6 +94,8 @@ pub struct Msg {
     pub edited: bool,
     /// XEP-0461: local id of the message this one answers (or the raw id if we don't have it).
     pub reply_to: Option<String>,
+    /// Deleted for everyone (XEP-0424/0425): shown as a placeholder.
+    pub retracted: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -141,6 +143,7 @@ impl Store {
         // MUC-assigned stanza-id (XEP-0359): what groupchat reactions point at.
         let _ = db.execute_batch("ALTER TABLE messages ADD COLUMN sid TEXT");
         let _ = db.execute_batch("ALTER TABLE messages ADD COLUMN reply_to TEXT");
+        let _ = db.execute_batch("ALTER TABLE messages ADD COLUMN retracted INTEGER NOT NULL DEFAULT 0");
         // SQLite's LOWER/LIKE only fold ASCII; search needs Cyrillic too.
         db.create_scalar_function("ulower", 1, rusqlite::functions::FunctionFlags::SQLITE_UTF8 | rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC, |ctx| {
             Ok(ctx.get::<String>(0)?.to_lowercase())
@@ -248,6 +251,21 @@ impl Store {
             .is_ok_and(|n| n > 0)
     }
 
+    /// XEP-0424: blanks a message deleted for everyone. `sender: None` = a moderator (XEP-0425) did it.
+    pub fn retract(&self, peer: &str, msg_id: &str, sender: Option<&str>) -> bool {
+        let n = self
+            .db
+            .execute(
+                "UPDATE messages SET body='', url=NULL, retracted=1 WHERE peer=?1 AND msg_id=?2 AND (?3 IS NULL OR sender=?3)",
+                params![peer, msg_id, sender],
+            )
+            .unwrap_or(0);
+        if n > 0 {
+            let _ = self.db.execute("DELETE FROM reactions WHERE peer=?1 AND msg_id=?2", [peer, msg_id]);
+        }
+        n > 0
+    }
+
     pub fn set_sid(&self, peer: &str, msg_id: &str, sid: &str) {
         let _ = self.db.execute("UPDATE messages SET sid=?3 WHERE peer=?1 AND msg_id=?2", params![peer, msg_id, sid]);
     }
@@ -292,7 +310,7 @@ impl Store {
     /// One message by local id (e.g. the original of a reply that is not loaded).
     pub fn msg(&self, peer: &str, msg_id: &str) -> Option<Msg> {
         self.db
-            .query_row("SELECT msg_id, sender, outgoing, body, url, ts, status, enc, edited, reply_to FROM messages WHERE peer=?1 AND msg_id=?2", [peer, msg_id], row_to_msg)
+            .query_row("SELECT msg_id, sender, outgoing, body, url, ts, status, enc, edited, reply_to, retracted FROM messages WHERE peer=?1 AND msg_id=?2", [peer, msg_id], row_to_msg)
             .optional()
             .ok()
             .flatten()
@@ -306,7 +324,7 @@ impl Store {
     pub fn history(&self, peer: &str, limit: usize) -> Vec<Msg> {
         let mut stmt = self
             .db
-            .prepare("SELECT msg_id, sender, outgoing, body, url, ts, status, enc, edited, reply_to FROM messages WHERE peer=?1 ORDER BY ts DESC, rowid DESC LIMIT ?2")
+            .prepare("SELECT msg_id, sender, outgoing, body, url, ts, status, enc, edited, reply_to, retracted FROM messages WHERE peer=?1 ORDER BY ts DESC, rowid DESC LIMIT ?2")
             .unwrap();
         let mut v: Vec<Msg> = stmt
             .query_map(params![peer, limit as i64], row_to_msg)
@@ -328,12 +346,12 @@ impl Store {
         let mut stmt = self
             .db
             .prepare(
-                "SELECT peer, msg_id, sender, outgoing, body, url, ts, status, enc, edited, reply_to FROM messages
+                "SELECT peer, msg_id, sender, outgoing, body, url, ts, status, enc, edited, reply_to, retracted FROM messages
                  WHERE url IS NULL AND ulower(body) LIKE ?1 ESCAPE '\\' AND (?3 IS NULL OR peer = ?3) ORDER BY ts DESC LIMIT ?2",
             )
             .unwrap();
         stmt.query_map(params![format!("%{escaped}%"), limit as i64, peer], |r| {
-            Ok((r.get(0)?, Msg { msg_id: r.get(1)?, sender: r.get(2)?, outgoing: r.get(3)?, body: r.get(4)?, url: r.get(5)?, ts: r.get(6)?, status: r.get(7)?, enc: r.get(8)?, edited: r.get(9)?, reply_to: r.get(10)? }))
+            Ok((r.get(0)?, Msg { msg_id: r.get(1)?, sender: r.get(2)?, outgoing: r.get(3)?, body: r.get(4)?, url: r.get(5)?, ts: r.get(6)?, status: r.get(7)?, enc: r.get(8)?, edited: r.get(9)?, reply_to: r.get(10)?, retracted: r.get(11)? }))
         })
         .unwrap()
         .filter_map(Result::ok)
@@ -349,7 +367,7 @@ impl Store {
     pub fn attachments(&self, peer: &str) -> Vec<Msg> {
         let mut stmt = self
             .db
-            .prepare("SELECT msg_id, sender, outgoing, body, url, ts, status, enc, edited, reply_to FROM messages WHERE peer=?1 AND url IS NOT NULL ORDER BY ts")
+            .prepare("SELECT msg_id, sender, outgoing, body, url, ts, status, enc, edited, reply_to, retracted FROM messages WHERE peer=?1 AND url IS NOT NULL ORDER BY ts")
             .unwrap();
         stmt.query_map([peer], row_to_msg).unwrap().filter_map(Result::ok).collect()
     }
@@ -358,7 +376,7 @@ impl Store {
     pub fn link_messages(&self, peer: &str) -> Vec<Msg> {
         let mut stmt = self
             .db
-            .prepare("SELECT msg_id, sender, outgoing, body, url, ts, status, enc, edited, reply_to FROM messages WHERE peer=?1 AND url IS NULL AND (body LIKE '%http://%' OR body LIKE '%https://%') ORDER BY ts DESC LIMIT 500")
+            .prepare("SELECT msg_id, sender, outgoing, body, url, ts, status, enc, edited, reply_to, retracted FROM messages WHERE peer=?1 AND url IS NULL AND (body LIKE '%http://%' OR body LIKE '%https://%') ORDER BY ts DESC LIMIT 500")
             .unwrap();
         stmt.query_map([peer], row_to_msg).unwrap().filter_map(Result::ok).collect()
     }
@@ -433,6 +451,7 @@ fn row_to_msg(r: &rusqlite::Row<'_>) -> rusqlite::Result<Msg> {
         enc: r.get(7)?,
         edited: r.get(8)?,
         reply_to: r.get(9)?,
+        retracted: r.get(10)?,
     })
 }
 
@@ -441,7 +460,7 @@ mod tests {
     use super::*;
 
     fn msg(id: &str, ts: i64, outgoing: bool) -> Msg {
-        Msg { msg_id: id.into(), sender: "a".into(), outgoing, body: id.into(), url: None, ts, status: 0, enc: 0, edited: false, reply_to: None }
+        Msg { msg_id: id.into(), sender: "a".into(), outgoing, body: id.into(), url: None, ts, status: 0, enc: 0, edited: false, reply_to: None, retracted: false }
     }
 
     #[test]
@@ -475,8 +494,11 @@ mod tests {
         s.set_reactions("room", "1", "bob", &["👍".into()]);
         s.set_reactions("room", "1", "eve", &["👍".into()]);
         assert_eq!(s.reactions("room")["1"], [("bob".into(), "👍".into()), ("eve".into(), "👍".into())]);
-        s.delete_msg("room", "1");
-        assert!(s.reactions("room").is_empty());
+        assert!(!s.retract("room", "1", Some("mallory")), "only the author may retract");
+        assert!(s.retract("room", "1", None), "a moderator may");
+        let m = s.history("room", 1).pop().unwrap();
+        assert!(m.retracted && m.body.is_empty());
+        assert!(s.reactions("room").is_empty(), "reactions go with the message");
     }
 
     #[test]

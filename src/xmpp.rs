@@ -90,7 +90,21 @@ pub struct Reply {
     pub quote: String,
 }
 
+/// A room occupant as XEP-0045 presence describes it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Occupant {
+    pub nick: String,
+    /// "moderator" | "participant" | "visitor" | "none"
+    pub role: String,
+    /// "owner" | "admin" | "member" | "none" | "outcast"
+    pub affiliation: String,
+    /// Real bare JID, when the room shows it to us.
+    pub jid: Option<String>,
+}
+
 pub const NS_REPLY: &str = "urn:xmpp:reply:0";
+const NS_RETRACT: &str = "urn:xmpp:message-retract:1";
+const NS_MODERATE: &str = "urn:xmpp:message-moderate:1";
 const NS_FALLBACK: &str = "urn:xmpp:fallback:0";
 const NS_SID: &str = "urn:xmpp:sid:0";
 
@@ -101,6 +115,12 @@ pub enum Cmd {
     Send { to: String, id: String, body: String, groupchat: bool, enc: String, reply: Option<Reply> },
     /// XEP-0490: we read chat `peer` up to the message with stanza-id `sid`.
     MarkDisplayed { peer: String, sid: String, groupchat: bool },
+    /// XEP-0424: delete our message `id` for everyone (MUC stanza-id in groups).
+    Retract { to: String, id: String, groupchat: bool },
+    /// XEP-0425: as a moderator, delete message `sid` in `room` for everyone.
+    Moderate { room: String, sid: String },
+    /// XEP-0045 admin change: kick (`role: none`), ban (`affiliation: outcast` + `jid`), (un)make moderator.
+    MucAdmin { room: String, nick: Option<String>, jid: Option<String>, role: Option<String>, affiliation: Option<String> },
     /// XEP-0191 (un)block; `spam` adds an XEP-0377 spam report.
     Block { jid: String, block: bool, spam: bool },
     /// XEP-0308: new text for our message `replace` (its msg_id).
@@ -166,6 +186,14 @@ pub enum Ev {
     RoomJoined { room: String, occupants: usize },
     RoomName { room: String, name: String },
     RoomError { room: String, error: String },
+    /// One occupant joined, changed role or left (`gone`).
+    Member { room: String, occupant: Occupant, gone: bool },
+    /// XEP-0410 says we dropped out of `room`: the UI rejoins with its history point.
+    RoomLost { room: String },
+    /// We were kicked, banned or removed from `room`.
+    RoomRemoved { room: String, reason: String },
+    /// XEP-0424/0425: message `id` deleted for everyone; `sender: None` = by a moderator.
+    Retract { peer: String, id: String, sender: Option<String> },
     Invite { room: String, from: String },
     Avatar { jid: String },
     Uploaded { peer: String, id: String, url: String },
@@ -258,7 +286,8 @@ struct State {
 
 async fn run(acc: Account, mut cmds: UnboundedReceiver<Cmd>, ev: UnboundedSender<Ev>) {
     let connector = Connector { host: acc.host.clone(), port: acc.port, insecure: acc.insecure };
-    let mut client = Client::new_with_connector(acc.jid.clone(), acc.password.clone(), connector, Timeouts::default());
+    let timeouts = Timeouts { read_timeout: Duration::from_secs(60), response_timeout: Duration::from_secs(30) };
+    let mut client = Client::new_with_connector(acc.jid.clone(), acc.password.clone(), connector, timeouts);
     let (out_tx, mut out_rx) = unbounded();
     let net = Net { out: out_tx, ev };
     let http = reqwest::Client::builder()
@@ -288,8 +317,12 @@ async fn run(acc: Account, mut cmds: UnboundedReceiver<Cmd>, ev: UnboundedSender
         Err(e) => st.net.emit(Ev::Error(format!("OMEMO недоступен: {e}"))),
     }
 
+    // XEP-0410: check now and then that we are still in our rooms.
+    let mut self_ping = tokio::time::interval(Duration::from_secs(10 * 60));
+    self_ping.tick().await;
     loop {
         tokio::select! {
+            _ = self_ping.tick() => st.self_ping(),
             event = client.next() => match event {
                 None => break,
                 Some(Event::Online { bound_jid, .. }) => st.on_online(bound_jid),
@@ -358,6 +391,7 @@ fn disco_info(node: Option<String>) -> DiscoInfoResult {
         "urn:xmpp:mds:displayed:0+notify",
         "urn:xmpp:avatar:metadata+notify",
         NS_REPLY,
+        NS_RETRACT,
     ];
     DiscoInfoResult {
         node,
@@ -465,6 +499,53 @@ impl State {
                 tokio::spawn(async move {
                     if let Err(e) = publish_private(&net, ns::MDS, &peer, el).await {
                         eprintln!("mds publish: {e}");
+                    }
+                });
+            }
+            Cmd::Retract { to, id, groupchat } => {
+                let mut m = Message::new_with_type(if groupchat { MessageType::Groupchat } else { MessageType::Chat }, jid(&to).map(Jid::from))
+                    .with_body(Lang::default(), "/me retracted a previous message, but it's unsupported by your client.".into());
+                m.id = Some(Id(new_id()));
+                m.payloads.push(Element::builder("retract", NS_RETRACT).attr(nc("id"), id).build());
+                m.payloads.push(Element::builder("fallback", NS_FALLBACK).attr(nc("for"), NS_RETRACT).build());
+                m.payloads.push(Element::builder("store", "urn:xmpp:hints").build());
+                self.net.send(m);
+            }
+            Cmd::Moderate { room, sid } => {
+                let Ok(to) = Jid::from_str(&room) else { return };
+                let net = self.net.clone();
+                tokio::spawn(async move {
+                    let v1 = Element::builder("moderate", NS_MODERATE).attr(nc("id"), sid.as_str()).append(Element::builder("retract", NS_RETRACT)).build();
+                    if net.iq(Some(to.clone()), IqRequest::Set(v1)).await.is_ok() {
+                        return;
+                    }
+                    // Older servers only know the fastening-based :0 form.
+                    let v0 = Element::builder("apply-to", "urn:xmpp:fasten:0")
+                        .attr(nc("id"), sid.as_str())
+                        .append(Element::builder("moderate", "urn:xmpp:message-moderate:0").append(Element::builder("retract", "urn:xmpp:message-retract:0")))
+                        .build();
+                    if let Err(e) = net.iq(Some(to), IqRequest::Set(v0)).await {
+                        net.emit(Ev::Error(format!("Не удалось удалить сообщение: {e}")));
+                    }
+                });
+            }
+            Cmd::MucAdmin { room, nick, jid: who, role, affiliation } => {
+                let Ok(to) = Jid::from_str(&room) else { return };
+                let mut item = Element::builder("item", "http://jabber.org/protocol/muc#admin");
+                for (k, v) in [("nick", nick), ("jid", who), ("role", role), ("affiliation", affiliation)] {
+                    if let Some(v) = v {
+                        item = item.attr(nc(k), v);
+                    }
+                }
+                let req = Element::builder("query", "http://jabber.org/protocol/muc#admin").append(item).build();
+                let net = self.net.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = net.iq(Some(to), IqRequest::Set(req)).await {
+                        let why = match e.as_str() {
+                            "NotAllowed" | "Forbidden" => "недостаточно прав".to_string(),
+                            _ => e,
+                        };
+                        net.emit(Ev::Error(format!("Не удалось выполнить действие в группе: {why}")));
                     }
                 });
             }
@@ -793,6 +874,22 @@ impl State {
         self.net.send(self.presence().with_to(full).with_payload(Muc::new().with_history(history)));
     }
 
+    /// XEP-0410: pings our occupant JID in each room; a "not joined" answer rejoins.
+    fn self_ping(&mut self) {
+        for (room, r) in self.rooms.iter().filter(|(_, r)| r.joined) {
+            let Ok(me) = room.with_resource_str(&r.nick) else { continue };
+            let (net, room) = (self.net.clone(), room.to_string());
+            tokio::spawn(async move {
+                match net.iq(Some(me.into()), IqRequest::Get(Ping.into())).await {
+                    // Not joined any more (server restart, ghost removal): rejoin.
+                    Err(e) if e == "NotAcceptable" || e == "ItemNotFound" => net.emit(Ev::RoomLost { room }),
+                    // Ok, or errors that still prove we're in (service-unavailable, feature-not-implemented), or a timeout: keep.
+                    _ => {}
+                }
+            });
+        }
+    }
+
     /// Text message, encrypted per `enc`; `replace` makes it an XEP-0308 correction, `reply` an XEP-0461 answer.
     #[allow(clippy::too_many_arguments)]
     fn send_text(&self, to: String, id: String, body: String, groupchat: bool, enc: String, replace: Option<String>, reply: Option<Reply>) {
@@ -914,13 +1011,39 @@ impl State {
                 return;
             }
             let muc = p.payloads.iter().find_map(|e| MucUser::try_from(e.clone()).ok());
+            let item = muc.as_ref().and_then(|m| m.items.first().cloned());
             let statuses = muc.map(|m| m.status).unwrap_or_default();
+            let gone = p.type_ == PresenceType::Unavailable;
+            if statuses.contains(&MucStatus::SelfPresence) && gone && !statuses.contains(&MucStatus::NewNick) {
+                let reason = if statuses.contains(&MucStatus::Banned) {
+                    "вас заблокировали в группе"
+                } else if statuses.contains(&MucStatus::Kicked) {
+                    "вас исключили из группы"
+                } else if statuses.contains(&MucStatus::ServiceShutdown) {
+                    "сервер групп выключается"
+                } else {
+                    "вы больше не участник группы"
+                };
+                self.rooms.remove(&bare);
+                self.net.emit(Ev::RoomRemoved { room: bare.to_string(), reason: reason.into() });
+                return;
+            }
             if nick.is_empty() {
                 // presence from the room itself, not an occupant
-            } else if p.type_ == PresenceType::Unavailable {
-                room.occupants.remove(&nick);
             } else {
-                room.occupants.insert(nick);
+                if gone {
+                    room.occupants.remove(&nick);
+                } else {
+                    room.occupants.insert(nick.clone());
+                }
+                let lower = |v: String| v.to_lowercase();
+                let occupant = Occupant {
+                    nick,
+                    role: item.as_ref().map(|i| lower(format!("{:?}", i.role))).unwrap_or_else(|| "participant".into()),
+                    affiliation: item.as_ref().map(|i| lower(format!("{:?}", i.affiliation))).unwrap_or_else(|| "none".into()),
+                    jid: item.and_then(|i| i.jid).map(|j| j.to_bare().to_string()),
+                };
+                self.net.emit(Ev::Member { room: bare.to_string(), occupant, gone });
             }
             if statuses.contains(&MucStatus::RoomHasBeenCreated) {
                 // New room: unlock it as persistent so it survives everyone leaving.
@@ -1144,6 +1267,25 @@ impl State {
                 self.net.emit(Ev::Typing { peer: peer.clone(), who: sender.clone(), on });
             }
         }
+        // A moderator's deletion comes from the room itself, not from an occupant.
+        let from_room = groupchat && from.resource().is_none();
+        if let Some(r) = m.payloads.iter().find(|p| p.is("retract", NS_RETRACT)) {
+            let moderated = r.has_child("moderated", NS_MODERATE);
+            if let Some(id) = r.attr("id")
+                && (!groupchat || from_room == moderated)
+            {
+                self.net.emit(Ev::Retract { peer, id: id.to_string(), sender: (!moderated).then_some(sender) });
+            }
+            return;
+        }
+        if from_room
+            && let Some(a) = m.payloads.iter().find(|p| p.is("apply-to", "urn:xmpp:fasten:0"))
+            && a.get_child("moderated", "urn:xmpp:message-moderate:0").is_some_and(|md| md.has_child("retract", "urn:xmpp:message-retract:0"))
+            && let Some(id) = a.attr("id")
+        {
+            self.net.emit(Ev::Retract { peer, id: id.to_string(), sender: None });
+            return;
+        }
         if let Some(r) = m.payloads.iter().find_map(|p| Reactions::try_from(p.clone()).ok()) {
             let emojis = r.reactions.into_iter().map(|x| x.emoji).collect();
             self.net.emit(Ev::Reactions { peer, id: r.id, sender, emojis });
@@ -1246,7 +1388,7 @@ impl State {
         self.net.emit(Ev::Message {
             peer,
             groupchat,
-            msg: Msg { msg_id, sender, outgoing, body, url, ts, status: if outgoing { 1 } else { 0 }, enc, edited: false, reply_to },
+            msg: Msg { msg_id, sender, outgoing, body, url, ts, status: if outgoing { 1 } else { 0 }, enc, edited: false, reply_to, retracted: false },
             archive_id,
             live: live && delay_ts.is_none(),
             sid,
@@ -1530,6 +1672,14 @@ mod caps_tests {
         assert_eq!(super::strip_fallback("> Боб: hi\nответ", &[fb], "urn:other"), "> Боб: hi\nответ");
         let mds: super::Element = "<item xmlns='http://jabber.org/protocol/pubsub' id='bob@x'><displayed xmlns='urn:xmpp:mds:displayed:0'><stanza-id xmlns='urn:xmpp:sid:0' id='S1' by='me@x'/></displayed></item>".parse().unwrap();
         assert_eq!(super::mds_item(&mds), Some(("bob@x".into(), "S1".into())));
+    }
+
+    #[test]
+    fn occupant_role_names() {
+        use tokio_xmpp::parsers::muc::user::{Affiliation, Role};
+        assert_eq!(format!("{:?}", Role::Moderator).to_lowercase(), "moderator");
+        assert_eq!(format!("{:?}", Affiliation::Outcast).to_lowercase(), "outcast");
+        assert_eq!(format!("{:?}", Affiliation::None).to_lowercase(), "none");
     }
 
     #[test]

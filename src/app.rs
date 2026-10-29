@@ -15,7 +15,7 @@ use gpui_kit::*;
 use crabber::call::{CallCmd, CallEv, CallState};
 use crabber::store::{self, ChatRow, Msg, Store};
 use crabber::e2e::DeviceInfo;
-use crabber::xmpp::{self, Account, Bookmark, Cmd, Ev, Reply};
+use crabber::xmpp::{self, Account, Bookmark, Cmd, Ev, Occupant, Reply};
 use tokio_xmpp::jid::BareJid;
 use tokio_xmpp::parsers::presence::Show;
 
@@ -43,6 +43,8 @@ pub enum Modal {
     JoinGroup,
     Invite { room: String },
     ConfirmDelete { peer: String },
+    /// Delete a message for everyone; `moderate`: someone else's, as a group moderator.
+    ConfirmRetract { msg: Msg, moderate: bool },
     /// Contact / group card opened from the chat header.
     Profile { peer: String },
 }
@@ -147,6 +149,8 @@ pub struct Session {
     pub mds: HashMap<String, String>,
     /// XEP-0191 blocked JIDs; `None` until the server answered (or it has no blocking).
     pub blocked: Option<HashSet<String>>,
+    /// Room -> nick -> occupant (roles for moderation).
+    pub members: HashMap<String, HashMap<String, Occupant>>,
 }
 
 impl Session {
@@ -557,6 +561,7 @@ impl App {
             replying: None,
             mds: HashMap::new(),
             blocked: None,
+            members: HashMap::new(),
         };
         for peer in sess.chats.iter().map(|c| c.peer.clone()).chain([jid]).collect::<Vec<_>>() {
             sess.load_avatar(&peer);
@@ -847,6 +852,7 @@ impl App {
                     }
                     sess.online = false;
                     sess.presence.clear();
+                    sess.members.clear();
                     sess.status = format!("Нет соединения, переподключение... ({e})").into();
                 }
                 Ev::Roster(contacts) => {
@@ -1038,6 +1044,30 @@ impl App {
                     sess.save(&room);
                 }
                 Ev::RoomError { room, error } => notes.push(format!("Группа {room}: {error}")),
+                Ev::Member { room, occupant, gone } => {
+                    let list = sess.members.entry(room).or_default();
+                    if gone {
+                        list.remove(&occupant.nick);
+                    } else {
+                        list.insert(occupant.nick.clone(), occupant);
+                    }
+                }
+                Ev::RoomRemoved { room, reason } => {
+                    sess.members.remove(&room);
+                    sess.occupants.remove(&room);
+                    notes.push(format!("{}: {reason}", sess.display_name(&room)));
+                }
+                Ev::RoomLost { room } => {
+                    if let Some(c) = sess.chat(&room) {
+                        let nick = c.nick.clone();
+                        sess.send(Cmd::Join { room: room.clone(), nick, since: sess.store.last_ts(&room), create_name: None });
+                    }
+                }
+                Ev::Retract { peer, id, sender } => {
+                    if let Some(msg_id) = sess.store.resolve(&peer, &id) {
+                        apply_retract(sess, &peer, &msg_id, sender.as_deref());
+                    }
+                }
                 Ev::Invite { room, from } => {
                     if sess.chat(&room).is_none() {
                         let nick = sess.localpart();
@@ -1260,7 +1290,7 @@ impl App {
         let reply = replying.as_ref().map(|r| reply_for(sess, &peer, groupchat, r));
         sess.send(Cmd::Send { to: peer.clone(), id: id.clone(), body: body.clone(), groupchat, enc, reply });
         let reply_to = replying.map(|r| r.msg_id);
-        self.push_outgoing(&peer, Msg { msg_id: id, sender, outgoing: true, body, url: None, ts: now_ms(), status: 0, enc: 0, edited: false, reply_to });
+        self.push_outgoing(&peer, Msg { msg_id: id, sender, outgoing: true, body, url: None, ts: now_ms(), status: 0, enc: 0, edited: false, reply_to, retracted: false });
     }
 
     /// "Reply" from the message menu.
@@ -1279,6 +1309,34 @@ impl App {
         if let Some(sess) = self.sess.as_mut() {
             sess.replying = None;
         }
+        cx.notify();
+    }
+
+    /// After the confirmation dialog: delete for everyone (our message, or as a moderator).
+    pub fn retract(&mut self, m: &Msg, moderate: bool, cx: &mut Context<Self>) {
+        self.modal = None;
+        let Some(sess) = self.sess.as_mut() else { return };
+        let Some(peer) = sess.selected.clone() else { return };
+        let groupchat = sess.chat(&peer).is_some_and(|c| c.is_room);
+        let sid = sess.store.sid(&peer, &m.msg_id);
+        if moderate {
+            // The room's broadcast of the deletion updates us like everyone else.
+            if let Some(sid) = sid {
+                sess.send(Cmd::Moderate { room: peer, sid });
+            }
+        } else {
+            let id = if groupchat { sid.unwrap_or_else(|| m.msg_id.clone()) } else { m.msg_id.clone() };
+            sess.send(Cmd::Retract { to: peer.clone(), id, groupchat });
+            apply_retract(sess, &peer, &m.msg_id, None);
+        }
+        cx.notify();
+    }
+
+    /// XEP-0045 role/affiliation change in the open group.
+    pub fn muc_admin(&mut self, nick: Option<String>, jid: Option<String>, role: Option<&str>, affiliation: Option<&str>, cx: &mut Context<Self>) {
+        let Some(sess) = self.sess.as_ref() else { return };
+        let Some(Modal::Profile { peer }) = self.modal.as_ref() else { return };
+        sess.send(Cmd::MucAdmin { room: peer.clone(), nick, jid, role: role.map(String::from), affiliation: affiliation.map(String::from) });
         cx.notify();
     }
 
@@ -1441,7 +1499,7 @@ impl App {
         sess.uploads.insert(id.clone(), path.clone());
         let enc = sess.chat(&peer).map(|c| c.enc.clone()).unwrap_or_default();
         sess.send(Cmd::Upload { to: peer.clone(), id: id.clone(), path, groupchat, enc });
-        self.push_outgoing(&peer, Msg { msg_id: id, sender, outgoing: true, body: format!("Отправка файла {name}..."), url: None, ts: now_ms(), status: 0, enc: 0, edited: false, reply_to: None });
+        self.push_outgoing(&peer, Msg { msg_id: id, sender, outgoing: true, body: format!("Отправка файла {name}..."), url: None, ts: now_ms(), status: 0, enc: 0, edited: false, reply_to: None, retracted: false });
     }
 
     pub fn change_avatar(&mut self, cx: &mut Context<Self>) {
@@ -1724,7 +1782,7 @@ impl App {
             None => "Пропущенный звонок".to_string(),
         };
         let sender = if c.outgoing { me } else { c.peer.clone() };
-        let msg = Msg { msg_id: format!("{CALL_ID}{}", xmpp::new_id()), sender, outgoing: c.outgoing, body, url: None, ts: now_ms(), status: 2, enc: 0, edited: false, reply_to: None };
+        let msg = Msg { msg_id: format!("{CALL_ID}{}", xmpp::new_id()), sender, outgoing: c.outgoing, body, url: None, ts: now_ms(), status: 2, enc: 0, edited: false, reply_to: None, retracted: false };
         self.push_outgoing(&c.peer, msg);
     }
 }
@@ -1803,6 +1861,32 @@ fn apply_contact(sess: &mut Session, c: xmpp::Contact) {
         chat.name = c.name;
     }
     sess.save(&c.jid);
+}
+
+/// Our role and affiliation in `room`.
+pub fn my_occupant<'a>(sess: &'a Session, room: &str) -> Option<&'a Occupant> {
+    let nick = &sess.chat(room)?.nick;
+    sess.members.get(room)?.get(nick)
+}
+
+fn apply_retract(sess: &mut Session, peer: &str, msg_id: &str, sender: Option<&str>) {
+    if !sess.store.retract(peer, msg_id, sender) {
+        return;
+    }
+    let blank = |m: &mut Msg| {
+        if m.msg_id == msg_id {
+            m.body.clear();
+            m.url = None;
+            m.retracted = true;
+        }
+    };
+    update_history(sess, peer, blank);
+    if let Some(last) = sess.chat_mut(peer).and_then(|c| c.last.as_mut()) {
+        blank(last);
+    }
+    if sess.selected.as_deref() == Some(peer) {
+        sess.reactions.remove(msg_id);
+    }
 }
 
 /// Time of the message our XEP-0490 read marker points at, if we have it.

@@ -18,7 +18,7 @@ use crabber::call::{CallCmd, CallState};
 use crabber::store::{ChatRow, Msg};
 use tokio_xmpp::parsers::presence::Show;
 
-use crate::app::{App, MediaTab, Modal, Session, Viewer, ext, file_name, is_call, is_image, is_text};
+use crate::app::{App, MediaTab, Modal, Session, Viewer, ext, file_name, is_call, is_image, is_text, my_occupant};
 use crate::style;
 use crabber::e2e::DeviceInfo;
 
@@ -393,7 +393,9 @@ fn icon_box(icon: IconName, size: f32) -> Div {
 
 fn preview(c: &ChatRow) -> String {
     let Some(m) = &c.last else { return String::new() };
-    let text = if m.url.is_some() {
+    let text = if m.retracted {
+        "Сообщение удалено".to_string()
+    } else if m.url.is_some() {
         if is_image(&m.body) { "Фото".to_string() } else { "Файл".to_string() }
     } else {
         m.body.replace("```", " ").split_whitespace().collect::<Vec<_>>().join(" ")
@@ -1122,6 +1124,7 @@ impl App {
                 None => "Сообщение".to_string(),
             };
             let text = match &orig {
+                Some(o) if o.retracted => "Сообщение удалено".to_string(),
                 Some(o) if o.url.is_some() => "Файл".to_string(),
                 Some(o) => o.body.replace('\n', " "),
                 None => "недоступно".to_string(),
@@ -1155,6 +1158,7 @@ impl App {
             }))
         });
         let content = match &m.url {
+            _ if m.retracted => h_flex().gap_2().items_center().italic().opacity(0.7).child(Icon::new(IconName::Ban).small()).child("Сообщение удалено").into_any_element(),
             _ if is_call(&m) => h_flex().gap_2().items_center().child(Icon::new(IconName::Phone).small()).child(m.body.clone()).into_any_element(),
             Some(url) => self.render_attachment(url, &m, cx),
             None => v_flex()
@@ -1616,7 +1620,10 @@ impl App {
                 .child(label)
         };
         let mut items: Vec<AnyElement> = vec![];
-        if !is_call(&m) {
+        let room = sess.selected.as_deref().filter(|p| sess.chat(p).is_some_and(|c| c.is_room));
+        let moderator = room.and_then(|r| my_occupant(sess, r)).is_some_and(|o| o.role == "moderator");
+        let has_sid = room.is_some_and(|r| sess.store.sid(r, &m.msg_id).is_some());
+        if !is_call(&m) && !m.retracted {
             items.push(
                 h_flex()
                     .justify_between()
@@ -1653,7 +1660,7 @@ impl App {
             );
             items.push(div().h(px(1.)).my_1().bg(p.divider).into_any_element());
         }
-        if !is_call(&m) && m.status >= 0 {
+        if !is_call(&m) && !m.retracted && m.status >= 0 {
             let msg = m.clone();
             items.push(
                 item("mm-reply", IconName::Reply, "Ответить", false)
@@ -1669,7 +1676,7 @@ impl App {
                     .into_any_element(),
             );
         }
-        if m.url.is_none() {
+        if m.url.is_none() && !m.retracted {
             let text = m.body.clone();
             items.push(
                 item("mm-copy", IconName::Copy, "Копировать текст", false)
@@ -1713,6 +1720,19 @@ impl App {
         }
         let id = m.msg_id.clone();
         items.push(div().h(px(1.)).my_1().bg(p.divider).into_any_element());
+        let can_retract = !m.retracted && !is_call(&m) && m.status >= 0 && (m.outgoing || (moderator && has_sid));
+        if can_retract {
+            let (msg, moderate) = (m.clone(), !m.outgoing);
+            items.push(
+                item("mm-retract", IconName::Ban, if moderate { "Удалить у всех (модератор)" } else { "Удалить у всех" }, true)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.msg_menu = None;
+                        this.modal = Some(Modal::ConfirmRetract { msg: msg.clone(), moderate });
+                        cx.notify();
+                    }))
+                    .into_any_element(),
+            );
+        }
         items.push(
             item("mm-delete", IconName::X, "Удалить у себя", true)
                 .on_click(cx.listener(move |this, _, _, cx| this.delete_message(&id, cx)))
@@ -1885,6 +1905,7 @@ impl App {
                     .child(Icon::new(IconName::Copy).xsmall().text_color(p.muted))
                     .on_click(move |_, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(pc.clone()))),
             )
+            .when(chat.is_room, |d| d.child(self.render_members(&peer, cx)))
             .when_some(blocked.filter(|_| !chat.is_room), |d, blocked| {
                 let (pb, ps) = (peer.clone(), peer.clone());
                 d.child(
@@ -1933,6 +1954,70 @@ impl App {
                 ),
             );
         Some(self.panel("profile", if chat.is_room { "Группа" } else { "Контакт" }, body.into_any_element(), cx))
+    }
+
+    /// Occupants of a group; moderators get kick, owners/admins also ban and (un)make moderator.
+    fn render_members(&self, room: &str, cx: &mut Context<Self>) -> AnyElement {
+        let p = style::palette(cx);
+        let Some(sess) = self.sess.as_ref() else { return div().into_any_element() };
+        let me = my_occupant(sess, room).cloned();
+        let is_mod = me.as_ref().is_some_and(|o| o.role == "moderator");
+        let is_admin = me.as_ref().is_some_and(|o| o.affiliation == "owner" || o.affiliation == "admin");
+        let mut list: Vec<crabber::xmpp::Occupant> = sess.members.get(room).map(|m| m.values().cloned().collect()).unwrap_or_default();
+        let rank = |o: &crabber::xmpp::Occupant| match o.affiliation.as_str() {
+            "owner" => 0,
+            "admin" => 1,
+            _ if o.role == "moderator" => 2,
+            _ => 3,
+        };
+        list.sort_by(|a, b| rank(a).cmp(&rank(b)).then(a.nick.to_lowercase().cmp(&b.nick.to_lowercase())));
+        let rows = list.into_iter().map(|o| {
+            let badge = match (o.affiliation.as_str(), o.role.as_str()) {
+                ("owner", _) => "владелец",
+                ("admin", _) => "админ",
+                (_, "moderator") => "модератор",
+                (_, "visitor") => "без голоса",
+                _ => "",
+            };
+            let mine = me.as_ref().is_some_and(|m| m.nick == o.nick);
+            // A moderator cannot act on owners/admins (XEP-0045 §8).
+            let above = o.affiliation == "owner" || o.affiliation == "admin";
+            let (kick, ban, promote) = (is_mod && !mine && !above, is_admin && !mine && !above && o.jid.is_some(), is_admin && !mine && !above);
+            let (n1, n3, jid, is_moderator) = (o.nick.clone(), o.nick.clone(), o.jid.clone(), o.role == "moderator");
+            h_flex()
+                .gap_2()
+                .py_1()
+                .items_center()
+                .child(div().flex_1().min_w_0().truncate().text_sm().text_color(sender_color(&o.nick)).child(o.nick.clone()))
+                .when(!badge.is_empty(), |d| d.child(div().text_xs().text_color(p.muted).child(badge)))
+                .when(promote, |d| {
+                    d.child(
+                        Button::new(SharedString::from(format!("mod-{}", o.nick)))
+                            .xsmall()
+                            .ghost()
+                            .label(if is_moderator { "Снять модератора" } else { "Модератор" })
+                            .on_click(cx.listener(move |this, _, _, cx| this.muc_admin(Some(n3.clone()), None, Some(if is_moderator { "participant" } else { "moderator" }), None, cx))),
+                    )
+                })
+                .when(kick, |d| {
+                    d.child(Button::new(SharedString::from(format!("kick-{}", o.nick))).xsmall().ghost().label("Исключить").on_click(cx.listener(move |this, _, _, cx| this.muc_admin(Some(n1.clone()), None, Some("none"), None, cx))))
+                })
+                .when(ban, |d| {
+                    d.child(
+                        Button::new(SharedString::from(format!("ban-{}", o.nick)))
+                            .xsmall()
+                            .ghost()
+                            .label("Заблокировать")
+                            .on_click(cx.listener(move |this, _, _, cx| this.muc_admin(None, jid.clone(), None, Some("outcast"), cx))),
+                    )
+                })
+        });
+        v_flex()
+            .w_full()
+            .pt_3()
+            .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).text_color(p.muted).child("Участники"))
+            .child(v_flex().id("members").max_h(dp(220.)).overflow_y_scroll().children(rows))
+            .into_any_element()
     }
 
     fn render_pgp_import(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
@@ -2230,6 +2315,10 @@ impl App {
                 });
                 ("Пригласить в группу", v_flex().id("invite-list").max_h(dp(320.)).overflow_y_scroll().children(contacts).into_any_element())
             }
+            Modal::ConfirmRetract { moderate, .. } => {
+                let text = if *moderate { "Удалить сообщение участника у всех в группе?" } else { "Удалить сообщение у всех? Клиенты без поддержки удаления могут продолжать его показывать." };
+                ("Удалить у всех", div().child(text).into_any_element())
+            }
             Modal::ConfirmDelete { peer } => {
                 let room = sess.chat(peer).is_some_and(|c| c.is_room);
                 let text = if room { "Покинуть группу и удалить переписку?" } else { "Удалить контакт и всю переписку?" };
@@ -2239,6 +2328,10 @@ impl App {
         };
         let confirm = match modal {
             Modal::Invite { .. } => None,
+            Modal::ConfirmRetract { msg, moderate } => {
+                let (msg, moderate) = (msg.clone(), *moderate);
+                Some(Button::new("modal-ok").danger().label("Удалить").on_click(cx.listener(move |this, _, _, cx| this.retract(&msg, moderate, cx))))
+            }
             Modal::ConfirmDelete { peer } => {
                 let p = peer.clone();
                 Some(Button::new("modal-ok").danger().label("Удалить").on_click(cx.listener(move |this, _, _, cx| this.delete_chat(p.clone(), cx))))

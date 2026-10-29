@@ -31,7 +31,7 @@ Crabber stands on each.
 | --- | --- | --- | --- |
 | [0027](https://xmpp.org/extensions/xep-0027.html) | Current Jabber OpenPGP Usage | ✅ | Text only, no files |
 | [0030](https://xmpp.org/extensions/xep-0030.html) | Service Discovery | ✅ | |
-| [0045](https://xmpp.org/extensions/xep-0045.html) | Multi-User Chat | 🟡 | Join, create, invite; no moderation or role management |
+| [0045](https://xmpp.org/extensions/xep-0045.html) | Multi-User Chat | ✅ | Join, create, invite; kick, ban, moderator role from the group card |
 | [0047](https://xmpp.org/extensions/xep-0047.html) | In-Band Bytestreams | ❌ | Jingle file transfer fallback |
 | [0048](https://xmpp.org/extensions/xep-0048.html) | Bookmarks | ❌ | Legacy; rooms sync via XEP-0402 |
 | [0049](https://xmpp.org/extensions/xep-0049.html) | Private XML Storage | ❌ | |
@@ -51,7 +51,7 @@ Crabber stands on each.
 | [0184](https://xmpp.org/extensions/xep-0184.html) | Message Delivery Receipts | ✅ | |
 | [0191](https://xmpp.org/extensions/xep-0191.html) | Blocking Command | ✅ | Contact card, chat banner, subscription requests |
 | [0198](https://xmpp.org/extensions/xep-0198.html) | Stream Management | ✅ | Provided by tokio-xmpp |
-| [0199](https://xmpp.org/extensions/xep-0199.html) | XMPP Ping | 🟡 | Answers pings, does not send them |
+| [0199](https://xmpp.org/extensions/xep-0199.html) | XMPP Ping | ✅ | Keepalive after 60 s of silence; a dead link is noticed in ~1.5 min |
 | [0202](https://xmpp.org/extensions/xep-0202.html) | Entity Time | ❌ | |
 | [0215](https://xmpp.org/extensions/xep-0215.html) | External Service Discovery | ✅ | STUN/TURN for calls |
 | [0223](https://xmpp.org/extensions/xep-0223.html) | Persistent Storage of Private Data via PubSub | 🟡 | OMEMO publish options only |
@@ -72,7 +72,7 @@ Crabber stands on each.
 | [0333](https://xmpp.org/extensions/xep-0333.html) | Chat Markers | ✅ | Read ticks |
 | [0338](https://xmpp.org/extensions/xep-0338.html) | Jingle Grouping Framework | ✅ | |
 | [0339](https://xmpp.org/extensions/xep-0339.html) | Source-Specific Media Attributes in Jingle | ✅ | |
-| [0352](https://xmpp.org/extensions/xep-0352.html) | Client State Indication | ❌ | Would save traffic while hidden in the tray |
+| [0352](https://xmpp.org/extensions/xep-0352.html) | Client State Indication | ❌ | Needs nonza sending in tokio-xmpp |
 | [0353](https://xmpp.org/extensions/xep-0353.html) | Jingle Message Initiation | ✅ | Ringing on all devices |
 | [0357](https://xmpp.org/extensions/xep-0357.html) | Push Notifications | ❌ | Mobile-oriented, low priority on desktop |
 | [0363](https://xmpp.org/extensions/xep-0363.html) | HTTP File Upload | ✅ | |
@@ -88,10 +88,11 @@ Crabber stands on each.
 | [0396](https://xmpp.org/extensions/xep-0396.html) | Jingle Encrypted Transports - OMEMO | ❌ | |
 | [0398](https://xmpp.org/extensions/xep-0398.html) | User Avatar to vCard-Based Avatars Conversion | ❌ | |
 | [0402](https://xmpp.org/extensions/xep-0402.html) | PEP Native Bookmarks | ✅ | Joined rooms sync between devices |
-| [0410](https://xmpp.org/extensions/xep-0410.html) | MUC Self-Ping | ❌ | |
+| [0410](https://xmpp.org/extensions/xep-0410.html) | MUC Self-Ping | ✅ | Every 10 min; rejoins a room we dropped out of |
 | [0411](https://xmpp.org/extensions/xep-0411.html) | Bookmarks Conversion | ❌ | |
 | [0421](https://xmpp.org/extensions/xep-0421.html) | Occupant identifiers for semi-anonymous MUCs | ❌ | |
-| [0425](https://xmpp.org/extensions/xep-0425.html) | Moderated Message Retraction | ❌ | |
+| [0424](https://xmpp.org/extensions/xep-0424.html) | Message Retraction | ✅ | Delete for everyone, with confirmation |
+| [0425](https://xmpp.org/extensions/xep-0425.html) | Moderated Message Retraction | ✅ | `:1`, falls back to `:0` for older servers |
 | [0428](https://xmpp.org/extensions/xep-0428.html) | Fallback Indication | 🟡 | Reply quotes only |
 | [0440](https://xmpp.org/extensions/xep-0440.html) | SASL Channel-Binding Type Capability | 🟡 | `tls-exporter` binding, capability not read |
 | [0444](https://xmpp.org/extensions/xep-0444.html) | Message Reactions | ✅ | Quick set in the message menu; groups use the room's stanza-id |
