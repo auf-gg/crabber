@@ -18,11 +18,17 @@ use crabber::call::{CallCmd, CallState};
 use crabber::store::{ChatRow, Msg};
 use tokio_xmpp::parsers::presence::Show;
 
-use crate::app::{App, MediaTab, Modal, Session, Viewer, ext, file_name, is_call, is_image, is_text, my_occupant};
+use crate::app::{App, MediaTab, Modal, Session, Viewer, ext, file_name, is_audio, is_call, is_image, is_text, my_occupant};
 use crate::style;
 use crabber::e2e::DeviceInfo;
 
 /// Design pixels in rems (16 px = 1 rem), so `Window::set_rem_size` scales the whole UI.
+// Material Icons (Apache-2.0) for the message bar.
+const ATTACH_SVG: &[u8] = include_bytes!("../assets/icons/attach_file.svg");
+const MOOD_SVG: &[u8] = include_bytes!("../assets/icons/mood.svg");
+const MIC_SVG: &[u8] = include_bytes!("../assets/icons/mic.svg");
+const SEND_SVG: &[u8] = include_bytes!("../assets/icons/send.svg");
+
 fn dp(x: f32) -> Rems {
     rems(x / 16.)
 }
@@ -396,7 +402,7 @@ fn preview(c: &ChatRow) -> String {
     let text = if m.retracted {
         "Сообщение удалено".to_string()
     } else if m.url.is_some() {
-        if is_image(&m.body) { "Фото".to_string() } else { "Файл".to_string() }
+        if is_image(&m.body) { "Фото".to_string() } else if is_audio(&m.body) { "Голосовое сообщение".to_string() } else { "Файл".to_string() }
     } else {
         m.body.replace("```", " ").split_whitespace().collect::<Vec<_>>().join(" ")
     };
@@ -453,6 +459,7 @@ impl Render for App {
             .child(content)
             .when_some(self.render_msg_menu(window, cx), |d, m| d.child(m))
             .when_some(self.render_emoji_picker(window, cx), |d, m| d.child(m))
+            .when_some(self.render_viewer_menu(cx), |d, m| d.child(m))
     }
 }
 
@@ -1012,50 +1019,89 @@ impl App {
                 .child(Button::new("unblock").small().ghost().label("Разблокировать").on_click(cx.listener(move |this, _, _, cx| this.block(jid.clone(), false, false, cx))))
         });
 
-        let composer = h_flex()
+        let has_text = !self.compose.read(cx).value().trim().is_empty() || !sess.pending.is_empty() || sess.editing.is_some();
+        // Telegram-like bar: one flat strip, translucent Material icons. Buttons and the field's first line are
+        // 44 px tall, so one line of text lines up with them; with more lines the buttons stay at the bottom.
+        let icon_btn = |id: &'static str, svg: &'static [u8], color: Hsla| {
+            div()
+                .id(id)
+                .size(dp(44.))
+                .flex_shrink_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .cursor_pointer()
+                .text_color(color)
+                .hover(move |d| d.text_color(Hsla { a: 0.85, ..color }))
+                .child(Icon::empty().data(svg).size(dp(24.)))
+        };
+        let dim = p.text.opacity(0.45);
+        let recording = self.recording.as_ref().map(|(r, at)| (at.elapsed().as_secs(), r.level()));
+        let bar = h_flex()
             .flex_shrink_0()
-            .px_3()
-            .py_2()
-            .gap_2()
+            .px_1()
             .items_end()
             .bg(p.panel)
-            .when(pending.is_none() && editing.is_none(), |d| d.border_t_1().border_color(p.border))
-            .child(Button::new("attach").ghost().icon(IconName::Paperclip).tooltip("Прикрепить файл").on_click(cx.listener(|this, _, _, cx| this.attach(cx))))
-            .child(
+            .when(pending.is_none() && editing.is_none(), |d| d.border_t_1().border_color(p.border));
+        let composer = if let Some((secs, level)) = recording {
+            bar.child(
                 div()
-                    .flex_1()
-                    .min_w_0()
-                    .px_3()
-                    .py_1()
-                    .rounded(dp(20.))
-                    .bg(p.field)
-                    .capture_action(cx.listener(|this, _: &gpui_kit::component::input::Copy, window, cx| {
-                        if copy_message_selection(&this.compose, window, cx) {
-                            cx.stop_propagation();
-                        }
-                    }))
-                    .capture_action(cx.listener(|this, _: &Paste, _, cx| {
-                        if this.paste_attachments(cx) {
-                            cx.stop_propagation();
-                        }
-                    }))
-                    .child(Textarea::new(&self.compose).appearance(false)),
-            )
-            .child(
-                div()
-                    .id("send")
-                    .size(dp(40.))
-                    .flex_shrink_0()
-                    .rounded_full()
-                    .bg(p.accent)
-                    .hover(|d| d.bg(p.accent_hover))
-                    .cursor_pointer()
+                    .id("rec-cancel")
+                    .size(dp(44.))
                     .flex()
                     .items_center()
                     .justify_center()
-                    .child(Icon::new(IconName::SendHorizontal).text_color(white()))
-                    .on_click(cx.listener(|this, _, window, cx| this.send_text(window, cx))),
-            );
+                    .cursor_pointer()
+                    .text_color(dim)
+                    .hover(|d| d.text_color(p.text))
+                    .child(Icon::new(IconName::X).size(dp(20.)))
+                    .on_click(cx.listener(|this, _, _, cx| this.cancel_recording(cx))),
+            )
+            .child(
+                h_flex()
+                    .flex_1()
+                    .h(dp(44.))
+                    .gap_2()
+                    .items_center()
+                    .child(div().size(dp(10.)).rounded_full().bg(p.danger))
+                    .child(div().text_sm().child(format!("Запись {}:{:02}", secs / 60, secs % 60)))
+                    // Level meter: sqrt so speech fills a visible part of the bar.
+                    .child(div().w(dp(80.)).h(px(4.)).rounded_full().bg(hsla(0., 0., 0.5, 0.3)).child(div().h_full().rounded_full().bg(p.accent).w(relative(level.sqrt().min(1.))))),
+            )
+            .child(icon_btn("rec-send", SEND_SVG, p.accent).on_click(cx.listener(|this, _, w, cx| this.finish_recording(w, cx))))
+            .into_any_element()
+        } else {
+            bar.child(icon_btn("attach", ATTACH_SVG, dim).on_click(cx.listener(|this, _, _, cx| this.attach(cx))))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .min_h(dp(44.))
+                        .flex()
+                        .items_center()
+                        .capture_action(cx.listener(|this, _: &gpui_kit::component::input::Copy, window, cx| {
+                            if copy_message_selection(&this.compose, window, cx) {
+                                cx.stop_propagation();
+                            }
+                        }))
+                        .capture_action(cx.listener(|this, _: &Paste, _, cx| {
+                            if this.paste_attachments(cx) {
+                                cx.stop_propagation();
+                            }
+                        }))
+                        .child(div().w_full().child(Textarea::new(&self.compose).appearance(false))),
+                )
+                .child(icon_btn("emoji", MOOD_SVG, dim).on_click(cx.listener(|this, ev: &ClickEvent, _, cx| {
+                    this.emoji_picker = Some((None, ev.position(), emojis::Group::SmileysAndEmotion));
+                    cx.notify();
+                })))
+                .child(if has_text {
+                    icon_btn("send", SEND_SVG, p.accent).on_click(cx.listener(|this, _, window, cx| this.send_text(window, cx))).into_any_element()
+                } else {
+                    icon_btn("mic", MIC_SVG, dim).on_click(cx.listener(|this, _, w, cx| this.start_recording(w, cx))).into_any_element()
+                })
+                .into_any_element()
+        };
 
         v_flex()
             .flex_1()
@@ -1153,7 +1199,10 @@ impl App {
                     .text_sm()
                     .cursor_pointer()
                     .bg(if mine { p.accent.opacity(0.3) } else { code })
-                    .child(format!("{e} {n}"))
+                    .flex()
+                    .gap_1()
+                    .child(div().font_family(style::EMOJI_FONT).child(e.clone()))
+                    .child(n.to_string())
                     .on_click(cx.listener(move |this, _, _, cx| this.toggle_reaction(&id, &emoji, cx)))
             }))
         });
@@ -1294,6 +1343,53 @@ impl App {
         let name = file_name(url);
         let u = url.to_string();
         let open = cx.listener(move |this, _, window, cx| this.open_attachment(u.clone(), window, cx));
+        if is_audio(url) {
+            let p = style::palette(cx);
+            if !downloaded && !failed && self.settings.auto_download {
+                self.request_download(url);
+            }
+            let progress = self.player.as_ref().filter(|(u, _)| u == url).map(|(_, pl)| pl.progress());
+            let len = if downloaded {
+                *self.audio_len.entry(path.clone()).or_insert_with(|| std::fs::read(&path).ok().and_then(|b| crabber::voice::duration(&b)).unwrap_or(0.))
+            } else {
+                0.
+            };
+            let clock = |secs: f32| format!("{}:{:02}", secs as u32 / 60, secs as u32 % 60);
+            let label = match progress {
+                Some(f) => format!("{} / {}", clock(f * len), clock(len)),
+                None if downloaded => clock(len),
+                None if failed => "недоступно · нажмите, чтобы повторить".to_string(),
+                None => "Голосовое сообщение".to_string(),
+            };
+            let u = url.to_string();
+            return h_flex()
+                .gap_3()
+                .items_center()
+                .min_w(dp(240.))
+                .child(
+                    div()
+                        .id(SharedString::from(format!("play-{}", m.msg_id)))
+                        .size(dp(40.))
+                        .flex_shrink_0()
+                        .rounded_full()
+                        .bg(p.accent)
+                        .hover(|d| d.bg(p.accent_hover))
+                        .cursor_pointer()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(Icon::new(if progress.is_some() { IconName::Pause } else { IconName::Play }).text_color(white()))
+                        .on_click(cx.listener(move |this, _, w, cx| this.toggle_play(u.clone(), w, cx))),
+                )
+                .child(
+                    v_flex()
+                        .flex_1()
+                        .gap_1()
+                        .child(div().h(px(4.)).w_full().rounded_full().bg(hsla(0., 0., 0.5, 0.3)).child(div().h_full().rounded_full().bg(p.accent).w(relative(progress.unwrap_or(0.)))))
+                        .child(div().text_xs().opacity(0.7).child(label)),
+                )
+                .into_any_element();
+        }
         if is_image(url) {
             if !downloaded {
                 if failed {
@@ -1635,6 +1731,7 @@ impl App {
                             .rounded_md()
                             .cursor_pointer()
                             .text_lg()
+                            .font_family(style::EMOJI_FONT)
                             .hover(|d| d.bg(p.hover))
                             .child(e)
                             .on_click(cx.listener(move |this, _, _, cx| this.toggle_reaction(&id, e, cx)))
@@ -1651,7 +1748,7 @@ impl App {
                             .child(Icon::new(IconName::Plus).small())
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.msg_menu = None;
-                                this.emoji_picker = Some((id.clone(), pos, emojis::Group::SmileysAndEmotion));
+                                this.emoji_picker = Some((Some(id.clone()), pos, emojis::Group::SmileysAndEmotion));
                                 cx.notify();
                             }))
                     })
@@ -1704,6 +1801,13 @@ impl App {
                         this.msg_menu = None;
                         this.save_attachment_as(url.clone(), w, cx);
                     }))
+                    .into_any_element(),
+            );
+        }
+        if let Some(f) = file.clone().filter(|_| m.url.as_deref().is_some_and(is_image)) {
+            items.push(
+                item("mm-copy-img", IconName::Copy, "Копировать изображение", false)
+                    .on_click(cx.listener(move |this, _, _, cx| this.copy_image(&f, cx)))
                     .into_any_element(),
             );
         }
@@ -1798,6 +1902,7 @@ impl App {
                 .py_0p5()
                 .rounded_md()
                 .cursor_pointer()
+                .font_family(style::EMOJI_FONT)
                 .when(g == group, |d| d.bg(p.hover))
                 .hover(|d| d.bg(p.hover))
                 .child(icon)
@@ -1818,10 +1923,14 @@ impl App {
                 .justify_center()
                 .rounded_md()
                 .text_lg()
+                .font_family(style::EMOJI_FONT)
                 .cursor_pointer()
                 .hover(|d| d.bg(p.hover))
                 .child(emoji)
-                .on_click(cx.listener(move |this, _, _, cx| this.toggle_reaction(&id, emoji, cx)))
+                .on_click(cx.listener(move |this, _, w, cx| match &id {
+                    Some(id) => this.toggle_reaction(id, emoji, cx),
+                    None => this.insert_emoji(emoji, w, cx),
+                }))
         })));
         Some(
             div()
@@ -2168,6 +2277,40 @@ impl App {
         Some(self.panel("media", &title, v_flex().child(tabs).child(content).into_any_element(), cx))
     }
 
+    /// Right-click menu over the image viewer; drawn at the root, where window coordinates apply.
+    fn render_viewer_menu(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let pos = self.viewer_menu?;
+        let Some(Viewer::Image { path, url, .. }) = self.viewer.as_ref() else { return None };
+        let (path, url) = (path.clone(), url.clone());
+        let p = style::palette(cx);
+        let entry = |id: &'static str, icon: IconName, label: &'static str| {
+            h_flex().id(id).gap_3().px_3().py_1p5().rounded_md().items_center().cursor_pointer().text_sm().text_color(p.text).hover(|d| d.bg(p.hover)).child(Icon::new(icon).small()).child(label)
+        };
+        let menu = v_flex()
+            .id("viewer-menu")
+            .occlude()
+            .absolute()
+            .left(pos.x)
+            .top(pos.y)
+            .w(dp(240.))
+            .p_1()
+            .rounded_lg()
+            .bg(p.panel)
+            .border_1()
+            .border_color(p.divider)
+            .shadow_xl()
+            .child(entry("vm-copy", IconName::Copy, "Копировать изображение").on_click(cx.listener(move |this, _, _, cx| {
+                cx.stop_propagation();
+                this.copy_image(&path, cx);
+            })))
+            .child(entry("vm-save", IconName::Download, "Сохранить как…").on_click(cx.listener(move |this, _, w, cx| {
+                cx.stop_propagation();
+                this.viewer_menu = None;
+                this.save_attachment_as(url.clone(), w, cx);
+            })));
+        Some(menu.into_any_element())
+    }
+
     fn render_viewer(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let viewer = self.viewer.as_ref()?;
         let t = cx.theme().clone();
@@ -2180,6 +2323,10 @@ impl App {
                 let body = div()
                     .size_full()
                     .relative()
+                    .on_mouse_down(MouseButton::Right, cx.listener(|this, ev: &MouseDownEvent, _, cx| {
+                        this.viewer_menu = Some(ev.position);
+                        cx.notify();
+                    }))
                     .child(if path.is_file() {
                         img(path.clone()).absolute().inset_0().size_full().object_fit(ObjectFit::Contain).into_any_element()
                     } else {
@@ -2251,7 +2398,9 @@ impl App {
                 .bg(hsla(0., 0., 0., 0.88))
                 .track_focus(&self.viewer_focus)
                 .on_click(cx.listener(move |this, ev: &ClickEvent, _, cx| {
-                    if !content.get().contains(&ev.position()) {
+                    if this.viewer_menu.take().is_some() {
+                        cx.notify();
+                    } else if !content.get().contains(&ev.position()) {
                         this.viewer = None;
                         cx.notify();
                     }

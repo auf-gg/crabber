@@ -47,6 +47,8 @@ serde_json = "1"
 pgp = "0.21"
 rand = "0.8"
 emojis = "0.9.1"
+unsafe-libopus = "0.2.0"
+ogg = "0.9.2"
 
 [target.'cfg(windows)'.dependencies]
 tray-icon = "0.26"

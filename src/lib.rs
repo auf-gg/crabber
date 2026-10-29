@@ -5,4 +5,5 @@ pub mod pgp;
 pub mod connector;
 pub mod e2e;
 pub mod store;
+pub mod voice;
 pub mod xmpp;

@@ -25,6 +25,7 @@ depends=(
   'alsa-lib'
   'vulkan-icd-loader'
   'dbus'
+  'noto-fonts-emoji'   # colour emojis (reactions, picker)
 )
 provides=('crabber')
 conflicts=('crabber' 'crabber-git')

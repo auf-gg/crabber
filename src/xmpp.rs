@@ -1629,6 +1629,7 @@ fn mime(path: &std::path::Path) -> &'static str {
         Some("txt") => "text/plain",
         Some("pdf") => "application/pdf",
         Some("mp3") => "audio/mpeg",
+        Some("oga" | "ogg" | "opus") => "audio/ogg",
         Some("mp4") => "video/mp4",
         _ => "application/octet-stream",
     }

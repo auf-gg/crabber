@@ -30,6 +30,7 @@ depends=(
   'alsa-lib'           # cpal
   'vulkan-icd-loader'  # gpui/blade
   'dbus'               # ksni, notify-rust
+  'noto-fonts-emoji'   # colour emojis (reactions, picker)
 )
 provides=('crabber')
 conflicts=('crabber' 'crabber-bin')

@@ -106,6 +106,16 @@ pub fn palette(cx: &App) -> Palette {
 
 /// Re-skins gpui-component for the current mode; call after every theme change.
 /// `scale` drives the rem size: gpui-component's Root sets rem = theme font size every frame.
+/// Colour emoji font, set explicitly: on Linux the UI font (e.g. DejaVu Sans) has black-and-white
+/// glyphs for the older emojis and would win over the colour font.
+pub const EMOJI_FONT: &str = if cfg!(windows) {
+    "Segoe UI Emoji"
+} else if cfg!(target_os = "macos") {
+    "Apple Color Emoji"
+} else {
+    "Noto Color Emoji"
+};
+
 pub fn apply(cx: &mut App, scale: f32) {
     let p = palette(cx);
     Theme::update(cx, |t| {

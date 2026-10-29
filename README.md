@@ -15,6 +15,7 @@ Cross-platform XMPP messenger with a GPU-accelerated [GPUI](https://github.com/z
 - OMEMO end-to-end encryption (libsignal-compatible) and PGP support
 - Encrypted file transfer
 - Voice calls over WebRTC
+- Voice messages (Ogg Opus, compatible with Conversations)
 - Message history stored in SQLite with per-chat search
 - Account credentials kept in the system keyring
 - Desktop integration: tray icon, native notifications
@@ -143,6 +144,8 @@ sudo apt install pkg-config clang libxkbcommon-dev libxkbcommon-x11-dev libwayla
   libx11-xcb-dev libxcb1-dev libfontconfig-dev libfreetype-dev \
   libasound2-dev libvulkan-dev libdbus-1-dev
 ```
+
+Colour emojis need the Noto Color Emoji font (`fonts-noto-color-emoji` on Debian/Ubuntu).
 
 On Windows install the Visual Studio Build Tools (MSVC), then on either platform:
 

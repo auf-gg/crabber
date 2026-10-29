@@ -242,6 +242,11 @@ fn save_pasted(img: &Image) -> Option<PathBuf> {
     Some(path)
 }
 
+/// Voice messages we can play (Ogg Opus, what Conversations and we record).
+pub fn is_audio(url: &str) -> bool {
+    matches!(ext(url).as_str(), "oga" | "ogg" | "opus")
+}
+
 pub fn is_image(url: &str) -> bool {
     // `#` carries the key of aesgcm:// links in encrypted chats.
     let path = url.split(['?', '#']).next().unwrap_or(url).to_ascii_lowercase();
@@ -279,7 +284,18 @@ pub struct App {
     /// Right-click menu: the message and the window position it was opened at.
     pub msg_menu: Option<(Msg, Point<Pixels>)>,
     /// Full reaction picker: message id, where it opened, the shown emoji group.
-    pub emoji_picker: Option<(String, Point<Pixels>, emojis::Group)>,
+    /// Emoji picker: message to react to (`None`: insert into the composer), where it opened, the shown group.
+    pub emoji_picker: Option<(Option<String>, Point<Pixels>, emojis::Group)>,
+    /// Voice message being recorded, since when.
+    pub recording: Option<(crabber::voice::Recorder, Instant)>,
+    /// Voice message playing: its URL and the player.
+    pub player: Option<(String, crabber::voice::Player)>,
+    /// Voice message lengths in seconds, read once per file.
+    pub audio_len: HashMap<PathBuf, f32>,
+    /// Right-click menu over the image viewer.
+    pub viewer_menu: Option<Point<Pixels>>,
+    /// A 100 ms redraw loop runs (playback progress, recording timer).
+    animating: bool,
     /// Last window geometry, to restore it when re-opened from the tray.
     window_bounds: Option<WindowBounds>,
     tray: Option<desktop::Tray>,
@@ -336,7 +352,7 @@ impl App {
         let login_host = cx.new(|cx| InputState::new(window, cx).placeholder("Сервер host[:порт] — необязательно").default_value(saved_host));
         let search = cx.new(|cx| InputState::new(window, cx).placeholder("Поиск"));
         // Enter sends, Shift+Enter starts a new line (for ``` code blocks).
-        let compose = cx.new(|cx| TextareaState::new(window, cx).placeholder("Сообщение...").auto_grow(1, 8).submit_on_enter(true));
+        let compose = cx.new(|cx| TextareaState::new(window, cx).placeholder("Написать сообщение…").auto_grow(1, 8).submit_on_enter(true));
         let field1 = cx.new(|cx| InputState::new(window, cx));
         let field2 = cx.new(|cx| InputState::new(window, cx));
         let field3 = cx.new(|cx| TextareaState::new(window, cx).placeholder("-----BEGIN PGP ... KEY BLOCK-----").rows(8));
@@ -400,6 +416,11 @@ impl App {
             logo: Arc::new(Image::from_bytes(ImageFormat::Png, desktop::ICON_PNG.to_vec())),
             msg_menu: None,
             emoji_picker: None,
+            recording: None,
+            player: None,
+            audio_len: HashMap::new(),
+            viewer_menu: None,
+            animating: false,
             window_bounds: None,
             tray,
             desktop_tx,
@@ -432,7 +453,10 @@ impl App {
             }),
             cx.subscribe_in(&self.compose, window, |this, _, ev: &InputEvent, window, cx| match ev {
                 InputEvent::PressEnter { shift: false, .. } => this.send_text(window, cx),
-                InputEvent::Change => this.on_compose_change(cx),
+                InputEvent::Change => {
+                    this.on_compose_change(cx);
+                    cx.notify(); // the send button shows only with text
+                }
                 _ => {}
             }),
             cx.subscribe_in(&self.search, window, |this, _, ev: &InputEvent, _, cx| {
@@ -678,7 +702,9 @@ impl App {
 
     /// Esc, innermost first: viewer, dialog, search, open chat. Returns whether it did anything.
     pub fn handle_escape(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        if self.msg_menu.take().is_some() || self.emoji_picker.take().is_some() {
+        if self.msg_menu.take().is_some() || self.emoji_picker.take().is_some() || self.viewer_menu.take().is_some() {
+        } else if self.recording.take().is_some() {
+            // Esc throws the recording away.
         } else if self.viewer.take().is_some() {
             // Back to whatever was under the viewer (e.g. the media panel).
         } else if self.modal.take().is_some() {
@@ -913,6 +939,7 @@ impl App {
                         let title = if groupchat { format!("{} — {}", sess.display_name(&peer), msg.sender) } else { sess.display_name(&peer) };
                         let body = match &msg.url {
                             Some(u) if is_image(u) => "Фото".to_string(),
+                            Some(u) if is_audio(u) => "Голосовое сообщение".to_string(),
                             Some(_) => "Файл".to_string(),
                             None if notify_text => msg.body.clone(),
                             None => "Новое сообщение".to_string(),
@@ -1268,7 +1295,7 @@ impl App {
         let editing = sess.editing.take();
         let replying = sess.replying.take();
         for path in std::mem::take(&mut sess.pending) {
-            self.send_file(path);
+            self.send_file(&peer, path);
         }
         match editing {
             Some(id) => self.send_correction(&peer, id, body),
@@ -1488,9 +1515,9 @@ impl App {
         .detach();
     }
 
-    fn send_file(&mut self, path: PathBuf) {
+    fn send_file(&mut self, peer: &str, path: PathBuf) {
         let Some(sess) = self.sess.as_ref() else { return };
-        let Some(peer) = sess.selected.clone() else { return };
+        let peer = peer.to_string();
         let groupchat = sess.chat(&peer).is_some_and(|c| c.is_room);
         let sender = if groupchat { sess.chat(&peer).map(|c| c.nick.clone()).unwrap_or_default() } else { sess.me.clone() };
         let id = xmpp::new_id();
@@ -1500,6 +1527,140 @@ impl App {
         let enc = sess.chat(&peer).map(|c| c.enc.clone()).unwrap_or_default();
         sess.send(Cmd::Upload { to: peer.clone(), id: id.clone(), path, groupchat, enc });
         self.push_outgoing(&peer, Msg { msg_id: id, sender, outgoing: true, body: format!("Отправка файла {name}..."), url: None, ts: now_ms(), status: 0, enc: 0, edited: false, reply_to: None, retracted: false });
+    }
+
+    /// Mic button: starts a voice message.
+    pub fn start_recording(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.sess.as_ref().is_some_and(|s| s.call.is_some()) {
+            return window.push_notification("Во время звонка микрофон занят", cx);
+        }
+        self.player = None; // don't record our own speaker
+        match crabber::voice::Recorder::start() {
+            Ok(r) => {
+                self.recording = Some((r, Instant::now()));
+                self.animate(cx);
+            }
+            Err(e) => window.push_notification(format!("Не удалось включить микрофон: {e}"), cx),
+        }
+        cx.notify();
+    }
+
+    pub fn cancel_recording(&mut self, cx: &mut Context<Self>) {
+        self.recording = None;
+        cx.notify();
+    }
+
+    /// Encodes the recording to Ogg Opus off the UI thread and sends it like a file.
+    pub fn finish_recording(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((rec, _)) = self.recording.take() else { return };
+        let Some(sess) = self.sess.as_ref() else { return };
+        let Some(peer) = sess.selected.clone() else { return };
+        let dir = sess.dir.join("voice");
+        let pcm = rec.finish();
+        cx.notify();
+        if pcm.len() < 8000 {
+            return; // under half a second: a misclick
+        }
+        // Exact zeros: a hardware mute or a dead input, not a quiet room (that still has noise).
+        if pcm.iter().all(|s| *s == 0) {
+            return window.push_notification("Микрофон передаёт только тишину — проверьте кнопку отключения звука на микрофоне и выбранное устройство ввода в настройках звука", cx);
+        }
+        let task = cx.background_executor().spawn(async move {
+            let bytes = crabber::voice::encode(&pcm)?;
+            std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+            let path = dir.join(format!("voice-{}.oga", chrono::Local::now().format("%Y%m%d-%H%M%S")));
+            std::fs::write(&path, bytes).map_err(|e| e.to_string())?;
+            Ok::<_, String>(path)
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let res = task.await;
+            let _ = this.update_in(cx, |app, window, cx| match res {
+                Ok(path) => {
+                    app.send_file(&peer, path);
+                    cx.notify();
+                }
+                Err(e) => window.push_notification(format!("Не удалось сохранить запись: {e}"), cx),
+            });
+        })
+        .detach();
+    }
+
+    /// Play/pause button of a voice message.
+    pub fn toggle_play(&mut self, url: String, window: &mut Window, cx: &mut Context<Self>) {
+        if self.player.take().is_some_and(|(u, _)| u == url) {
+            cx.notify();
+            return;
+        }
+        let Some(sess) = self.sess.as_ref() else { return };
+        let Some(path) = sess.store.file_for(&url).filter(|p| p.is_file()) else {
+            if let Some(sess) = self.sess.as_mut() {
+                sess.failed.remove(&url);
+            }
+            self.request_download(&url);
+            cx.notify();
+            return;
+        };
+        let task = cx.background_executor().spawn(async move { std::fs::read(&path).map_err(|e| e.to_string()).and_then(|b| crabber::voice::decode(&b)) });
+        cx.spawn_in(window, async move |this, cx| {
+            let res = task.await.and_then(crabber::voice::Player::start);
+            let _ = this.update_in(cx, |app, window, cx| match res {
+                Ok(player) => {
+                    app.player = Some((url, player));
+                    app.animate(cx);
+                    cx.notify();
+                }
+                Err(e) => window.push_notification(format!("Не удалось воспроизвести: {e}"), cx),
+            });
+        })
+        .detach();
+    }
+
+    /// Redraws every 100 ms while something moves (playback progress, recording timer).
+    fn animate(&mut self, cx: &mut Context<Self>) {
+        if std::mem::replace(&mut self.animating, true) {
+            return;
+        }
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(std::time::Duration::from_millis(100)).await;
+                let go = this.update(cx, |app, cx| {
+                    if app.player.as_ref().is_some_and(|(_, p)| p.finished()) {
+                        app.player = None;
+                    }
+                    cx.notify();
+                    let go = app.player.is_some() || app.recording.is_some();
+                    app.animating = go;
+                    go
+                });
+                if !matches!(go, Ok(true)) {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// Smile button in the composer: the picked emoji goes in at the cursor.
+    pub fn insert_emoji(&mut self, emoji: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.emoji_picker = None;
+        let emoji = emoji.to_string();
+        self.compose.update(cx, |s, cx| {
+            s.insert(emoji, window, cx);
+            s.focus(window, cx);
+        });
+        cx.notify();
+    }
+
+    /// Puts a picture on the clipboard (message menu and viewer menu).
+    pub fn copy_image(&mut self, path: &std::path::Path, cx: &mut Context<Self>) {
+        self.msg_menu = None;
+        self.viewer_menu = None;
+        if let Ok(bytes) = std::fs::read(path)
+            && let Some(format) = image_format(&bytes)
+        {
+            cx.write_to_clipboard(ClipboardItem::new_image(&Image::from_bytes(format, bytes)));
+        }
+        cx.notify();
     }
 
     pub fn change_avatar(&mut self, cx: &mut Context<Self>) {

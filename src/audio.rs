@@ -41,15 +41,15 @@ pub fn ulaw_decode(u: u8) -> i16 {
 }
 
 /// Box-filter decimation; good enough for voice into an 8 kHz codec.
-struct Down {
-    ratio: f64,
-    pos: f64,
-    acc: f32,
-    n: u32,
+pub(crate) struct Down {
+    pub(crate) ratio: f64,
+    pub(crate) pos: f64,
+    pub(crate) acc: f32,
+    pub(crate) n: u32,
 }
 
 impl Down {
-    fn push(&mut self, x: f32, out: &mut Vec<f32>) {
+    pub(crate) fn push(&mut self, x: f32, out: &mut Vec<f32>) {
         self.acc += x;
         self.n += 1;
         self.pos += 1.0;
@@ -63,14 +63,14 @@ impl Down {
 }
 
 /// Linear interpolation from 8 kHz up to the device rate.
-struct Up {
-    step: f64,
-    frac: f64,
-    last: f32,
+pub(crate) struct Up {
+    pub(crate) step: f64,
+    pub(crate) frac: f64,
+    pub(crate) last: f32,
 }
 
 impl Up {
-    fn push(&mut self, x: f32, out: &mut VecDeque<f32>) {
+    pub(crate) fn push(&mut self, x: f32, out: &mut VecDeque<f32>) {
         while self.frac < 1.0 {
             out.push_back(self.last + (x - self.last) * self.frac as f32);
             self.frac += self.step;
