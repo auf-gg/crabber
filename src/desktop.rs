@@ -119,7 +119,7 @@ mod imp {
                 return;
             }
             let Ok(exe) = std::env::current_exe() else { return };
-            let data = wide(&format!("\"{}\"", exe.display()));
+            let data = wide(&format!("\"{}\" {}", exe.display(), super::MINIMIZED_ARG));
             let _ = RegSetKeyValueW(HKEY_CURRENT_USER, key, name, REG_SZ.0, Some(data.as_ptr() as *const _), (data.len() * 2) as u32);
         }
     }
@@ -306,7 +306,7 @@ mod imp {
             return;
         }
         let Ok(exe) = std::env::current_exe() else { return };
-        let entry = format!("[Desktop Entry]\nType=Application\nName=Crabber\nExec=\"{}\"\nIcon=crabber\nTerminal=false\nX-GNOME-Autostart-enabled=true\n", exe.display());
+        let entry = format!("[Desktop Entry]\nType=Application\nName=Crabber\nExec=\"{}\" {}\nIcon=crabber\nTerminal=false\nX-GNOME-Autostart-enabled=true\n", exe.display(), super::MINIMIZED_ARG);
         let _ = file.parent().map(std::fs::create_dir_all);
         let _ = std::fs::write(&file, entry);
     }
@@ -461,6 +461,9 @@ pub fn emoji_supported(e: &emojis::Emoji) -> bool {
         true
     }
 }
+
+/// Passed by autostart: start in the tray instead of showing the window.
+pub const MINIMIZED_ARG: &str = "--minimized";
 
 pub use imp::{Tray, autostart, hide_window, notify, set_autostart, set_window, show_window, toggle_window};
 

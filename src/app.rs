@@ -318,8 +318,14 @@ pub fn open_main_window(cx: &mut gpui_kit::App) -> gpui_kit::Result<()> {
         .as_ref()
         .and_then(|app| app.read_with(cx, |app, _| app.window_bounds))
         .unwrap_or_else(|| WindowBounds::centered(size(px(1100.), px(720.)), cx));
+    // Launched by autostart: the first window goes to the tray. On Windows it is created hidden (no flash);
+    // on Linux a never-shown window may not come back on activate, so it opens and is closed right away.
+    let start_hidden = existing.is_none() && std::env::args().any(|a| a == desktop::MINIMIZED_ARG);
+    let created_hidden = start_hidden && cfg!(windows);
     let options = WindowOptions {
         window_bounds: Some(bounds),
+        show: !created_hidden,
+        focus: !created_hidden,
         // Windows: our own title bar (view.rs `renderTitlebar`) replaces the system caption.
         // Elsewhere the window manager's title bar stays (move/resize/buttons work natively).
         titlebar: Some(TitlebarOptions { title: Some("Crabber".into()), appears_transparent: cfg!(windows), traffic_light_position: None }),
@@ -334,7 +340,7 @@ pub fn open_main_window(cx: &mut gpui_kit::App) -> gpui_kit::Result<()> {
             cx.set_global(AppGlobal(app.clone()));
             app
         });
-        app.update(cx, |app, cx| app.bind_window(window, cx));
+        app.update(cx, |app, cx| app.bind_window(window, start_hidden, cx));
         app
     })
     .map(|_| ())
@@ -429,6 +435,10 @@ impl App {
             _subs: vec![],
         };
         app.apply_theme(window, cx);
+        // Older versions registered autostart without the tray flag: rewrite the entry.
+        if app.settings.autostart {
+            desktop::set_autostart(true);
+        }
         // Auto-login with a remembered password.
         if !saved_jid.is_empty()
             && let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, &saved_jid)
@@ -440,7 +450,7 @@ impl App {
     }
 
     /// Window-scoped setup, re-run every time the window is (re)created after hide-to-tray.
-    fn bind_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn bind_window(&mut self, window: &mut Window, start_hidden: bool, cx: &mut Context<Self>) {
         desktop::set_window(window);
         self._subs = vec![
             cx.observe_window_bounds(window, |this, window, _| {
@@ -495,6 +505,12 @@ impl App {
             }
         });
         self.root_focus.focus(window, cx);
+        if start_hidden {
+            // Stay in the tray only if it can bring the window back and we log in by ourselves;
+            // otherwise the login screen must be seen.
+            let keep_hidden = self.tray.is_some() && self.sess.is_some();
+            cx.defer_in(window, move |_, window, _| if keep_hidden { desktop::hide_window(window) } else { desktop::show_window(window) });
+        }
     }
 
     pub fn login(&mut self, cx: &mut Context<Self>) {
