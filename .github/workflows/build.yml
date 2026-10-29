@@ -1,13 +1,12 @@
 # Build artifacts for all platforms:
 #   Linux  x86_64 / aarch64 — tar.gz (binary, .desktop, icon, install.sh)
 #   Windows x86_64 / aarch64 — portable .zip + NSIS installer setup.exe
-# Pushing a v* tag additionally creates a GitHub Release with all artifacts.
+# Runs on v* tags and manual dispatch only; a tag additionally creates a GitHub Release.
 
 name: Build
 
 on:
   push:
-    branches: [main]
     tags: ['v*']
   workflow_dispatch:
 
