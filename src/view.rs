@@ -841,7 +841,7 @@ impl App {
                         .child(div().text_sm().text_color(p.muted).child("Пока нет чатов. Добавьте контакт или создайте группу.")),
                 )
             })
-            .when_some(self.update.as_ref().filter(|_| !self.update_popup && !self.update_hidden), |d, rel| {
+            .when_some(self.update.as_ref().filter(|_| !self.update_popup && self.update_hidden_until.is_none_or(|t| std::time::Instant::now() >= t)), |d, rel| {
                 d.child(
                     h_flex()
                         .id("update-reminder")
@@ -860,7 +860,7 @@ impl App {
                                 .flex_1()
                                 .min_w_0()
                                 .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).child("Доступно обновление"))
-                                .child(div().text_xs().opacity(0.85).truncate().child(format!("Версия {} · нажмите, чтобы обновить", rel.version))),
+                                .child(div().text_xs().opacity(0.85).truncate().child(if self.updating { format!("Загрузка обновления... {}%", self.update_percent()) } else { format!("Версия {} · нажмите, чтобы обновить", rel.version) })),
                         )
                         .child(
                             div()
@@ -2629,7 +2629,7 @@ impl App {
         let p = style::palette(cx);
         let notes: Vec<Div> = rel.notes.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with("**Full Changelog**")).map(|l| div().text_sm().child(l.to_string())).collect();
         let action = if self.updating {
-            Button::new("update-go").primary().label("Загрузка...").disabled(true)
+            Button::new("update-go").primary().label(format!("Загрузка... {}%", self.update_percent())).disabled(true)
         } else {
             Button::new("update-go").primary().label("Обновить").on_click(cx.listener(|this, _, _, cx| this.install_update(cx)))
         };
@@ -2668,6 +2668,9 @@ impl App {
                                     .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).child("Что нового"))
                                     .child(v_flex().id("update-notes").max_h(dp(280.)).overflow_y_scroll().gap_1().children(notes)),
                             )
+                        })
+                        .when(self.updating, |d| {
+                            d.child(div().h(px(4.)).w_full().rounded_full().bg(hsla(0., 0., 0.5, 0.3)).child(div().h_full().rounded_full().bg(p.accent).w(relative(self.update_percent() as f32 / 100.))))
                         })
                         .when_some(self.update_error.clone(), |d, e| d.child(div().text_sm().text_color(p.danger).child(format!("Не удалось обновить: {e}"))))
                         .child(

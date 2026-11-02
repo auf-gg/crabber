@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 const REPO: &str = "auf-gg/crabber";
 pub const UPDATED_ARG: &str = "--updated";
@@ -33,6 +34,20 @@ async fn get(url: &str) -> Result<Vec<u8>, String> {
     let resp = reqwest::Client::new().get(url).header("User-Agent", "crabber").send().await.map_err(|e| e.to_string())?;
     let resp = resp.error_for_status().map_err(|e| e.to_string())?;
     Ok(resp.bytes().await.map_err(|e| e.to_string())?.to_vec())
+}
+
+async fn download(url: &str, progress: &AtomicU32) -> Result<Vec<u8>, String> {
+    let resp = reqwest::Client::new().get(url).header("User-Agent", "crabber").send().await.map_err(|e| e.to_string())?;
+    let mut resp = resp.error_for_status().map_err(|e| e.to_string())?;
+    let total = resp.content_length().unwrap_or(0);
+    let mut buf = Vec::with_capacity(total as usize);
+    while let Some(chunk) = resp.chunk().await.map_err(|e| e.to_string())? {
+        buf.extend_from_slice(&chunk);
+        if total > 0 {
+            progress.store((buf.len() as u64 * 1000 / total).min(1000) as u32, Ordering::Relaxed);
+        }
+    }
+    Ok(buf)
 }
 
 pub fn check(portable: bool) -> Result<Option<Release>, String> {
@@ -69,8 +84,8 @@ pub fn cleanup() {
     }
 }
 
-pub fn install(rel: &Release, portable: bool) -> Result<(), String> {
-    let bytes = block_on(get(&rel.url))?;
+pub fn install(rel: &Release, portable: bool, progress: &AtomicU32) -> Result<(), String> {
+    let bytes = block_on(download(&rel.url, progress))?;
     let dir = std::env::temp_dir().join(format!("crabber-update-{}", rel.version));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;

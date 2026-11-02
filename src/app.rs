@@ -425,7 +425,8 @@ pub struct App {
     pub video_drag: Option<(&'static str, f32)>,
     pub update: Option<crabber::update::Release>,
     pub update_popup: bool,
-    pub update_hidden: bool,
+    pub update_hidden_until: Option<Instant>,
+    pub update_progress: Arc<std::sync::atomic::AtomicU32>,
     pub updating: bool,
     pub update_error: Option<String>,
     app_store: Store,
@@ -563,7 +564,8 @@ impl App {
             video_drag: None,
             update: None,
             update_popup: false,
-            update_hidden: false,
+            update_hidden_until: None,
+            update_progress: Arc::default(),
             updating: false,
             update_error: None,
             app_store,
@@ -598,7 +600,7 @@ impl App {
                     {
                         app.update = Some(rel);
                         app.update_popup = true;
-                        app.update_hidden = false;
+                        app.update_hidden_until = None;
                         app.update_error = None;
                         cx.notify();
                     }
@@ -620,7 +622,22 @@ impl App {
         self.updating = true;
         self.update_error = None;
         let portable = store::portable_dir().is_some();
-        let task = cx.background_executor().spawn(async move { crabber::update::install(&rel, portable) });
+        let progress = self.update_progress.clone();
+        progress.store(0, std::sync::atomic::Ordering::Relaxed);
+        let task = cx.background_executor().spawn(async move { crabber::update::install(&rel, portable, &progress) });
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(std::time::Duration::from_millis(200)).await;
+                let go = this.update(cx, |app, cx| {
+                    cx.notify();
+                    app.updating
+                });
+                if !matches!(go, Ok(true)) {
+                    break;
+                }
+            }
+        })
+        .detach();
         cx.spawn(async move |this, cx| {
             let res = task.await;
             let _ = this.update(cx, |app, cx| match res {
@@ -642,8 +659,18 @@ impl App {
     }
 
     pub fn hide_update_reminder(&mut self, cx: &mut Context<Self>) {
-        self.update_hidden = true;
+        let hide = std::time::Duration::from_secs(4 * 3600);
+        self.update_hidden_until = Some(Instant::now() + hide);
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(hide).await;
+            let _ = this.update(cx, |_, cx| cx.notify());
+        })
+        .detach();
         cx.notify();
+    }
+
+    pub fn update_percent(&self) -> u32 {
+        self.update_progress.load(std::sync::atomic::Ordering::Relaxed) / 10
     }
 
     /// Window-scoped setup, re-run every time the window is (re)created after hide-to-tray.
