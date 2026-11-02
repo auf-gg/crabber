@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const REPO: &str = "auf-gg/crabber";
+pub const UPDATED_ARG: &str = "--updated";
 
 #[derive(Clone)]
 pub struct Release {
@@ -90,7 +91,7 @@ pub fn install(rel: &Release, portable: bool) -> Result<(), String> {
         let _ = std::fs::rename(&old, &exe);
         return Err(e.to_string());
     }
-    hidden(&exe).spawn().map_err(|e| e.to_string())?;
+    hidden(&exe).arg(UPDATED_ARG).spawn().map_err(|e| e.to_string())?;
     Ok(())
 }
 

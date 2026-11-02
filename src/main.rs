@@ -19,6 +19,10 @@ fn main() {
         .install_default()
         .expect("failed to install rustls crypto provider");
 
+    if !desktop::single_instance(&crabber::store::data_dir()) {
+        return;
+    }
+
     gpui_kit::application()
         .with_assets(AppAssets)
         // Hide-to-tray closes the window (Wayland): quit only explicitly, via the tray or the login close.

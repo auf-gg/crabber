@@ -1527,7 +1527,7 @@ impl App {
             .child(div().pt_1().text_xs().text_color(t.muted_foreground).child("Также Ctrl + «+» / «−», Ctrl + 0 — сбросить"))
             .child(section("СИСТЕМА"))
             .child(
-                h_flex().gap_3().py_1().items_center().child(row("Запускать при входе в систему", "Crabber будет открываться автоматически после входа в Windows или Linux")).child(
+                h_flex().gap_3().py_1().items_center().child(row("Запускать при входе в систему", "Crabber будет открываться автоматически после входа в систему")).child(
                     Switch::new("set-autostart").checked(s.autostart).on_click(cx.listener(|this, v: &bool, w, cx| {
                         crate::desktop::set_autostart(*v);
                         this.update_settings(w, cx, |st| st.autostart = crate::desktop::autostart())

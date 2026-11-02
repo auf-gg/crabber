@@ -45,10 +45,11 @@ mod imp {
     use windows::Data::Xml::Dom::XmlDocument;
     use windows::Foundation::{IPropertyValue, TypedEventHandler};
     use windows::UI::Notifications::{ToastActivatedEventArgs, ToastNotification, ToastNotificationManager, ToastNotifier};
-    use windows::Win32::Foundation::HWND;
+    use windows::Win32::Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE, HWND};
+    use windows::Win32::System::Threading::{CreateEventW, SetEvent, WaitForSingleObject};
     use windows::Win32::System::Registry::{HKEY_CURRENT_USER, REG_SZ, RRF_RT_REG_SZ, RegDeleteKeyValueW, RegGetValueW, RegSetKeyValueW};
     use windows::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID;
-    use windows::Win32::UI::WindowsAndMessaging::{IsIconic, IsWindowVisible, SW_HIDE, SW_RESTORE, SetForegroundWindow, ShowWindow};
+    use windows::Win32::UI::WindowsAndMessaging::{ASFW_ANY, AllowSetForegroundWindow, IsIconic, IsWindowVisible, SW_HIDE, SW_RESTORE, SetForegroundWindow, ShowWindow};
     use windows::core::{HSTRING, IInspectable, Interface};
 
     use super::{DesktopEvent, UnboundedSender, app_icon};
@@ -58,6 +59,33 @@ mod imp {
     static HWND_RAW: OnceLock<isize> = OnceLock::new();
     static NOTIFIER: OnceLock<Option<ToastNotifier>> = OnceLock::new();
     static EVENTS: OnceLock<UnboundedSender<DesktopEvent>> = OnceLock::new();
+    static WAKE: OnceLock<isize> = OnceLock::new();
+
+    pub fn single_instance(data_dir: &std::path::Path) -> bool {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        data_dir.hash(&mut h);
+        let name = HSTRING::from(format!("Local\\Crabber-{:016x}", h.finish()));
+        let mut waits = if std::env::args().any(|a| a == crabber::update::UPDATED_ARG) { 50 } else { 0 };
+        unsafe {
+            loop {
+                let Ok(event) = CreateEventW(None, false, false, &name) else { return true };
+                if GetLastError() != ERROR_ALREADY_EXISTS {
+                    let _ = WAKE.set(event.0 as isize);
+                    return true;
+                }
+                if waits == 0 {
+                    let _ = AllowSetForegroundWindow(ASFW_ANY);
+                    let _ = SetEvent(event);
+                    let _ = CloseHandle(event);
+                    return false;
+                }
+                let _ = CloseHandle(event);
+                waits -= 1;
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+        }
+    }
     /// Toasts must stay alive for their Activated handler to fire.
     static LIVE: Mutex<Vec<ToastNotification>> = Mutex::new(Vec::new());
 
@@ -150,6 +178,17 @@ mod imp {
         let _ = image::save_buffer(&icon_path, &app_icon(256, false), 256, 256, image::ColorType::Rgba8);
         register_aumid(&icon_path);
         let _ = EVENTS.set(tx.clone());
+        if let Some(&event) = WAKE.get() {
+            let tx = tx.clone();
+            std::thread::spawn(move || {
+                loop {
+                    unsafe { WaitForSingleObject(HANDLE(event as _), u32::MAX) };
+                    if tx.unbounded_send(DesktopEvent::Show).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
 
         let menu = Menu::new();
         let open = MenuItem::new("Открыть", true, None);
@@ -466,6 +505,13 @@ pub fn emoji_supported(e: &emojis::Emoji) -> bool {
 pub const MINIMIZED_ARG: &str = "--minimized";
 
 pub use imp::{Tray, autostart, hide_window, notify, set_autostart, set_window, show_window, toggle_window};
+#[cfg(windows)]
+pub use imp::single_instance;
+
+#[cfg(not(windows))]
+pub fn single_instance(_: &std::path::Path) -> bool {
+    true
+}
 
 /// The sender lets the app raise its own events (an incoming call shows the window).
 pub fn init(data_dir: &std::path::Path) -> (Option<Tray>, UnboundedSender<DesktopEvent>, UnboundedReceiver<DesktopEvent>) {
@@ -495,5 +541,13 @@ mod tests {
         assert!(ok("🤝") && ok("🏁"));
         assert!(!ok("🇷🇺") && !ok("🏴󠁧󠁢󠁥󠁮󠁧󠁿"), "country flags render as letters");
         assert_eq!(ok("🫠"), super::imp::build() >= 22000, "Emoji 14.0 only on Windows 11");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn second_instance_with_same_data_dir_is_refused() {
+        let dir = std::env::temp_dir().join(format!("crabber-single-{}", std::process::id()));
+        assert!(super::single_instance(&dir));
+        assert!(!super::single_instance(&dir));
     }
 }
