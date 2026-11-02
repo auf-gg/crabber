@@ -24,6 +24,44 @@ use crate::desktop::{self, DesktopEvent};
 
 const KEYRING_SERVICE: &str = "rust-ejabber";
 
+fn load_password(jid: &str) -> Option<String> {
+    match store::portable_dir() {
+        Some(dir) => store::read_passwords(&dir).remove(jid),
+        None => keyring::Entry::new(KEYRING_SERVICE, jid).ok()?.get_password().ok(),
+    }
+}
+
+fn save_password(jid: &str, password: &str) {
+    match store::portable_dir() {
+        Some(dir) => {
+            let mut map = store::read_passwords(&dir);
+            map.insert(jid.to_string(), password.to_string());
+            store::write_passwords(&dir, &map);
+        }
+        None => {
+            if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, jid) {
+                let _ = entry.set_password(password);
+            }
+        }
+    }
+}
+
+fn delete_password(jid: &str) {
+    match store::portable_dir() {
+        Some(dir) => {
+            let mut map = store::read_passwords(&dir);
+            if map.remove(jid).is_some() {
+                store::write_passwords(&dir, &map);
+            }
+        }
+        None => {
+            if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, jid) {
+                let _ = entry.delete_credential();
+            }
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq)]
 pub enum MediaTab {
     Photos,
@@ -528,12 +566,51 @@ impl App {
         }
         // Auto-login with a remembered password.
         if !saved_jid.is_empty()
-            && let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, &saved_jid)
-            && let Ok(password) = entry.get_password()
+            && let Some(password) = load_password(&saved_jid)
         {
             app.start_session(saved_jid, password, cx);
         }
+        #[cfg(windows)]
+        app.check_update(window, cx);
         app
+    }
+
+    #[cfg(windows)]
+    fn check_update(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        crabber::update::cleanup();
+        let portable = store::portable_dir().is_some();
+        let task = cx.background_executor().spawn(async move { crabber::update::check(portable) });
+        cx.spawn_in(window, async move |this, cx| {
+            let Ok(Some(rel)) = task.await else { return };
+            let _ = this.update_in(cx, |_, window, cx| {
+                let app = cx.entity().downgrade();
+                let note = gpui_kit::component::notification::Notification::new()
+                    .title("Доступно обновление")
+                    .message(format!("Crabber {}", rel.version))
+                    .action(move |_, _, _| {
+                        let (app, rel) = (app.clone(), rel.clone());
+                        gpui_kit::component::button::Button::new("update").label("Обновить").on_click(move |_, window, cx| {
+                            let _ = app.update(cx, |this, cx| this.install_update(rel.clone(), portable, window, cx));
+                        })
+                    });
+                window.push_notification(note, cx);
+            });
+        })
+        .detach();
+    }
+
+    #[cfg(windows)]
+    fn install_update(&mut self, rel: crabber::update::Release, portable: bool, window: &mut Window, cx: &mut Context<Self>) {
+        window.push_notification("Загрузка обновления...", cx);
+        let task = cx.background_executor().spawn(async move { crabber::update::install(&rel, portable) });
+        cx.spawn_in(window, async move |_, cx| {
+            let res = task.await;
+            let _ = cx.update(|window, cx| match res {
+                Ok(()) => cx.quit(),
+                Err(e) => window.push_notification(format!("Не удалось обновить: {e}"), cx),
+            });
+        })
+        .detach();
     }
 
     /// Window-scoped setup, re-run every time the window is (re)created after hide-to-tray.
@@ -638,10 +715,8 @@ impl App {
         self.app_store.set("jid", &jid);
         self.app_store.set("host", &host_field);
         self.app_store.set("insecure", if self.insecure { "1" } else { "0" });
-        if self.remember
-            && let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, &jid)
-        {
-            let _ = entry.set_password(&password);
+        if self.remember {
+            save_password(&jid, &password);
         }
 
         let (cmd, mut events) = xmpp::connect(Account {
@@ -742,10 +817,8 @@ impl App {
     }
 
     pub fn logout(&mut self, cx: &mut Context<Self>) {
-        if let Some(sess) = self.sess.take()
-            && let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, &sess.me)
-        {
-            let _ = entry.delete_credential();
+        if let Some(sess) = self.sess.take() {
+            delete_password(&sess.me);
         }
         self.connecting = false;
         self.modal = None;

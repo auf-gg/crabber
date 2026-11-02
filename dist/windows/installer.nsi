@@ -21,8 +21,8 @@
 Name "${APPNAME} ${VERSION}"
 OutFile "${OUTFILE}"
 Unicode true
-RequestExecutionLevel admin
-InstallDir "$PROGRAMFILES64\${APPNAME}"
+RequestExecutionLevel user
+InstallDir "$LOCALAPPDATA\Programs\${APPNAME}"
 
 !define MUI_ICON "${ICON}"
 !define MUI_UNICON "${ICON}"
@@ -43,6 +43,16 @@ InstallDir "$PROGRAMFILES64\${APPNAME}"
 Section "${APPNAME}" SecInstall
   SectionIn RO
   SetOutPath "$INSTDIR"
+  StrCpy $0 0
+  wait:
+  ClearErrors
+  Delete "$INSTDIR\crabber.exe"
+  IfErrors 0 free
+  IntOp $0 $0 + 1
+  IntCmp $0 50 free
+  Sleep 200
+  Goto wait
+  free:
   File "${BINDIR}\crabber.exe"
   File /oname=LICENSE.txt "${LICENSEFILE}"
 
@@ -52,12 +62,15 @@ Section "${APPNAME}" SecInstall
 
   WriteUninstaller "$INSTDIR\uninstall.exe"
 
-  WriteRegStr HKLM "Software\${APPNAME}" "InstallDir" "$INSTDIR"
-  WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\${APPNAME}" "DisplayName" "${APPNAME}"
-  WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\${APPNAME}" "DisplayVersion" "${VERSION}"
-  WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\${APPNAME}" "Publisher" "${PUBLISHER}"
-  WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\${APPNAME}" "DisplayIcon" "$INSTDIR\crabber.exe"
-  WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\${APPNAME}" "UninstallString" "$\"$INSTDIR\uninstall.exe$\""
+  WriteRegStr HKCU "Software\${APPNAME}" "InstallDir" "$INSTDIR"
+  WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\${APPNAME}" "DisplayName" "${APPNAME}"
+  WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\${APPNAME}" "DisplayVersion" "${VERSION}"
+  WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\${APPNAME}" "Publisher" "${PUBLISHER}"
+  WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\${APPNAME}" "DisplayIcon" "$INSTDIR\crabber.exe"
+  WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\${APPNAME}" "UninstallString" "$\"$INSTDIR\uninstall.exe$\""
+
+  IfSilent 0 +2
+  Exec '"$INSTDIR\crabber.exe"'
 SectionEnd
 
 Section "Uninstall"
@@ -68,6 +81,6 @@ Section "Uninstall"
   Delete "$INSTDIR\LICENSE.txt"
   Delete "$INSTDIR\uninstall.exe"
   RMDir "$INSTDIR"
-  DeleteRegKey HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\${APPNAME}"
-  DeleteRegKey HKLM "Software\${APPNAME}"
+  DeleteRegKey HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\${APPNAME}"
+  DeleteRegKey HKCU "Software\${APPNAME}"
 SectionEnd

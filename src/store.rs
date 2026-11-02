@@ -3,10 +3,77 @@ use std::path::{Path, PathBuf};
 
 use rusqlite::{Connection, OptionalExtension, params};
 
+fn portable_data(exe: &Path) -> Option<PathBuf> {
+    let dir = exe.parent()?;
+    dir.join("portable").is_file().then(|| dir.join("data"))
+}
+
+pub fn portable_dir() -> Option<PathBuf> {
+    portable_data(&std::env::current_exe().ok()?)
+}
+
+#[cfg(windows)]
+fn dpapi(data: &[u8], encrypt: bool) -> Option<Vec<u8>> {
+    use windows::Win32::Foundation::{HLOCAL, LocalFree};
+    use windows::Win32::Security::Cryptography::{CRYPT_INTEGER_BLOB, CRYPTPROTECT_UI_FORBIDDEN, CryptProtectData, CryptUnprotectData};
+    let input = CRYPT_INTEGER_BLOB { cbData: data.len() as u32, pbData: data.as_ptr() as *mut u8 };
+    let mut out = CRYPT_INTEGER_BLOB::default();
+    unsafe {
+        let res = if encrypt {
+            CryptProtectData(&input, windows::core::PCWSTR::null(), None, None, None, CRYPTPROTECT_UI_FORBIDDEN, &mut out)
+        } else {
+            CryptUnprotectData(&input, None, None, None, None, CRYPTPROTECT_UI_FORBIDDEN, &mut out)
+        };
+        res.ok()?;
+        let bytes = std::slice::from_raw_parts(out.pbData, out.cbData as usize).to_vec();
+        LocalFree(Some(HLOCAL(out.pbData as _)));
+        Some(bytes)
+    }
+}
+
+#[cfg(windows)]
+fn protect(password: &str) -> Option<String> {
+    use base64::Engine;
+    dpapi(password.as_bytes(), true).map(|b| format!("dpapi:{}", base64::engine::general_purpose::STANDARD.encode(b)))
+}
+
+#[cfg(windows)]
+fn unprotect(stored: &str) -> Option<String> {
+    use base64::Engine;
+    let b = base64::engine::general_purpose::STANDARD.decode(stored.strip_prefix("dpapi:")?).ok()?;
+    String::from_utf8(dpapi(&b, false)?).ok()
+}
+
+#[cfg(not(windows))]
+fn protect(password: &str) -> Option<String> {
+    Some(password.to_string())
+}
+
+#[cfg(not(windows))]
+fn unprotect(_: &str) -> Option<String> {
+    None
+}
+
+pub fn read_passwords(dir: &Path) -> std::collections::HashMap<String, String> {
+    let raw: std::collections::HashMap<String, String> = std::fs::read(dir.join("passwords.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+    let legacy = raw.values().any(|v| !v.starts_with("dpapi:"));
+    let map = raw.into_iter().filter_map(|(jid, v)| if v.starts_with("dpapi:") { unprotect(&v).map(|p| (jid, p)) } else { Some((jid, v)) }).collect();
+    if legacy && cfg!(windows) {
+        write_passwords(dir, &map);
+    }
+    map
+}
+
+pub fn write_passwords(dir: &Path, map: &std::collections::HashMap<String, String>) {
+    let stored: std::collections::HashMap<&String, String> = map.iter().filter_map(|(jid, p)| protect(p).map(|s| (jid, s))).collect();
+    let _ = std::fs::write(dir.join("passwords.json"), serde_json::to_vec(&stored).unwrap_or_default());
+}
+
 pub fn data_dir() -> PathBuf {
     // RUST_EJABBER_DATA lets several instances (e.g. two test accounts) run side by side.
     let dir = std::env::var_os("RUST_EJABBER_DATA")
         .map(PathBuf::from)
+        .or_else(portable_dir)
         .unwrap_or_else(|| {
             let base = dirs::data_dir().unwrap_or_else(|| PathBuf::from("."));
             let dir = base.join("Crabber");
@@ -36,7 +103,7 @@ pub fn avatar_path(dir: &Path, jid: &str) -> PathBuf {
 
 /// Where received attachments are saved: <Downloads>\CrabberDesktop.
 pub fn downloads_dir() -> PathBuf {
-    let dir = dirs::download_dir().unwrap_or_else(data_dir).join("CrabberDesktop");
+    let dir = portable_dir().map(|d| d.join("Downloads")).unwrap_or_else(|| dirs::download_dir().unwrap_or_else(data_dir).join("CrabberDesktop"));
     let _ = std::fs::create_dir_all(&dir);
     dir
 }
@@ -457,6 +524,35 @@ fn row_to_msg(r: &rusqlite::Row<'_>) -> rusqlite::Result<Msg> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn passwords_file_is_encrypted_and_migrates_plaintext() {
+        let dir = std::env::temp_dir().join(format!("crabber-passwords-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("passwords.json");
+        std::fs::write(&file, r#"{"a@x.org":"hunter2"}"#).unwrap();
+        let map = super::read_passwords(&dir);
+        assert_eq!(map.get("a@x.org").map(String::as_str), Some("hunter2"));
+        let on_disk = std::fs::read_to_string(&file).unwrap();
+        if cfg!(windows) {
+            assert!(!on_disk.contains("hunter2") && on_disk.contains("dpapi:"), "{on_disk}");
+        }
+        assert_eq!(super::read_passwords(&dir), map);
+        std::fs::write(&file, r#"{"b@x.org":"dpapi:AAAA"}"#).unwrap();
+        assert!(super::read_passwords(&dir).is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn portable_marker_puts_data_next_to_exe() {
+        let dir = std::env::temp_dir().join(format!("crabber-portable-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join("crabber.exe");
+        assert_eq!(super::portable_data(&exe), None);
+        std::fs::write(dir.join("portable"), "").unwrap();
+        assert_eq!(super::portable_data(&exe), Some(dir.join("data")));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     use super::*;
 
     fn msg(id: &str, ts: i64, outgoing: bool) -> Msg {
