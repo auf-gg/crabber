@@ -1642,6 +1642,7 @@ impl App {
                     .child(row("Папка загрузок", "Загрузки\\CrabberDesktop"))
                     .child(Button::new("open-dl").small().outline().icon(IconName::FolderOpen).label("Открыть").on_click(|_, _, cx| cx.open_with_system(&crabber::store::downloads_dir()))),
             )
+            .child(div().pt_4().text_xs().text_center().text_color(t.muted_foreground).child(format!("Crabber {}", env!("CARGO_PKG_VERSION"))))
             ;
         Some(self.panel("settings", "Настройки", body.into_any_element(), cx))
     }
