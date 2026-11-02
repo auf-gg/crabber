@@ -813,10 +813,13 @@ impl App {
                 }
                 // The window may be closed to the tray (Wayland): events keep processing without it.
                 let windowed = this.update(cx, |_, cx| !cx.windows().is_empty());
-                let ok = match windowed {
-                    Ok(true) => this.update_in(cx, |app, window, cx| app.on_events(batch, Some(window), cx)).is_ok(),
-                    Ok(false) => this.update(cx, |app, cx| app.on_events(batch, None, cx)).is_ok(),
-                    Err(_) => false,
+                let mut batch = Some(batch);
+                if matches!(windowed, Ok(true)) {
+                    let _ = this.update_in(cx, |app, window, cx| app.on_events(batch.take().unwrap_or_default(), Some(window), cx));
+                }
+                let ok = match batch {
+                    Some(batch) => this.update(cx, |app, cx| app.on_events(batch, None, cx)).is_ok(),
+                    None => true,
                 };
                 if !ok {
                     break;
