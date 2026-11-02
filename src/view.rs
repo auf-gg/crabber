@@ -18,7 +18,7 @@ use crabber::call::{CallCmd, CallState};
 use crabber::store::{ChatRow, Msg};
 use tokio_xmpp::parsers::presence::Show;
 
-use crate::app::{App, MediaTab, Modal, Session, Viewer, ext, file_name, is_audio, is_call, is_image, is_text, my_occupant};
+use crate::app::{App, MediaTab, Modal, Session, Viewer, ext, file_name, is_audio, is_call, is_image, is_text, is_video, my_occupant};
 use crate::style;
 use crabber::e2e::DeviceInfo;
 
@@ -402,7 +402,7 @@ fn preview(c: &ChatRow) -> String {
     let text = if m.retracted {
         "Сообщение удалено".to_string()
     } else if m.url.is_some() {
-        if is_image(&m.body) { "Фото".to_string() } else if is_audio(&m.body) { "Голосовое сообщение".to_string() } else { "Файл".to_string() }
+        if is_image(&m.body) { "Фото".to_string() } else if is_video(&m.body) { "Видео".to_string() } else if is_audio(&m.body) { "Голосовое сообщение".to_string() } else { "Файл".to_string() }
     } else {
         m.body.replace("```", " ").split_whitespace().collect::<Vec<_>>().join(" ")
     };
@@ -1277,17 +1277,6 @@ impl App {
                     cx.notify();
                 }),
             )
-            .when(!is_call(&m), |d| {
-                let id = m.msg_id.clone();
-                d.on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
-                        if ev.click_count == 2 {
-                            this.add_reaction(&id, "❤️", cx);
-                        }
-                    }),
-                )
-            })
             .max_w(relative(0.68))
             .min_w(dp(72.))
             .px_3()
@@ -1390,7 +1379,9 @@ impl App {
                 )
                 .into_any_element();
         }
-        if is_image(url) {
+        let video = is_video(url) && crabber::video::available();
+        if is_image(url) || video {
+            let kind = if video { "Видео" } else { "Изображение" };
             if !downloaded {
                 if failed {
                     return div()
@@ -1398,7 +1389,7 @@ impl App {
                         .cursor_pointer()
                         .text_sm()
                         .opacity(0.7)
-                        .child("Изображение недоступно · нажмите, чтобы повторить")
+                        .child(format!("{kind} недоступно · нажмите, чтобы повторить"))
                         .on_click(open)
                         .into_any_element();
                 }
@@ -1407,12 +1398,40 @@ impl App {
                     return div()
                         .id(SharedString::from(format!("img-{}", m.msg_id)))
                         .cursor_pointer()
-                        .child(h_flex().gap_2().items_center().child(icon_box(IconName::Download, 40.)).child(div().text_sm().child("Фото · нажмите, чтобы загрузить")))
+                        .child(h_flex().gap_2().items_center().child(icon_box(IconName::Download, 40.)).child(div().text_sm().child(if video { "Видео · нажмите, чтобы загрузить" } else { "Фото · нажмите, чтобы загрузить" })))
                         .on_click(open)
                         .into_any_element();
                 }
                 self.request_download(url);
-                return div().text_sm().opacity(0.7).child("Загрузка изображения...").into_any_element();
+                return div().text_sm().opacity(0.7).child(if video { "Загрузка видео..." } else { "Загрузка изображения..." }).into_any_element();
+            }
+            if video {
+                let thumb = self.video_thumb(&path, cx);
+                let (w, h) = match &thumb {
+                    Some(t) => *self.img_dims.entry(t.clone()).or_insert_with(|| image::image_dimensions(t).map(|(w, h)| (w as f32, h as f32)).unwrap_or((320., 180.))),
+                    None => (320., 180.),
+                };
+                let scale = (320. / w).min(320. / h).min(1.);
+                return div()
+                    .id(SharedString::from(format!("vid-{}", m.msg_id)))
+                    .cursor_pointer()
+                    .relative()
+                    .w(dp(w * scale))
+                    .h(dp(h * scale))
+                    .rounded_md()
+                    .bg(black())
+                    .when_some(thumb, |d, t| d.child(img(t).size_full().rounded_md()))
+                    .child(
+                        div()
+                            .absolute()
+                            .inset_0()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(div().size(dp(48.)).rounded_full().bg(hsla(0., 0., 0., 0.55)).flex().items_center().justify_center().child(Icon::new(IconName::Play).text_color(white()))),
+                    )
+                    .on_click(open)
+                    .into_any_element();
             }
             // Fit into 320x320 keeping the aspect ratio, so the bubble hugs the picture.
             let (w, h) = *self.img_dims.entry(path.clone()).or_insert_with(|| image::image_dimensions(&path).map(|(w, h)| (w as f32, h as f32)).unwrap_or((320., 240.)));
@@ -2311,6 +2330,67 @@ impl App {
         Some(menu.into_any_element())
     }
 
+    fn drag_bar(&self, id: &'static str, value: f32, cx: &mut Context<Self>, set: fn(&mut App, f32, bool, &mut Window, &mut Context<App>)) -> Stateful<Div> {
+        let shown = match self.video_drag {
+            Some((d, v)) if d == id => v,
+            _ => value,
+        };
+        let frac = |b: Bounds<Pixels>, x: Pixels| if b.size.width > px(0.) { ((x - b.left()) / b.size.width).clamp(0., 1.) } else { 0. };
+        let bounds = Rc::new(Cell::new(Bounds::default()));
+        let entity = cx.entity().downgrade();
+        let track = {
+            let bounds = bounds.clone();
+            canvas(
+                move |b: Bounds<Pixels>, _, _| bounds.set(b),
+                move |b, _, window, _| {
+                    let e = entity.clone();
+                    window.on_mouse_event(move |ev: &MouseMoveEvent, phase, window, cx| {
+                        if phase == DispatchPhase::Bubble && ev.pressed_button == Some(MouseButton::Left) {
+                            let _ = e.update(cx, |app, cx| {
+                                if app.video_drag.is_some_and(|(d, _)| d == id) {
+                                    let v = frac(b, ev.position.x);
+                                    app.video_drag = Some((id, v));
+                                    set(app, v, false, window, cx);
+                                }
+                            });
+                        }
+                    });
+                    window.on_mouse_event(move |ev: &MouseUpEvent, phase, window, cx| {
+                        if phase == DispatchPhase::Bubble && ev.button == MouseButton::Left {
+                            let _ = entity.update(cx, |app, cx| {
+                                if app.video_drag.is_some_and(|(d, _)| d == id) {
+                                    app.video_drag = None;
+                                    set(app, frac(b, ev.position.x), true, window, cx);
+                                }
+                            });
+                        }
+                    });
+                },
+            )
+            .absolute()
+            .inset_0()
+        };
+        div()
+            .id(id)
+            .h(px(16.))
+            .relative()
+            .flex()
+            .items_center()
+            .cursor_pointer()
+            .child(div().h(px(4.)).w_full().rounded_full().bg(hsla(0., 0., 1., 0.3)).child(div().h_full().rounded_full().bg(white()).w(relative(shown))))
+            .child(track)
+            .child(div().absolute().top(px(2.)).left(relative(shown)).ml(px(-6.)).size(px(12.)).rounded_full().bg(white()).shadow_sm())
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, ev: &MouseDownEvent, window, cx| {
+                    cx.stop_propagation();
+                    let v = frac(bounds.get(), ev.position.x);
+                    this.video_drag = Some((id, v));
+                    set(this, v, false, window, cx);
+                }),
+            )
+    }
+
     fn render_viewer(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let viewer = self.viewer.as_ref()?;
         let t = cx.theme().clone();
@@ -2348,6 +2428,64 @@ impl App {
                     Some(i) if gallery.len() > 1 => format!("{} · {} из {}", file_name(url), i + 1, gallery.len()),
                     _ => file_name(url),
                 };
+                (title, path.clone(), body.into_any_element())
+            }
+            Viewer::Video { path, thumb, size, duration, play, frame, .. } => {
+                dims = Some((size.0 as f32, size.1 as f32));
+                let total = *duration;
+                let pos = match self.video_drag {
+                    Some(("video-seek", f)) => f as f64 * total,
+                    _ => play.as_ref().map_or(total, |p| p.position().min(total)),
+                };
+                let paused = play.as_ref().is_none_or(|p| p.paused());
+                let clock = |s: f64| format!("{}:{:02}", s as u32 / 60, s as u32 % 60);
+                let (volume, muted) = (self.video_volume, self.video_muted);
+                let vol_bar = self
+                    .drag_bar("video-volume", if muted { 0. } else { volume }, cx, |app, v, _, _, cx| app.video_set_volume(v, false, cx))
+                    .w(dp(80.))
+                    .flex_shrink_0();
+                let picture = match frame {
+                    Some(f) => img(f.clone()),
+                    None => img(thumb.clone()),
+                };
+                let seek = self
+                    .drag_bar("video-seek", if total > 0. { (pos / total) as f32 } else { 0. }, cx, |app, f, release, w, cx| {
+                        let Some(Viewer::Video { duration, .. }) = app.viewer.as_ref() else { return };
+                        if release {
+                            let to = f as f64 * *duration;
+                            app.video_seek(to, w, cx);
+                        } else {
+                            cx.notify();
+                        }
+                    })
+                    .flex_1();
+                let controls = h_flex()
+                    .id("video-controls")
+                    .absolute()
+                    .bottom_0()
+                    .left_0()
+                    .right_0()
+                    .gap_3()
+                    .px_3()
+                    .py_2()
+                    .items_center()
+                    .rounded_md()
+                    .text_color(white())
+                    .bg(hsla(0., 0., 0., 0.55))
+                    .on_click(|_, _, cx| cx.stop_propagation())
+                    .child(overlay_icon("video-play", if paused { IconName::Play } else { IconName::Pause }).on_click(cx.listener(|this, _, w, cx| {
+                        cx.stop_propagation();
+                        this.video_toggle(w, cx)
+                    })))
+                    .child(div().text_sm().child(format!("{} / {}", clock(pos), clock(total))))
+                    .child(seek)
+                    .child(overlay_icon("video-mute", if muted { IconName::VolumeX } else { IconName::Volume2 }).on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.video_set_volume(volume, !muted, cx)
+                    })))
+                    .child(vol_bar);
+                let body = div().size_full().relative().child(picture.absolute().inset_0().size_full().object_fit(ObjectFit::Contain)).child(controls);
+                let title = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
                 (title, path.clone(), body.into_any_element())
             }
             Viewer::Text { name, path, text } => {
@@ -2397,22 +2535,31 @@ impl App {
                 .inset_0()
                 .bg(hsla(0., 0., 0., 0.88))
                 .track_focus(&self.viewer_focus)
-                .on_click(cx.listener(move |this, ev: &ClickEvent, _, cx| {
+                .on_click(cx.listener(move |this, ev: &ClickEvent, window, cx| {
                     if this.viewer_menu.take().is_some() {
                         cx.notify();
                     } else if !content.get().contains(&ev.position()) {
                         this.viewer = None;
                         cx.notify();
+                    } else if matches!(this.viewer, Some(Viewer::Video { .. })) {
+                        this.video_toggle(window, cx);
                     }
                 }))
-                .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _, cx| {
+                .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
                     match ev.keystroke.key.as_str() {
                         "escape" => {
                             this.viewer = None;
                             cx.notify();
                         }
-                        "left" => this.viewer_step(-1, cx),
-                        "right" => this.viewer_step(1, cx),
+                        "left" => {
+                            this.viewer_step(-1, cx);
+                            this.video_nudge(-5., window, cx);
+                        }
+                        "right" => {
+                            this.viewer_step(1, cx);
+                            this.video_nudge(5., window, cx);
+                        }
+                        "space" => this.video_toggle(window, cx),
                         _ => {}
                     }
                 }))

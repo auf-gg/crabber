@@ -1,6 +1,7 @@
 //! UI state and logic. All persistence happens here; the network thread only reports events.
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Instant;
@@ -54,6 +55,18 @@ pub enum Viewer {
     /// `gallery`: all image URLs of the chat, for left/right navigation.
     Image { path: PathBuf, url: String, gallery: Vec<String> },
     Text { name: String, path: PathBuf, text: String },
+    /// Played with the system ffmpeg; `size`: frame size (the thumbnail's), `play`: None once it ended.
+    /// `alive` ends the frame ticker when the viewer is closed or replaced.
+    Video {
+        path: PathBuf,
+        thumb: PathBuf,
+        size: (u32, u32),
+        duration: f64,
+        has_audio: bool,
+        play: Option<crabber::video::Playback>,
+        frame: Option<Arc<RenderImage>>,
+        _alive: Rc<()>,
+    },
 }
 
 /// App-wide preferences (stored in app.db).
@@ -247,6 +260,21 @@ pub fn is_audio(url: &str) -> bool {
     matches!(ext(url).as_str(), "oga" | "ogg" | "opus")
 }
 
+pub fn is_video(url: &str) -> bool {
+    matches!(ext(url).as_str(), "mp4" | "webm" | "mov" | "mkv" | "avi" | "m4v" | "3gp")
+}
+
+/// Cached first frame of a video; keyed by path and size so a reused file name gets a fresh one.
+fn thumb_path(video: &Path) -> PathBuf {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    video.hash(&mut h);
+    std::fs::metadata(video).map(|m| m.len()).unwrap_or(0).hash(&mut h);
+    let dir = store::data_dir().join("thumbs");
+    let _ = std::fs::create_dir_all(&dir);
+    dir.join(format!("{:016x}.png", h.finish()))
+}
+
 /// Linux file managers put copied files on the clipboard as `text/uri-list`, which GPUI
 /// cannot read back as paths; the same clipboard also carries the paths as plain text.
 /// When every line of that text names an existing file, it is a file copy, not a message.
@@ -352,6 +380,11 @@ pub struct App {
     desktop_tx: UnboundedSender<DesktopEvent>,
     /// Picture sizes for the chat bubbles: reading the file header every frame made scrolling stutter.
     pub img_dims: HashMap<PathBuf, (f32, f32)>,
+    /// Video -> its thumbnail; None while ffmpeg makes it (or if it failed).
+    pub thumbs: HashMap<PathBuf, Option<PathBuf>>,
+    pub video_volume: f32,
+    pub video_muted: bool,
+    pub video_drag: Option<(&'static str, f32)>,
     app_store: Store,
     _subs: Vec<Subscription>,
 }
@@ -481,6 +514,10 @@ impl App {
             tray,
             desktop_tx,
             img_dims: HashMap::new(),
+            thumbs: HashMap::new(),
+            video_volume: 1.,
+            video_muted: false,
+            video_drag: None,
             app_store,
             _subs: vec![],
         };
@@ -1482,15 +1519,6 @@ impl App {
         cx.notify();
     }
 
-    /// Double click: puts our `emoji` on, never takes it off.
-    pub fn add_reaction(&mut self, msg_id: &str, emoji: &str, cx: &mut Context<Self>) {
-        let Some(sess) = self.sess.as_ref() else { return };
-        let me = sess.selected.as_deref().map(|p| sess.my_sender(p)).unwrap_or_default();
-        if !sess.reactions.get(msg_id).into_iter().flatten().any(|(s, e)| *s == me && e == emoji) {
-            self.toggle_reaction(msg_id, emoji, cx);
-        }
-    }
-
     /// Adds or removes our `emoji` on a message of the open chat (XEP-0444).
     pub fn toggle_reaction(&mut self, msg_id: &str, emoji: &str, cx: &mut Context<Self>) {
         self.msg_menu = None;
@@ -1764,6 +1792,9 @@ impl App {
                 let peer = sess.selected.clone().unwrap_or_default();
                 let gallery = sess.store.attachments(&peer).into_iter().filter_map(|m| m.url).filter(|u| is_image(u)).collect();
                 self.viewer = Some(Viewer::Image { path, url, gallery });
+            } else if is_video(&url) && crabber::video::available() {
+                self.open_video(path, window, cx);
+                return;
             } else if is_text(&url) {
                 let bytes = std::fs::read(&path).unwrap_or_default();
                 let text = String::from_utf8_lossy(&bytes[..bytes.len().min(512 * 1024)]).into_owned();
@@ -1780,6 +1811,154 @@ impl App {
             }
             self.request_download(&url);
         }
+    }
+
+    /// Thumbnail for a chat bubble; starts making it on first ask.
+    pub fn video_thumb(&mut self, video: &Path, cx: &mut Context<Self>) -> Option<PathBuf> {
+        if let Some(t) = self.thumbs.get(video) {
+            return t.clone();
+        }
+        let thumb = thumb_path(video);
+        if thumb.is_file() {
+            self.thumbs.insert(video.to_path_buf(), Some(thumb.clone()));
+            return Some(thumb);
+        }
+        self.thumbs.insert(video.to_path_buf(), None);
+        let src = video.to_path_buf();
+        let task = cx.background_executor().spawn({
+            let (src, thumb) = (src.clone(), thumb.clone());
+            async move { crabber::video::thumbnail(&src, &thumb) }
+        });
+        cx.spawn(async move |this, cx| {
+            if task.await.is_ok() {
+                let _ = this.update(cx, |app, cx| {
+                    app.thumbs.insert(src, Some(thumb));
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+        None
+    }
+
+    fn open_video(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        let thumb = thumb_path(&path);
+        let task = cx.background_executor().spawn({
+            let (path, thumb) = (path.clone(), thumb.clone());
+            async move {
+                if !thumb.is_file() {
+                    crabber::video::thumbnail(&path, &thumb)?;
+                }
+                let size = image::image_dimensions(&thumb).map_err(|e| e.to_string())?;
+                Ok::<_, String>((crabber::video::probe(&path)?, size))
+            }
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let res = task.await;
+            let _ = this.update_in(cx, |app, window, cx| match res {
+                Ok((info, size)) => {
+                    let alive = Rc::new(());
+                    let ticker = Rc::downgrade(&alive);
+                    app.viewer = Some(Viewer::Video { path, thumb, size, duration: info.duration, has_audio: info.has_audio, play: None, frame: None, _alive: alive });
+                    app.video_seek(0., window, cx);
+                    app.viewer_focus.focus(window, cx);
+                    app.video_ticker(ticker, window, cx);
+                }
+                Err(e) => window.push_notification(format!("Не удалось открыть видео: {e}"), cx),
+            });
+        })
+        .detach();
+    }
+
+    /// Restarts playback at `to` seconds, keeping the pause state.
+    pub fn video_seek(&mut self, to: f64, window: &mut Window, cx: &mut Context<Self>) {
+        let volume = self.effective_volume();
+        let Some(Viewer::Video { path, size, duration, has_audio, play, .. }) = self.viewer.as_mut() else { return };
+        let paused = play.as_ref().is_some_and(|p| p.paused());
+        // Stop the old ffmpeg before starting the new one.
+        *play = None;
+        match crabber::video::Playback::start(path, *size, to.clamp(0., (*duration - 0.1).max(0.)), *has_audio, volume) {
+            Ok(mut p) => {
+                if paused {
+                    p.toggle_pause();
+                }
+                *play = Some(p);
+            }
+            Err(e) => window.push_notification(format!("Не удалось воспроизвести: {e}"), cx),
+        }
+        cx.notify();
+    }
+
+    fn effective_volume(&self) -> f32 {
+        if self.video_muted { 0. } else { self.video_volume }
+    }
+
+    pub fn video_set_volume(&mut self, volume: f32, muted: bool, cx: &mut Context<Self>) {
+        self.video_volume = volume.clamp(0., 1.);
+        self.video_muted = muted;
+        let v = self.effective_volume();
+        if let Some(Viewer::Video { play: Some(p), .. }) = self.viewer.as_ref() {
+            p.set_volume(v);
+        }
+        cx.notify();
+    }
+
+    /// Seeks by `delta` seconds from the current position.
+    pub fn video_nudge(&mut self, delta: f64, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(Viewer::Video { play, duration, .. }) = self.viewer.as_ref() else { return };
+        let pos = play.as_ref().map_or(*duration, |p| p.position());
+        self.video_seek(pos + delta, window, cx);
+    }
+
+    /// Play/pause; after the end, plays again from the start.
+    pub fn video_toggle(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(Viewer::Video { play, .. }) = self.viewer.as_mut() else { return };
+        match play {
+            Some(p) => p.toggle_pause(),
+            None => return self.video_seek(0., window, cx),
+        }
+        cx.notify();
+    }
+
+    /// Shows due frames until the viewer goes away, then frees the last one from the GPU atlas.
+    fn video_ticker(&mut self, alive: std::rc::Weak<()>, window: &mut Window, cx: &mut Context<Self>) {
+        cx.spawn_in(window, async move |this, cx| {
+            let mut shown: Option<Arc<RenderImage>> = None;
+            loop {
+                cx.background_executor().timer(std::time::Duration::from_millis(15)).await;
+                let go = this.update_in(cx, |app, window, cx| {
+                    if alive.upgrade().is_none() {
+                        return false;
+                    }
+                    let Some(Viewer::Video { size: (w, h), play, frame, .. }) = app.viewer.as_mut() else { return false };
+                    let Some(p) = play.as_mut() else { return true };
+                    let mut changed = !p.paused();
+                    if let Some(buf) = p.frame().and_then(|b| image::RgbaImage::from_raw(*w, *h, b)) {
+                        let img = Arc::new(RenderImage::new(vec![image::Frame::new(buf)]));
+                        *frame = Some(img.clone());
+                        if let Some(old) = shown.replace(img) {
+                            cx.drop_image(old, Some(window));
+                        }
+                        changed = true;
+                    }
+                    if p.ended() {
+                        *play = None;
+                        changed = true;
+                    }
+                    if changed {
+                        cx.notify();
+                    }
+                    true
+                });
+                if !matches!(go, Ok(true)) {
+                    if let Some(old) = shown {
+                        let _ = cx.update(|window, cx| cx.drop_image(old, Some(window)));
+                    }
+                    break;
+                }
+            }
+        })
+        .detach();
     }
 
     /// "Save as": copies the downloaded file, or downloads straight to the chosen path.
