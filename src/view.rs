@@ -431,7 +431,8 @@ impl Render for App {
             .when_some(self.render_pgp_import(cx), |d, m| d.child(m))
             .when_some(self.render_profile(cx), |d, m| d.child(m))
             .when_some(self.render_call(cx), |d, c| d.child(c))
-            .when_some(self.render_viewer(cx), |d, v| d.child(v));
+            .when_some(self.render_viewer(cx), |d, v| d.child(v))
+            .when_some(self.render_update(cx), |d, u| d.child(u));
         v_flex()
             .size_full()
             .relative()
@@ -838,6 +839,42 @@ impl App {
                         .text_center()
                         .child(Icon::new(IconName::Users).size(dp(40.)).text_color(p.muted))
                         .child(div().text_sm().text_color(p.muted).child("Пока нет чатов. Добавьте контакт или создайте группу.")),
+                )
+            })
+            .when_some(self.update.as_ref().filter(|_| !self.update_popup && !self.update_hidden), |d, rel| {
+                d.child(
+                    h_flex()
+                        .id("update-reminder")
+                        .m_2()
+                        .p_3()
+                        .gap_3()
+                        .items_center()
+                        .rounded_xl()
+                        .bg(p.accent)
+                        .hover(|d| d.bg(p.accent_hover))
+                        .text_color(white())
+                        .cursor_pointer()
+                        .child(Icon::new(IconName::Download))
+                        .child(
+                            v_flex()
+                                .flex_1()
+                                .min_w_0()
+                                .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).child("Доступно обновление"))
+                                .child(div().text_xs().opacity(0.85).truncate().child(format!("Версия {} · нажмите, чтобы обновить", rel.version))),
+                        )
+                        .child(
+                            div()
+                                .id("update-reminder-close")
+                                .p_1()
+                                .rounded_md()
+                                .hover(|d| d.bg(hsla(0., 0., 1., 0.15)))
+                                .child(Icon::new(IconName::X).small())
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.hide_update_reminder(cx)
+                                })),
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| this.show_update(true, cx))),
                 )
             })
     }
@@ -2581,6 +2618,65 @@ impl App {
                 )
                 // Absolute child of a sized box: otherwise the image grows to its own height and overflows.
                 .child(div().flex_1().min_h_0().px_6().pb_6().child(div().relative().size_full().child(body).child(measure)))
+                .into_any_element(),
+        )
+    }
+
+    fn render_update(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let rel = self.update.as_ref().filter(|_| self.update_popup)?;
+        let t = cx.theme().clone();
+        let p = style::palette(cx);
+        let notes: Vec<Div> = rel.notes.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with("**Full Changelog**")).map(|l| div().text_sm().child(l.to_string())).collect();
+        let action = if self.updating {
+            Button::new("update-go").primary().label("Загрузка...").disabled(true)
+        } else {
+            Button::new("update-go").primary().label("Обновить").on_click(cx.listener(|this, _, _, cx| this.install_update(cx)))
+        };
+        Some(
+            div()
+                .id("update-overlay")
+                .occlude()
+                .absolute()
+                .inset_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(hsla(0., 0., 0., 0.5))
+                .on_click(cx.listener(|this, _, _, cx| this.show_update(false, cx)))
+                .child(
+                    v_flex()
+                        .id("update")
+                        .w(dp(460.))
+                        .p_5()
+                        .gap_4()
+                        .rounded_lg()
+                        .bg(t.background)
+                        .border_1()
+                        .border_color(t.border)
+                        .on_click(|_, _, cx| cx.stop_propagation())
+                        .child(
+                            v_flex()
+                                .gap_1()
+                                .child(div().text_lg().font_weight(FontWeight::SEMIBOLD).child("Доступно обновление"))
+                                .child(div().text_sm().text_color(t.muted_foreground).child(format!("Версия {} · у вас {}", rel.version, env!("CARGO_PKG_VERSION")))),
+                        )
+                        .when(!notes.is_empty(), |d| {
+                            d.child(
+                                v_flex()
+                                    .gap_2()
+                                    .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).child("Что нового"))
+                                    .child(v_flex().id("update-notes").max_h(dp(280.)).overflow_y_scroll().gap_1().children(notes)),
+                            )
+                        })
+                        .when_some(self.update_error.clone(), |d, e| d.child(div().text_sm().text_color(p.danger).child(format!("Не удалось обновить: {e}"))))
+                        .child(
+                            h_flex()
+                                .gap_2()
+                                .justify_end()
+                                .child(Button::new("update-later").ghost().label("Позже").on_click(cx.listener(|this, _, _, cx| this.show_update(false, cx))))
+                                .child(action),
+                        ),
+                )
                 .into_any_element(),
         )
     }

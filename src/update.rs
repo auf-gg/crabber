@@ -8,6 +8,7 @@ pub const UPDATED_ARG: &str = "--updated";
 pub struct Release {
     pub version: String,
     pub url: String,
+    pub notes: String,
 }
 
 fn parse(v: &str) -> Option<(u32, u32, u32)> {
@@ -44,7 +45,8 @@ pub fn check(portable: bool) -> Result<Option<Release>, String> {
     let version = tag.trim_start_matches('v').to_string();
     let name = asset_name(&version, portable);
     let url = json["assets"].as_array().into_iter().flatten().find(|a| a["name"].as_str() == Some(name.as_str())).and_then(|a| a["browser_download_url"].as_str());
-    Ok(url.map(|url| Release { version, url: url.to_string() }))
+    let notes = json["body"].as_str().unwrap_or_default().to_string();
+    Ok(url.map(|url| Release { version, url: url.to_string(), notes }))
 }
 
 fn hidden(name: impl AsRef<std::ffi::OsStr>) -> Command {

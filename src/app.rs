@@ -423,6 +423,11 @@ pub struct App {
     pub video_volume: f32,
     pub video_muted: bool,
     pub video_drag: Option<(&'static str, f32)>,
+    pub update: Option<crabber::update::Release>,
+    pub update_popup: bool,
+    pub update_hidden: bool,
+    pub updating: bool,
+    pub update_error: Option<String>,
     app_store: Store,
     _subs: Vec<Subscription>,
 }
@@ -556,6 +561,11 @@ impl App {
             video_volume: 1.,
             video_muted: false,
             video_drag: None,
+            update: None,
+            update_popup: false,
+            update_hidden: false,
+            updating: false,
+            update_error: None,
             app_store,
             _subs: vec![],
         };
@@ -571,46 +581,69 @@ impl App {
             app.start_session(saved_jid, password, cx);
         }
         #[cfg(windows)]
-        app.check_update(window, cx);
+        app.check_updates(cx);
         app
     }
 
     #[cfg(windows)]
-    fn check_update(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn check_updates(&mut self, cx: &mut Context<Self>) {
         crabber::update::cleanup();
         let portable = store::portable_dir().is_some();
-        let task = cx.background_executor().spawn(async move { crabber::update::check(portable) });
-        cx.spawn_in(window, async move |this, cx| {
-            let Ok(Some(rel)) = task.await else { return };
-            let _ = this.update_in(cx, |_, window, cx| {
-                let app = cx.entity().downgrade();
-                let note = gpui_kit::component::notification::Notification::new()
-                    .title("Доступно обновление")
-                    .message(format!("Crabber {}", rel.version))
-                    .action(move |_, _, _| {
-                        let (app, rel) = (app.clone(), rel.clone());
-                        gpui_kit::component::button::Button::new("update").label("Обновить").on_click(move |_, window, cx| {
-                            let _ = app.update(cx, |this, cx| this.install_update(rel.clone(), portable, window, cx));
-                        })
-                    });
-                window.push_notification(note, cx);
-            });
+        cx.spawn(async move |this, cx| {
+            loop {
+                let res = cx.background_executor().spawn(async move { crabber::update::check(portable) }).await;
+                let alive = this.update(cx, |app, cx| {
+                    if let Ok(Some(rel)) = res
+                        && app.update.as_ref().is_none_or(|u| u.version != rel.version)
+                    {
+                        app.update = Some(rel);
+                        app.update_popup = true;
+                        app.update_hidden = false;
+                        app.update_error = None;
+                        cx.notify();
+                    }
+                });
+                if alive.is_err() {
+                    break;
+                }
+                cx.background_executor().timer(std::time::Duration::from_secs(3600)).await;
+            }
         })
         .detach();
     }
 
-    #[cfg(windows)]
-    fn install_update(&mut self, rel: crabber::update::Release, portable: bool, window: &mut Window, cx: &mut Context<Self>) {
-        window.push_notification("Загрузка обновления...", cx);
+    pub fn install_update(&mut self, cx: &mut Context<Self>) {
+        let Some(rel) = self.update.clone() else { return };
+        if self.updating {
+            return;
+        }
+        self.updating = true;
+        self.update_error = None;
+        let portable = store::portable_dir().is_some();
         let task = cx.background_executor().spawn(async move { crabber::update::install(&rel, portable) });
-        cx.spawn_in(window, async move |_, cx| {
+        cx.spawn(async move |this, cx| {
             let res = task.await;
-            let _ = cx.update(|window, cx| match res {
+            let _ = this.update(cx, |app, cx| match res {
                 Ok(()) => cx.quit(),
-                Err(e) => window.push_notification(format!("Не удалось обновить: {e}"), cx),
+                Err(e) => {
+                    app.updating = false;
+                    app.update_error = Some(e);
+                    cx.notify();
+                }
             });
         })
         .detach();
+        cx.notify();
+    }
+
+    pub fn show_update(&mut self, show: bool, cx: &mut Context<Self>) {
+        self.update_popup = show;
+        cx.notify();
+    }
+
+    pub fn hide_update_reminder(&mut self, cx: &mut Context<Self>) {
+        self.update_hidden = true;
+        cx.notify();
     }
 
     /// Window-scoped setup, re-run every time the window is (re)created after hide-to-tray.
@@ -878,6 +911,10 @@ impl App {
 
     /// Esc, innermost first: viewer, dialog, search, open chat. Returns whether it did anything.
     pub fn handle_escape(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.update_popup {
+            self.show_update(false, cx);
+            return true;
+        }
         if self.msg_menu.take().is_some() || self.emoji_picker.take().is_some() || self.viewer_menu.take().is_some() {
         } else if self.recording.take().is_some() {
             // Esc throws the recording away.
