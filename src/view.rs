@@ -1338,7 +1338,7 @@ impl App {
                                     .py_0p5()
                                     .rounded_md()
                                     .bg(code)
-                                    .child(div().w(px(3.)).self_stretch().rounded_l_md().bg(if m.outgoing { fg } else { sender_color(&m.sender) }))
+                                    .child(div().w(px(4.)).self_stretch().rounded_l_md().bg(if m.outgoing { fg } else { sender_color(&m.sender) }))
                                     .child(v_flex().flex_1().min_w_0().child(rich_text(SharedString::from(format!("qt-{i}-{j}-{}", m.msg_id)).into(), &text, code)))
                                     .into_any_element(),
                             })
@@ -1430,12 +1430,14 @@ impl App {
                     .id(SharedString::from(format!("q-{}", m.msg_id)))
                     .gap_2()
                     .pr_2()
+                    .py_0p5()
                     .rounded_md()
                     .bg(code)
                     .cursor_pointer()
-                    .child(div().w(px(3.)).h(dp(36.)).rounded_l_md().bg(if m.outgoing { fg } else { sender_color(&who) }))
+                    .child(div().w(px(4.)).self_stretch().rounded_l_md().bg(if m.outgoing { fg } else { sender_color(&who) }))
                     .child(
                         v_flex()
+                            .flex_1()
                             .min_w_0()
                             .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).truncate().child(who))
                             .child(div().text_sm().opacity(0.8).truncate().child(text)),
