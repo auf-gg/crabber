@@ -266,8 +266,8 @@ fn copy_message_selection(compose: &Entity<TextareaState>, window: &mut Window, 
     take
 }
 
-/// Plain text with `inline code` shaded, `> quote` lines dimmed, and http(s) links underlined and clickable.
-fn rich_text(id: ElementId, text: &str, code_bg: Hsla, quote_c: Hsla) -> AnyElement {
+/// Plain text with `inline code` shaded and http(s) links underlined and clickable.
+fn rich_text(id: ElementId, text: &str, code_bg: Hsla) -> AnyElement {
     let mut parts: Vec<&str> = text.split('`').collect();
     if parts.len() < 3 || parts.len().is_multiple_of(2) {
         parts = vec![text];
@@ -291,24 +291,33 @@ fn rich_text(id: ElementId, text: &str, code_bg: Hsla, quote_c: Hsla) -> AnyElem
             links.push((r.clone(), SharedString::from(plain[r].to_string())));
         }
     }
-    for r in quote_ranges(&plain) {
-        highlights.push((r, HighlightStyle { color: Some(quote_c), font_style: Some(FontStyle::Italic), ..Default::default() }));
-    }
     Selectable::new(id, plain, highlights).links(links).into_any_element()
 }
 
-/// Byte ranges of lines starting with `>` (Markdown quotes).
-fn quote_ranges(text: &str) -> Vec<std::ops::Range<usize>> {
-    let mut ranges = vec![];
-    let mut start = 0;
+/// A run of message text: consecutive `> quote` lines, or plain text between them.
+enum QuotePart {
+    Text(String),
+    Quote(String),
+}
+
+/// Splits text into plain and quote runs; quote markers (`>` and one space) are stripped.
+fn split_quotes(text: &str) -> Vec<QuotePart> {
+    let mut parts: Vec<(bool, String)> = vec![];
     for line in text.split('\n') {
-        let end = start + line.len();
-        if line.trim_start().starts_with('>') {
-            ranges.push(start..end);
+        let trimmed = line.trim_start();
+        let (quote, stripped) = match trimmed.strip_prefix('>') {
+            Some(rest) => (true, rest.strip_prefix(' ').unwrap_or(rest)),
+            None => (false, line),
+        };
+        match parts.last_mut() {
+            Some((last, buf)) if *last == quote => {
+                buf.push('\n');
+                buf.push_str(stripped);
+            }
+            _ => parts.push((quote, stripped.to_string())),
         }
-        start = end + 1;
     }
-    ranges
+    parts.into_iter().map(|(q, text)| if q { QuotePart::Quote(text) } else { QuotePart::Text(text) }).collect()
 }
 
 /// Maps a ``` fence tag or file extension to a tree-sitter language id.
@@ -1315,41 +1324,62 @@ impl App {
             Some(url) => self.render_attachment(url, &m, cx),
             None => v_flex()
                 .gap_1()
-                .children(segments(&m.body).into_iter().enumerate().map(|(i, seg)| match seg {
-                    Seg::Text(text) => rich_text(SharedString::from(format!("txt-{}-{i}", m.msg_id)).into(), text, code, p.muted),
-                    Seg::Code { lang, code: src } => {
-                        let copy = src.to_string();
-                        let shown = src.replace('\t', "    ");
-                        let hl = if lang.is_empty() { Arc::default() } else { syntax_styles(p.dark, lang, &shown) };
-                        v_flex()
-                            .min_w(dp(260.))
-                            .rounded_lg()
-                            .bg(code)
-                            .child(
-                                h_flex()
-                                    .pl_3()
-                                    .pr_1()
-                                    .pt_0p5()
-                                    .justify_between()
-                                    .items_center()
-                                    .text_xs()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .opacity(0.8)
-                                    .child(if lang.is_empty() { "код".to_string() } else { lang.to_string() })
-                                    .child(
-                                        // Plain icon so it takes the bubble's text colour (a Button would not on dark bubbles).
-                                        div()
-                                            .id(SharedString::from(format!("copy-{}-{i}", m.msg_id)))
-                                            .p_1()
-                                            .rounded_sm()
-                                            .cursor_pointer()
-                                            .hover(|d| d.bg(code))
-                                            .child(Icon::new(IconName::Copy).xsmall())
-                                            .on_click(move |_, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(copy.clone()))),
-                                    ),
-                            )
-                            .child(div().px_3().pb_2().font_family("Consolas").text_sm().child(Selectable::new(SharedString::from(format!("src-{}-{i}", m.msg_id)), shown, (*hl).clone())))
-                            .into_any_element()
+                .children(segments(&m.body).into_iter().enumerate().flat_map(|(i, seg)| {
+                    match seg {
+                        Seg::Text(text) => split_quotes(text)
+                            .into_iter()
+                            .enumerate()
+                            .map(|(j, part)| match part {
+                                QuotePart::Text(text) => rich_text(SharedString::from(format!("txt-{i}-{j}-{}", m.msg_id)).into(), &text, code).into_any_element(),
+                                // A quote block, styled like the reply preview above the message.
+                                QuotePart::Quote(text) => h_flex()
+                                    .gap_2()
+                                    .pr_2()
+                                    .py_0p5()
+                                    .rounded_md()
+                                    .bg(code)
+                                    .child(div().w(px(3.)).self_stretch().rounded_l_md().bg(if m.outgoing { fg } else { sender_color(&m.sender) }))
+                                    .child(v_flex().flex_1().min_w_0().child(rich_text(SharedString::from(format!("qt-{i}-{j}-{}", m.msg_id)).into(), &text, code)))
+                                    .into_any_element(),
+                            })
+                            .collect::<Vec<_>>(),
+                        Seg::Code { lang, code: src } => vec![{
+                            let copy = src.to_string();
+                            let shown = src.replace('\t', "    ");
+                            // A solid dark panel with light text: a tint would vanish on any bubble.
+                            let panel = hsla(0., 0., 0.07, 1.);
+                            let hl = if lang.is_empty() { Arc::default() } else { syntax_styles(true, lang, &shown) };
+                            v_flex()
+                                .min_w(dp(260.))
+                                .rounded_lg()
+                                .bg(panel)
+                                .text_color(rgb(0xE8E8E8))
+                                .child(
+                                    h_flex()
+                                        .pl_3()
+                                        .pr_1()
+                                        .pt_0p5()
+                                        .justify_between()
+                                        .items_center()
+                                        .text_xs()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .opacity(0.8)
+                                        .child(if lang.is_empty() { "код".to_string() } else { lang.to_string() })
+                                        .child(
+                                            // Plain icon so it takes the bubble's text colour (a Button would not on dark bubbles).
+                                            div()
+                                                .id(SharedString::from(format!("copy-{i}-{}", m.msg_id)))
+                                                .p_1()
+                                                .rounded_sm()
+                                                .cursor_pointer()
+                                                .hover(|d| d.bg(hsla(0., 0., 1., 0.1)))
+                                                .child(Icon::new(IconName::Copy).xsmall())
+                                                .on_click(move |_, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(copy.clone()))),
+                                        ),
+                                )
+                                .child(div().px_3().pb_2().font_family("Consolas").text_sm().child(Selectable::new(SharedString::from(format!("src-{i}-{}", m.msg_id)), shown, (*hl).clone())))
+                                .into_any_element()
+                        }],
                     }
                 }))
                 .into_any_element(),
@@ -2979,10 +3009,21 @@ mod tests {
     }
 
     #[test]
-    fn quote_lines_are_found() {
-        let t = "обычная\n> цитата\n  > с отступом\nне цитата";
-        let found: Vec<&str> = super::quote_ranges(t).into_iter().map(|r| &t[r]).collect();
-        assert_eq!(found, ["> цитата", "  > с отступом"]);
+    fn quote_lines_split_into_blocks() {
+        use super::QuotePart::*;
+        let parts = super::split_quotes("обычная\n> цитата\n>вторая строка\nне цитата\n> снова");
+        let shown: Vec<&str> = parts
+            .iter()
+            .map(|p| match p {
+                Text(t) => t.as_str(),
+                Quote(q) => q.as_str(),
+            })
+            .collect();
+        assert_eq!(shown, ["обычная", "цитата\nвторая строка", "не цитата", "снова"]);
+        assert!(matches!(parts[0], Text(_)));
+        assert!(matches!(parts[1], Quote(_)));
+        assert!(matches!(parts[2], Text(_)));
+        assert!(matches!(parts[3], Quote(_)));
     }
 
     #[test]
@@ -3013,7 +3054,7 @@ mod tests {
         struct V;
         impl Render for V {
             fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-                div().w(px(400.)).child(super::rich_text("m".into(), "https://example.com tail", black(), black()))
+                div().w(px(400.)).child(super::rich_text("m".into(), "https://example.com tail", black()))
             }
         }
         let mut cx = TestAppContext::single();
