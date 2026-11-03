@@ -1559,14 +1559,14 @@ impl App {
                     .child(Button::new("set-avatar").small().outline().label("Сменить аватар").on_click(cx.listener(|this, _, _, cx| this.change_avatar(cx))))
                     .child(Button::new("set-logout").small().danger().icon(IconName::LogOut).label("Выйти").on_click(cx.listener(|this, _, _, cx| this.logout(cx)))),
             )
-            .child(section("ОФОРМЛЕНИЕ"))
-            .child(h_flex().gap_2().flex_wrap().child(theme_btn("theme-system", "Как в системе", "system")).child(theme_btn("theme-light", "Светлая", "light")).child(theme_btn("theme-dark", "Тёмная", "dark")))
+            .child(section("ТЕМА"))
+            .child(h_flex().gap_2().flex_wrap().child(theme_btn("theme-system", "Системная", "system")).child(theme_btn("theme-light", "Светлая", "light")).child(theme_btn("theme-dark", "Тёмная", "dark")))
+            .child(section("ЦВЕТОВОЙ АКЦЕНТ"))
             .child(
                 h_flex()
                     .gap_1()
                     .flex_wrap()
-                    .pt_2()
-                    .child(scheme_btn("scheme-default", "Стандартная", "default"))
+                    .child(scheme_btn("scheme-default", "Стандартный", "default"))
                     .children(style::PRESETS.iter().map(|p| {
                         Button::new(SharedString::from(format!("scheme-{}", p.0)))
                             .label(p.1)
@@ -1575,11 +1575,7 @@ impl App {
                             .when(s.scheme != p.0, |b| b.outline())
                             .on_click(cx.listener(move |this, _, w, cx| this.update_settings(w, cx, |st| st.scheme = p.0.into())))
                     }))
-                    .child(scheme_btn("scheme-custom", "Своя", "custom"))
-                    .when(cfg!(target_os = "linux"), |d| {
-                        d.child(scheme_btn("scheme-matugen", "Matugen", "matugen").when(!style::source_available("matugen"), |b| b.disabled(true)))
-                            .child(scheme_btn("scheme-dux", "Dux", "dux").when(!style::source_available("dux"), |b| b.disabled(true)))
-                    }),
+                    .child(scheme_btn("scheme-custom", "Свой", "custom")),
             )
             .when(s.scheme == "custom", |d| {
                 d.child(
@@ -1597,24 +1593,14 @@ impl App {
                         .child(Button::new("colors-reset").small().outline().label("Сбросить цвета").on_click(cx.listener(|this, _, w, cx| this.reset_custom_colors(w, cx)))),
                 )
             })
-            .when(
-                cfg!(target_os = "linux") && (s.scheme == "matugen" || s.scheme == "dux"),
-                |d| {
-                    let missing = cx.try_global::<style::SchemeState>().is_some_and(|st| st.source_error);
-                    let paths = if s.scheme == "dux" {
-                        "~/.cache/DankMaterialShell/dms-colors.json или ~/.cache/dms/dms-colors.json"
-                    } else {
-                        "~/.cache/matugen/colors.json"
-                    };
-                    d.child(
-                        div().pt_1().text_xs().text_color(t.muted_foreground).child(if missing {
-                            format!("Не удалось прочитать {paths} — используется стандартная схема; проверка идёт автоматически")
-                        } else {
-                            format!("Цвета Material You из {paths}; подхватываются автоматически при смене обоев")
-                        }),
+            .when(cfg!(target_os = "linux"), |d| {
+                d.child(section("ЦВЕТОВОЙ АКЦЕНТ ИЗ"))
+                    .child(
+                        h_flex().gap_1().flex_wrap()
+                            .child(scheme_btn("scheme-matugen", "Matugen", "matugen").when(!style::source_available("matugen"), |b| b.disabled(true)))
+                            .child(scheme_btn("scheme-dux", "Dux", "dux").when(!style::source_available("dux"), |b| b.disabled(true))),
                     )
-                },
-            )
+            })
             .child(section("МАСШТАБ"))
             .child(
                 h_flex().gap_1().flex_wrap().children(App::SCALES.iter().enumerate().map(|(i, &scale)| {
@@ -1632,8 +1618,20 @@ impl App {
             .child(
                 h_flex().gap_3().py_1().items_center().child(row("Запускать при входе в систему", "Crabber будет открываться автоматически после входа в систему")).child(
                     Switch::new("set-autostart").checked(s.autostart).on_click(cx.listener(|this, v: &bool, w, cx| {
-                        crate::desktop::set_autostart(*v);
+                        crate::desktop::set_autostart(*v, this.settings.start_minimized);
                         this.update_settings(w, cx, |st| st.autostart = crate::desktop::autostart())
+                    })),
+                ),
+            )
+            .child(
+                h_flex().gap_3().py_1().items_center().child(row("Запускать свёрнутым", "После автозапуска Crabber окажется в трее, а не на экране")).child(
+                    Switch::new("set-start-min").checked(s.start_minimized).on_click(cx.listener(|this, v: &bool, w, cx| {
+                        let v = *v;
+                        this.update_settings(w, cx, |st| st.start_minimized = v);
+                        if this.settings.autostart {
+                            crate::desktop::set_autostart(true, this.settings.start_minimized);
+                            this.update_settings(w, cx, |st| st.autostart = crate::desktop::autostart());
+                        }
                     })),
                 ),
             )

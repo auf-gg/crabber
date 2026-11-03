@@ -226,8 +226,6 @@ pub fn from_base(b: &SchemeBase, dark: bool) -> Palette {
 pub struct SchemeState {
     pub light: Option<Palette>,
     pub dark: Option<Palette>,
-    /// A system-scheme source (matugen, dux) is selected but its colors file could not be read.
-    pub source_error: bool,
 }
 
 impl Global for SchemeState {}
@@ -239,23 +237,24 @@ pub fn palette(cx: &App) -> Palette {
         .unwrap_or_else(|| if is_dark { dark() } else { light() })
 }
 
-/// Resolves the scheme selection to per-mode palettes; `(None, None)` = built-in.
-fn resolve(scheme: &str, custom: Option<SchemeColors>) -> (Option<Palette>, Option<Palette>, bool) {
+/// Resolves the scheme selection to per-mode palettes; `(None, None)` = built-in
+/// (also the fallback when a system source's file cannot be read).
+fn resolve(scheme: &str, custom: Option<SchemeColors>) -> (Option<Palette>, Option<Palette>) {
     match scheme {
         "custom" => {
             let cs = custom.unwrap_or(DEFAULT_BASE);
-            (Some(from_base(&cs.light, false)), Some(from_base(&cs.dark, true)), false)
+            (Some(from_base(&cs.light, false)), Some(from_base(&cs.dark, true)))
         }
         #[cfg(target_os = "linux")]
         "matugen" | "dux" => match cache_colors(scheme) {
-            Some(cs) => (Some(from_base(&cs.light, false)), Some(from_base(&cs.dark, true)), false),
-            None => (None, None, true),
+            Some(cs) => (Some(from_base(&cs.light, false)), Some(from_base(&cs.dark, true))),
+            None => (None, None),
         },
         _ => PRESETS
             .iter()
             .find(|p| p.0 == scheme)
-            .map(|Preset(_, _, cs)| (Some(from_base(&cs.light, false)), Some(from_base(&cs.dark, true)), false))
-            .unwrap_or((None, None, false)),
+            .map(|Preset(_, _, cs)| (Some(from_base(&cs.light, false)), Some(from_base(&cs.dark, true))))
+            .unwrap_or((None, None)),
     }
 }
 
@@ -369,8 +368,8 @@ pub const EMOJI_FONT: &str = if cfg!(windows) {
 };
 
 pub fn apply(cx: &mut App, scheme: &str, custom: Option<SchemeColors>, scale: f32) {
-    let (light, dark, source_error) = resolve(scheme, custom);
-    cx.set_global(SchemeState { light, dark, source_error });
+    let (light, dark) = resolve(scheme, custom);
+    cx.set_global(SchemeState { light, dark });
     let p = palette(cx);
     let on_accent = on_color(p.accent);
     Theme::update(cx, |t| {
@@ -457,7 +456,6 @@ mod tests {
             let st = cx.try_global::<super::SchemeState>().expect("apply sets the scheme global");
             assert_eq!(Rgba::from(st.light.unwrap().accent), Rgba::from(c(PRESETS[0].2.light.accent)));
             assert!(st.dark.is_some(), "both modes are installed");
-            assert!(!st.source_error);
 
             super::apply(cx, "no-such-scheme", None, 1.);
             assert!(cx.try_global::<super::SchemeState>().unwrap().light.is_none(), "unknown ids fall back to the built-in palette");
@@ -465,9 +463,7 @@ mod tests {
             #[cfg(target_os = "linux")]
             if super::cache_colors("matugen").is_none() {
                 super::apply(cx, "matugen", None, 1.);
-                let st = cx.try_global::<super::SchemeState>().unwrap();
-                assert!(st.source_error, "a missing colors.json is reported");
-                assert!(st.light.is_none(), "and falls back to the built-in palette");
+                assert!(cx.try_global::<super::SchemeState>().unwrap().light.is_none(), "a missing colors file falls back to the built-in palette");
             }
         });
     }

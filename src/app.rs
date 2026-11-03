@@ -126,6 +126,8 @@ pub struct Settings {
     pub ui_scale: f32,
     /// Launch at login. Read from the OS (registry / autostart file), not stored in app.db.
     pub autostart: bool,
+    /// Autostart opens Crabber in the tray instead of a window.
+    pub start_minimized: bool,
 }
 
 impl Settings {
@@ -141,6 +143,7 @@ impl Settings {
             blind_trust: flag("blind_trust"),
             ui_scale: s.get("ui_scale").and_then(|v| v.parse().ok()).filter(|v: &f32| (0.5..=2.0).contains(v)).unwrap_or(1.0),
             autostart: desktop::autostart(),
+            start_minimized: flag("start_minimized"),
         }
     }
     fn save(&self, s: &Store) {
@@ -155,6 +158,7 @@ impl Settings {
         s.set("auto_download", b(self.auto_download));
         s.set("blind_trust", b(self.blind_trust));
         s.set("ui_scale", &self.ui_scale.to_string());
+        s.set("start_minimized", b(self.start_minimized));
     }
 }
 
@@ -621,7 +625,7 @@ impl App {
         app.apply_theme(window, cx);
         // Older versions registered autostart without the tray flag: rewrite the entry.
         if app.settings.autostart {
-            desktop::set_autostart(true);
+            desktop::set_autostart(true, app.settings.start_minimized);
         }
         // Auto-login with a remembered password.
         if !saved_jid.is_empty()

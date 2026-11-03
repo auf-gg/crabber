@@ -138,7 +138,7 @@ mod imp {
         unsafe { RegGetValueW(HKEY_CURRENT_USER, windows::core::PCWSTR(key.as_ptr()), windows::core::PCWSTR(name.as_ptr()), RRF_RT_REG_SZ, None, None, None).is_ok() }
     }
 
-    pub fn set_autostart(on: bool) {
+    pub fn set_autostart(on: bool, minimized: bool) {
         let (key, name) = (wide(RUN_KEY), wide("Crabber"));
         let (key, name) = (windows::core::PCWSTR(key.as_ptr()), windows::core::PCWSTR(name.as_ptr()));
         unsafe {
@@ -147,7 +147,8 @@ mod imp {
                 return;
             }
             let Ok(exe) = std::env::current_exe() else { return };
-            let data = wide(&format!("\"{}\" {}", exe.display(), super::MINIMIZED_ARG));
+            let cmd = if minimized { format!("\"{}\" {}", exe.display(), super::MINIMIZED_ARG) } else { format!("\"{}\"", exe.display()) };
+            let data = wide(&cmd);
             let _ = RegSetKeyValueW(HKEY_CURRENT_USER, key, name, REG_SZ.0, Some(data.as_ptr() as *const _), (data.len() * 2) as u32);
         }
     }
@@ -338,14 +339,15 @@ mod imp {
         autostart_file().is_some_and(|f| f.is_file())
     }
 
-    pub fn set_autostart(on: bool) {
+    pub fn set_autostart(on: bool, minimized: bool) {
         let Some(file) = autostart_file() else { return };
         if !on {
             let _ = std::fs::remove_file(&file);
             return;
         }
         let Ok(exe) = std::env::current_exe() else { return };
-        let entry = format!("[Desktop Entry]\nType=Application\nName=Crabber\nExec=\"{}\" {}\nIcon=crabber\nTerminal=false\nX-GNOME-Autostart-enabled=true\n", exe.display(), super::MINIMIZED_ARG);
+        let arg = if minimized { format!(" {}", super::MINIMIZED_ARG) } else { String::new() };
+        let entry = format!("[Desktop Entry]\nType=Application\nName=Crabber\nExec=\"{}\"{arg}\nIcon=crabber\nTerminal=false\nX-GNOME-Autostart-enabled=true\n", exe.display());
         let _ = file.parent().map(std::fs::create_dir_all);
         let _ = std::fs::write(&file, entry);
     }
@@ -482,7 +484,7 @@ mod imp {
     pub fn autostart() -> bool {
         false
     }
-    pub fn set_autostart(_: bool) {}
+    pub fn set_autostart(_: bool, _: bool) {}
 }
 
 /// Whether the system font can draw `e`; otherwise it shows as letters or empty boxes.
