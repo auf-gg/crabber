@@ -19,7 +19,35 @@ Cross-platform XMPP messenger with a GPU-accelerated [GPUI](https://github.com/z
 - Message history stored in SQLite with per-chat search
 - Account credentials kept in the system keyring
 - Desktop integration: tray icon, native notifications
+- Themes: light/dark following the system, color schemes with a custom color editor, and Material You colors from matugen on Linux
 - Linux (X11/Wayland, Vulkan) and Windows (x64/ARM64)
+
+### Matugen colors (Linux)
+
+The «Matugen» scheme in settings takes colors from `~/.cache/matugen/colors.json`, and the
+«Dux» scheme from `~/.cache/DankMaterialShell/dms-colors.json` or `~/.cache/dms/dms-colors.json`
+([dux-shell](https://github.com/duxlabs-dev/dux-shell) / DankMaterialShell, depending on the version).
+Both buttons appear only when the file is found. Add a template to `~/.config/matugen/config.toml`:
+
+```toml
+[templates.crabber]
+input_path = '~/.config/matugen/templates/crabber.json'
+output_path = '~/.cache/matugen/colors.json'
+```
+
+with a `crabber.json` like:
+
+```json
+{
+  "primary": "{{colors.primary.default.hex}}",
+  "surface": "{{colors.surface.default.hex}}",
+  "surface_container_high": "{{colors.surface_container_high.default.hex}}",
+  "on_surface": "{{colors.on_surface.default.hex}}"
+}
+```
+
+The output of `matugen image wallpaper.jpg --json > ~/.cache/matugen/colors.json` works too.
+Colors are picked up automatically when the file changes.
 
 ## XEP support
 

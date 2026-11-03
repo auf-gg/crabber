@@ -10,6 +10,7 @@ use futures::StreamExt;
 use futures::channel::mpsc::UnboundedSender;
 use gpui_kit::component::{
     Theme, ThemeMode, WindowExt as _,
+    color_picker::{ColorPickerEvent, ColorPickerState},
     input::{InputEvent, InputState, TextareaState},
 };
 use gpui_kit::*;
@@ -112,6 +113,10 @@ pub enum Viewer {
 pub struct Settings {
     /// "system" | "light" | "dark"
     pub theme: String,
+    /// Color scheme: "default", a style::PRESETS id, "custom", or a system source ("matugen", "dux"; Linux).
+    pub scheme: String,
+    /// The user's colors for scheme = "custom".
+    pub custom: Option<crate::style::SchemeColors>,
     pub notify: bool,
     pub notify_text: bool,
     pub auto_download: bool,
@@ -128,6 +133,8 @@ impl Settings {
         let flag = |k: &str| s.get(k).is_none_or(|v| v == "1");
         Self {
             theme: s.get("theme").unwrap_or_else(|| "system".into()),
+            scheme: s.get("scheme").unwrap_or_else(|| "default".into()),
+            custom: s.get("custom_colors").and_then(|v| serde_json::from_str(&v).ok()),
             notify: flag("notify"),
             notify_text: flag("notify_text"),
             auto_download: flag("auto_download"),
@@ -139,6 +146,10 @@ impl Settings {
     fn save(&self, s: &Store) {
         let b = |v: bool| if v { "1" } else { "0" };
         s.set("theme", &self.theme);
+        s.set("scheme", &self.scheme);
+        if let Some(c) = &self.custom {
+            s.set("custom_colors", &serde_json::to_string(c).unwrap_or_default());
+        }
         s.set("notify", b(self.notify));
         s.set("notify_text", b(self.notify_text));
         s.set("auto_download", b(self.auto_download));
@@ -390,6 +401,8 @@ pub struct App {
     pub viewer: Option<Viewer>,
     pub viewer_focus: FocusHandle,
     pub settings: Settings,
+    /// Scheme editor pickers: [light, dark] × [accent, panel, chat, bubble_in, bubble_out, text].
+    pub color_pickers: Vec<Entity<ColorPickerState>>,
     pub search_results: Vec<(String, Msg)>,
     /// With a chat open: search all chats instead of just this one.
     pub search_all: bool,
@@ -476,6 +489,7 @@ pub fn open_main_window(cx: &mut gpui_kit::App) -> gpui_kit::Result<()> {
 impl App {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let app_store = Store::open(&store::data_dir().join("app.db")).expect("cannot open settings database");
+        let settings = Settings::load(&app_store);
         let saved_jid = app_store.get("jid").unwrap_or_default();
         let saved_host = app_store.get("host").unwrap_or_default();
         let insecure = app_store.get("insecure").is_some_and(|v| v == "1");
@@ -492,6 +506,15 @@ impl App {
 
         let messages = ListState::new(0, ListAlignment::Top, px(600.));
         messages.set_follow_mode(FollowMode::Tail);
+
+        let base = settings.custom.unwrap_or(crate::style::DEFAULT_BASE);
+        let mut color_pickers = vec![];
+        for dark in [false, true] {
+            let b = if dark { &base.dark } else { &base.light };
+            for v in [b.accent, b.panel, b.chat, b.bubble_in, b.bubble_out, b.text] {
+                color_pickers.push(cx.new(|cx| ColorPickerState::new(window, cx).default_value(rgb(v))));
+            }
+        }
 
         let (tray, desktop_tx, mut desktop_events) = desktop::init(&store::data_dir());
         cx.spawn(async move |this, cx| {
@@ -524,6 +547,29 @@ impl App {
         })
         .detach();
 
+        // Linux: pick up matugen/dux colors when their cache file is rewritten (wallpaper change).
+        // A stat every 15 s: wallpapers change rarely, and the file appears only with the tool.
+        #[cfg(target_os = "linux")]
+        cx.spawn(async move |this, cx| {
+            let mut seen: Option<(PathBuf, std::time::SystemTime)> = None;
+            loop {
+                cx.background_executor().timer(std::time::Duration::from_secs(15)).await;
+                let Ok(stamp) = this.read_with(cx, |app, _| crate::style::source_stamp(&app.settings.scheme)) else { break };
+                if stamp != seen && stamp.is_some() {
+                    seen = stamp;
+                    if this.update(cx, |app, cx| {
+                            crate::style::apply(cx, &app.settings.scheme, app.settings.custom, app.settings.ui_scale);
+                            cx.notify();
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            }
+        })
+        .detach();
+
         let mut app = Self {
             login_jid,
             login_pass,
@@ -542,7 +588,8 @@ impl App {
             messages,
             viewer: None,
             viewer_focus: cx.focus_handle(),
-            settings: Settings::load(&app_store),
+            settings,
+            color_pickers,
             search_results: vec![],
             search_all: false,
             root_focus: cx.focus_handle(),
@@ -676,7 +723,7 @@ impl App {
     /// Window-scoped setup, re-run every time the window is (re)created after hide-to-tray.
     fn bind_window(&mut self, window: &mut Window, start_hidden: bool, cx: &mut Context<Self>) {
         desktop::set_window(window);
-        self._subs = vec![
+        let mut subs = vec![
             cx.observe_window_bounds(window, |this, window, _| {
                 this.window_bounds = Some(window.window_bounds());
             }),
@@ -701,7 +748,7 @@ impl App {
             cx.observe_window_appearance(window, |this, window, cx| {
                 if this.settings.theme == "system" {
                     Theme::sync_system_appearance(Some(window), cx);
-                    crate::style::apply(cx, this.settings.ui_scale);
+                    crate::style::apply(cx, &this.settings.scheme, this.settings.custom, this.settings.ui_scale);
                 }
             }),
             cx.subscribe_in(&self.field2, window, |this, _, ev: &InputEvent, window, cx| {
@@ -715,6 +762,15 @@ impl App {
                 }
             }),
         ];
+        // Scheme editor pickers: write the chosen color into the custom palette and re-apply it live.
+        subs.extend(self.color_pickers.iter().enumerate().map(|(ix, picker)| {
+            cx.subscribe_in(picker, window, move |this, _, ev: &ColorPickerEvent, window, cx| {
+                if let ColorPickerEvent::Change(Some(color)) = ev {
+                    this.set_custom_color(ix, *color, window, cx);
+                }
+            })
+        }));
+        self._subs = subs;
         // Closing the window keeps the app in the tray while logged in.
         let weak = cx.weak_entity();
         let has_tray = self.tray.is_some();
@@ -895,7 +951,7 @@ impl App {
             "dark" => Theme::change(ThemeMode::Dark, Some(window), cx),
             _ => Theme::sync_system_appearance(Some(window), cx),
         }
-        crate::style::apply(cx, self.settings.ui_scale);
+        crate::style::apply(cx, &self.settings.scheme, self.settings.custom, self.settings.ui_scale);
     }
 
     pub const SCALES: [f32; 7] = [0.8, 0.9, 1.0, 1.1, 1.25, 1.5, 1.75];
@@ -919,6 +975,32 @@ impl App {
         self.settings.save(&self.app_store);
         self.apply_theme(window, cx);
         cx.notify();
+    }
+
+    /// One of the scheme editor pickers changed (`ix` indexes `color_pickers`).
+    pub fn set_custom_color(&mut self, ix: usize, color: Hsla, window: &mut Window, cx: &mut Context<Self>) {
+        let r = Rgba::from(color);
+        let v = (((r.r * 255.) as u32) << 16) | (((r.g * 255.) as u32) << 8) | (r.b * 255.) as u32;
+        let mut cs = self.settings.custom.unwrap_or(crate::style::DEFAULT_BASE);
+        let b = if ix >= 6 { &mut cs.dark } else { &mut cs.light };
+        match ix % 6 {
+            0 => b.accent = v,
+            1 => b.panel = v,
+            2 => b.chat = v,
+            3 => b.bubble_in = v,
+            4 => b.bubble_out = v,
+            _ => b.text = v,
+        }
+        self.update_settings(window, cx, |st| st.custom = Some(cs));
+    }
+
+    /// Returns the scheme editor to the built-in colors.
+    pub fn reset_custom_colors(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let defaults = crate::style::DEFAULT_BASE;
+        for (ix, v) in [defaults.light, defaults.dark].iter().flat_map(|b| [b.accent, b.panel, b.chat, b.bubble_in, b.bubble_out, b.text].into_iter()).enumerate() {
+            self.color_pickers[ix].update(cx, |st, cx| st.set_value(rgb(v), window, cx));
+        }
+        self.update_settings(window, cx, |st| st.custom = None);
     }
 
     pub fn run_search(&mut self, cx: &mut Context<Self>) {

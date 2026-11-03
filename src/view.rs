@@ -8,6 +8,7 @@ use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, Icon, Sizable as _, h_flex,
     button::{Button, ButtonVariants as _},
     checkbox::Checkbox,
+    color_picker::ColorSelect,
     switch::Switch,
     input::{Input, Paste, Textarea, TextareaState},
     v_flex,
@@ -34,6 +35,9 @@ fn dp(x: f32) -> Rems {
 }
 
 const MONTHS: [&str; 12] = ["января", "февраля", "марта", "апреля", "мая", "июня", "июля", "августа", "сентября", "октября", "ноября", "декабря"];
+
+/// The scheme editor's editable colors, in `App::color_pickers` order.
+const COLOR_FIELDS: [&str; 6] = ["Акцент", "Панель", "Фон чата", "Входящие", "Исходящие", "Текст"];
 
 fn local(ts: i64) -> chrono::DateTime<Local> {
     Local.timestamp_millis_opt(ts).single().unwrap_or_else(Local::now)
@@ -1535,6 +1539,14 @@ impl App {
                 .when(s.theme != value, |b| b.outline())
                 .on_click(cx.listener(move |this, _, w, cx| this.update_settings(w, cx, |st| st.theme = value.into())))
         };
+        let scheme_btn = |id: &'static str, label: &'static str, value: &'static str| {
+            Button::new(id)
+                .label(label)
+                .small()
+                .when(s.scheme == value, |b| b.primary())
+                .when(s.scheme != value, |b| b.outline())
+                .on_click(cx.listener(move |this, _, w, cx| this.update_settings(w, cx, |st| st.scheme = value.into())))
+        };
         let me = sess.localpart();
         let body = v_flex()
             .child(section("АККАУНТ"))
@@ -1548,7 +1560,61 @@ impl App {
                     .child(Button::new("set-logout").small().danger().icon(IconName::LogOut).label("Выйти").on_click(cx.listener(|this, _, _, cx| this.logout(cx)))),
             )
             .child(section("ОФОРМЛЕНИЕ"))
-            .child(h_flex().gap_2().child(theme_btn("theme-system", "Как в системе", "system")).child(theme_btn("theme-light", "Светлая", "light")).child(theme_btn("theme-dark", "Тёмная", "dark")))
+            .child(h_flex().gap_2().flex_wrap().child(theme_btn("theme-system", "Как в системе", "system")).child(theme_btn("theme-light", "Светлая", "light")).child(theme_btn("theme-dark", "Тёмная", "dark")))
+            .child(
+                h_flex()
+                    .gap_1()
+                    .flex_wrap()
+                    .pt_2()
+                    .child(scheme_btn("scheme-default", "Стандартная", "default"))
+                    .children(style::PRESETS.iter().map(|p| {
+                        Button::new(SharedString::from(format!("scheme-{}", p.0)))
+                            .label(p.1)
+                            .small()
+                            .when(s.scheme == p.0, |b| b.primary())
+                            .when(s.scheme != p.0, |b| b.outline())
+                            .on_click(cx.listener(move |this, _, w, cx| this.update_settings(w, cx, |st| st.scheme = p.0.into())))
+                    }))
+                    .child(scheme_btn("scheme-custom", "Своя", "custom"))
+                    .when(cfg!(target_os = "linux"), |d| {
+                        d.child(scheme_btn("scheme-matugen", "Matugen", "matugen").when(!style::source_available("matugen"), |b| b.disabled(true)))
+                            .child(scheme_btn("scheme-dux", "Dux", "dux").when(!style::source_available("dux"), |b| b.disabled(true)))
+                    }),
+            )
+            .when(s.scheme == "custom", |d| {
+                d.child(
+                    v_flex()
+                        .gap_2()
+                        .pt_2()
+                        .children([(0usize, "Светлая схема"), (6, "Тёмная схема")].map(|(off, title)| {
+                            v_flex()
+                                .gap_1()
+                                .child(div().text_xs().text_color(t.muted_foreground).child(title))
+                                .child(h_flex().gap_2().flex_wrap().children(COLOR_FIELDS.iter().enumerate().map(|(j, label)| {
+                                    v_flex().gap_1().w(dp(104.)).child(div().text_xs().text_color(t.muted_foreground).child(*label)).child(ColorSelect::new(&self.color_pickers[off + j]))
+                                })))
+                        }))
+                        .child(Button::new("colors-reset").small().outline().label("Сбросить цвета").on_click(cx.listener(|this, _, w, cx| this.reset_custom_colors(w, cx)))),
+                )
+            })
+            .when(
+                cfg!(target_os = "linux") && (s.scheme == "matugen" || s.scheme == "dux"),
+                |d| {
+                    let missing = cx.try_global::<style::SchemeState>().is_some_and(|st| st.source_error);
+                    let paths = if s.scheme == "dux" {
+                        "~/.cache/DankMaterialShell/dms-colors.json или ~/.cache/dms/dms-colors.json"
+                    } else {
+                        "~/.cache/matugen/colors.json"
+                    };
+                    d.child(
+                        div().pt_1().text_xs().text_color(t.muted_foreground).child(if missing {
+                            format!("Не удалось прочитать {paths} — используется стандартная схема; проверка идёт автоматически")
+                        } else {
+                            format!("Цвета Material You из {paths}; подхватываются автоматически при смене обоев")
+                        }),
+                    )
+                },
+            )
             .child(section("МАСШТАБ"))
             .child(
                 h_flex().gap_1().flex_wrap().children(App::SCALES.iter().enumerate().map(|(i, &scale)| {
