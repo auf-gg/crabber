@@ -13,6 +13,17 @@ winresource = "0.1"
 
 [dependencies]
 gpui-kit = "0.7.3"
+# Only to enable tree-sitter grammar features on the gpui-component instance gpui-kit uses
+# (no umbrella: its sql grammar pins cc ~1.2.1, conflicting with the rest of the tree).
+gpui-component = { version = "0.7.3", features = [
+    "tree-sitter",
+    "tree-sitter-bash", "tree-sitter-c", "tree-sitter-cmake", "tree-sitter-cpp", "tree-sitter-csharp",
+    "tree-sitter-css", "tree-sitter-diff", "tree-sitter-elixir", "tree-sitter-go", "tree-sitter-graphql",
+    "tree-sitter-html", "tree-sitter-java", "tree-sitter-javascript", "tree-sitter-kotlin", "tree-sitter-lua",
+    "tree-sitter-make", "tree-sitter-markdown", "tree-sitter-php", "tree-sitter-proto", "tree-sitter-python",
+    "tree-sitter-ruby", "tree-sitter-rust", "tree-sitter-scala", "tree-sitter-swift", "tree-sitter-toml",
+    "tree-sitter-tsx", "tree-sitter-typescript", "tree-sitter-yaml", "tree-sitter-zig",
+] }
 tokio-xmpp = { version = "6", default-features = false, features = ["starttls", "ring", "rustls-native-certs"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "fs"] }
 futures = "0.3"

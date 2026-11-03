@@ -186,7 +186,7 @@ fn tint(a: Hsla, b: Hsla, t: f32) -> Hsla {
 }
 
 /// White or near-black, whichever reads on top of `bg`.
-fn on_color(bg: Hsla) -> Hsla {
+pub fn on_color(bg: Hsla) -> Hsla {
     let r = Rgba::from(bg);
     if r.r * 255. * 0.299 + r.g * 255. * 0.587 + r.b * 255. * 0.114 < 150. { c(0xFFFFFF) } else { c(0x141414) }
 }

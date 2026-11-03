@@ -1,6 +1,7 @@
 //! Rendering. Telegram-like layout: chat list on the left, conversation on the right.
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
+use std::sync::Arc;
 
 use chrono::{Datelike, Local, TimeZone};
 use gpui_kit::assets::IconName;
@@ -265,8 +266,8 @@ fn copy_message_selection(compose: &Entity<TextareaState>, window: &mut Window, 
     take
 }
 
-/// Plain text with `inline code` shaded and http(s) links underlined and clickable.
-fn rich_text(id: ElementId, text: &str, code_bg: Hsla) -> AnyElement {
+/// Plain text with `inline code` shaded, `> quote` lines dimmed, and http(s) links underlined and clickable.
+fn rich_text(id: ElementId, text: &str, code_bg: Hsla, quote_c: Hsla) -> AnyElement {
     let mut parts: Vec<&str> = text.split('`').collect();
     if parts.len() < 3 || parts.len().is_multiple_of(2) {
         parts = vec![text];
@@ -290,7 +291,67 @@ fn rich_text(id: ElementId, text: &str, code_bg: Hsla) -> AnyElement {
             links.push((r.clone(), SharedString::from(plain[r].to_string())));
         }
     }
+    for r in quote_ranges(&plain) {
+        highlights.push((r, HighlightStyle { color: Some(quote_c), font_style: Some(FontStyle::Italic), ..Default::default() }));
+    }
     Selectable::new(id, plain, highlights).links(links).into_any_element()
+}
+
+/// Byte ranges of lines starting with `>` (Markdown quotes).
+fn quote_ranges(text: &str) -> Vec<std::ops::Range<usize>> {
+    let mut ranges = vec![];
+    let mut start = 0;
+    for line in text.split('\n') {
+        let end = start + line.len();
+        if line.trim_start().starts_with('>') {
+            ranges.push(start..end);
+        }
+        start = end + 1;
+    }
+    ranges
+}
+
+/// Maps a ``` fence tag or file extension to a tree-sitter language id.
+fn lang_id(tag: &str) -> &str {
+    match tag.to_ascii_lowercase().as_str() {
+        "py" | "python3" => "python",
+        "js" | "mjs" | "cjs" => "javascript",
+        "ts" => "typescript",
+        "sh" | "shell" | "zsh" => "bash",
+        "c++" | "cc" | "cxx" | "hpp" => "cpp",
+        "cs" => "csharp",
+        "golang" => "go",
+        "htm" => "html",
+        "kt" => "kotlin",
+        "md" => "markdown",
+        "rb" => "ruby",
+        "rs" => "rust",
+        "yml" => "yaml",
+        _ => tag,
+    }
+}
+
+/// Syntax-highlight styles for `code`, cached by (mode, language, text): blocks re-render every frame.
+fn syntax_styles(dark: bool, lang: &str, code: &str) -> Arc<Vec<(std::ops::Range<usize>, HighlightStyle)>> {
+    use gpui_kit::component::{Rope, highlighter::{HighlightTheme, SyntaxHighlighter}};
+    static CACHE: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<(bool, String, String), Arc<Vec<(std::ops::Range<usize>, HighlightStyle)>>>>> =
+        std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let lang = lang_id(lang);
+    let key = (dark, lang.to_string(), code.to_string());
+    let mut cache = CACHE.lock().unwrap();
+    if let Some(styles) = cache.get(&key) {
+        return styles.clone();
+    }
+    let mut hl = SyntaxHighlighter::new(lang);
+    // A huge paste must not stall a frame: a timeout leaves it unstyled.
+    hl.update(None, &Rope::from_str(code), Some(std::time::Duration::from_millis(100)));
+    let theme = if dark { HighlightTheme::default_dark() } else { HighlightTheme::default_light() };
+    let styles = Arc::new(hl.styles(&(0..code.len()), &*theme));
+    if cache.len() > 100 {
+        cache.clear();
+    }
+    cache.insert(key, styles.clone());
+    styles
 }
 
 /// Byte ranges of http(s) URLs in `text`, without trailing punctuation.
@@ -682,7 +743,6 @@ impl App {
                 )
         });
 
-        let white_soft = hsla(0., 0., 1., 0.8);
         let scoped = !query.is_empty() && sess.selected.is_some() && !self.search_all;
         let visible: Vec<&crabber::store::ChatRow> = sess
             .chats
@@ -708,7 +768,9 @@ impl App {
                 let peer = c.peer.clone();
                 let sub = if typing { "печатает...".to_string() } else { preview(c) };
                 let locked = c.last.as_ref().is_some_and(|m| m.enc > 0);
-                let (title_c, sub_c, time_c) = if active { (white(), white_soft, white_soft) } else { (p.text, if typing { p.accent } else { p.muted }, p.muted) };
+                // The row is filled with the accent: its text must contrast with it (not always white).
+                let on_acc = style::on_color(p.accent);
+                let (title_c, sub_c, time_c) = if active { (on_acc, on_acc.opacity(0.75), on_acc.opacity(0.75)) } else { (p.text, if typing { p.accent } else { p.muted }, p.muted) };
                 let row = h_flex()
                     .id(SharedString::from(format!("chat-{}", c.peer)))
                     .mx_2()
@@ -757,8 +819,8 @@ impl App {
                                                 .justify_center()
                                                 .text_xs()
                                                 .font_weight(FontWeight::SEMIBOLD)
-                                                .bg(if active { white() } else { p.accent })
-                                                .text_color(if active { p.accent } else { white() })
+                                                .bg(if active { on_acc } else { p.accent })
+                                                .text_color(if active { p.accent } else { on_acc })
                                                 .child(c.unread.to_string()),
                                         )
                                     }),
@@ -1254,9 +1316,11 @@ impl App {
             None => v_flex()
                 .gap_1()
                 .children(segments(&m.body).into_iter().enumerate().map(|(i, seg)| match seg {
-                    Seg::Text(text) => rich_text(SharedString::from(format!("txt-{}-{i}", m.msg_id)).into(), text, code),
+                    Seg::Text(text) => rich_text(SharedString::from(format!("txt-{}-{i}", m.msg_id)).into(), text, code, p.muted),
                     Seg::Code { lang, code: src } => {
                         let copy = src.to_string();
+                        let shown = src.replace('\t', "    ");
+                        let hl = if lang.is_empty() { Arc::default() } else { syntax_styles(p.dark, lang, &shown) };
                         v_flex()
                             .min_w(dp(260.))
                             .rounded_lg()
@@ -1284,7 +1348,7 @@ impl App {
                                             .on_click(move |_, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(copy.clone()))),
                                     ),
                             )
-                            .child(div().px_3().pb_2().font_family("Consolas").text_sm().child(Selectable::new(SharedString::from(format!("src-{}-{i}", m.msg_id)), src.replace('\t', "    "), vec![])))
+                            .child(div().px_3().pb_2().font_family("Consolas").text_sm().child(Selectable::new(SharedString::from(format!("src-{}-{i}", m.msg_id)), shown, (*hl).clone())))
                             .into_any_element()
                     }
                 }))
@@ -2591,7 +2655,10 @@ impl App {
                 (title, path.clone(), body.into_any_element())
             }
             Viewer::Text { name, path, text } => {
-                let shown: String = text.chars().take(200_000).collect();
+                let shown: String = text.chars().take(200_000).collect::<String>().replace('\t', "    ");
+                // The language comes from the file extension; unknown ones stay plain.
+                let lang = name.rsplit_once('.').map(|(_, ext)| lang_id(ext)).unwrap_or("text");
+                let hl = syntax_styles(cx.theme().is_dark(), lang, &shown);
                 let body = div()
                     .id("viewer-text")
                     .size_full()
@@ -2602,7 +2669,7 @@ impl App {
                     .text_color(t.foreground)
                     .font_family("Consolas")
                     .text_sm()
-                    .child(shown.replace('\t', "    "))
+                    .child(StyledText::new(SharedString::from(shown)).with_highlights((*hl).clone()))
                     .into_any_element();
                 (name.clone(), path.clone(), body)
             }
@@ -2912,12 +2979,41 @@ mod tests {
     }
 
     #[test]
+    fn quote_lines_are_found() {
+        let t = "обычная\n> цитата\n  > с отступом\nне цитата";
+        let found: Vec<&str> = super::quote_ranges(t).into_iter().map(|r| &t[r]).collect();
+        assert_eq!(found, ["> цитата", "  > с отступом"]);
+    }
+
+    #[test]
+    fn language_aliases() {
+        assert_eq!(super::lang_id("PY"), "python");
+        assert_eq!(super::lang_id("Sh"), "bash");
+        assert_eq!(super::lang_id("c++"), "cpp");
+        assert_eq!(super::lang_id("rs"), "rust");
+        assert_eq!(super::lang_id("json"), "json");
+        assert_eq!(super::lang_id("never-heard"), "never-heard");
+    }
+
+    #[test]
+    fn code_gets_syntax_colors() {
+        // A keyword and a string must pick up non-default colors (here: any color at all).
+        let styles = super::syntax_styles(true, "rust", "fn main() { let s = \"текст\"; }");
+        assert!(styles.iter().any(|(r, s)| r.len() > 0 && s.color.is_some()), "no styles: {styles:?}");
+        // The cache returns the same styles for the same input.
+        assert!(std::ptr::eq(
+            &*super::syntax_styles(true, "rust", "fn main() { let s = \"текст\"; }"),
+            &*styles
+        ));
+    }
+
+    #[test]
     fn link_click_opens_url() {
         use gpui_kit::*;
         struct V;
         impl Render for V {
             fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-                div().w(px(400.)).child(super::rich_text("m".into(), "https://example.com tail", black()))
+                div().w(px(400.)).child(super::rich_text("m".into(), "https://example.com tail", black(), black()))
             }
         }
         let mut cx = TestAppContext::single();
