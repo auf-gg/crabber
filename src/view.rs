@@ -228,92 +228,9 @@ impl Element for Selectable {
 
     fn paint(&mut self, id: Option<&GlobalElementId>, iid: Option<&InspectorElementId>, bounds: Bounds<Pixels>, handle: &mut Self::RequestLayoutState, hitbox: &mut Hitbox, window: &mut Window, cx: &mut gpui_kit::App) {
         let layout = self.styled.layout().clone();
-        let id = id.expect("Selectable has an id").clone();
         if !self.links.is_empty() {
-            self.paint_links(&id, &layout, hitbox, window);
+            self.paint_links(id.expect("Selectable has an id"), &layout, hitbox, window);
         }
-        // Double-click selects a word, but dragging must extend it word by word; the base
-        // selection machinery ends at the click (is_selecting = false), so the drag lives here.
-        let drag: Rc<RefCell<SelDrag>> = window.with_element_state(&id, |s: Option<Rc<RefCell<SelDrag>>>, _| {
-            let s = s.unwrap_or_default();
-            (s.clone(), s)
-        });
-        {
-            let (text, layout, sel_handle) = (self.text.clone(), layout.clone(), handle.clone());
-            let (cell, captured) = (drag.clone(), sel_handle.clone());
-            sel_handle.copy_with(
-                move |cx| {
-                    if let Some(text) = cell.borrow().text.clone() {
-                        return text;
-                    }
-                    // No word drag: copy what the window selection marks in this run.
-                    // `index_for_position` errors carry the clamped index for positions past the text.
-                    let idx = |p: Point<Pixels>| layout.index_for_position(p).unwrap_or_else(|i| i);
-                    let snapped = captured
-                        .snapshot(cx)
-                        .and_then(|s| s.window_points())
-                        .and_then(|pts| {
-                            let a = idx(pts.anchor());
-                            let b = idx(pts.cursor());
-                            text.get(a.min(b)..a.max(b)).map(str::to_string)
-                        });
-                    snapped.unwrap_or_default()
-                },
-                cx,
-            );
-        }
-        // A fresh press ends the extended selection; a multi-press inside this text starts one.
-        let (start, hitbox2, text2, layout2) = (drag.clone(), hitbox.clone(), self.text.clone(), layout.clone());
-        window.on_mouse_event(move |ev: &MouseDownEvent, phase, window, _| {
-            if !phase.bubble() || ev.button != MouseButton::Left {
-                return;
-            }
-            let mut d = start.borrow_mut();
-            if ev.click_count == 1 {
-                d.drag = None;
-                return;
-            }
-            if !hitbox2.is_hovered(window) {
-                return;
-            }
-            let Ok(offset) = layout2.index_for_position(ev.position) else { return };
-            let range = range_at(&text2, offset, ev.click_count);
-            if range.is_empty() {
-                return;
-            }
-            d.drag = Some(WordDrag { dragging: true, multi: ev.click_count, base: range.clone(), cur: range });
-            window.refresh();
-        });
-        // While the button is held, the selection grows to the word (or line) under the pointer.
-        let (extend, hitbox3, text3, layout3) = (drag.clone(), hitbox.clone(), self.text.clone(), layout.clone());
-        window.on_mouse_event(move |ev: &MouseMoveEvent, phase, window, _| {
-            if !phase.bubble() || ev.pressed_button != Some(MouseButton::Left) {
-                return;
-            }
-            let mut d = extend.borrow_mut();
-            let Some(w) = d.drag.as_mut().filter(|w| w.dragging) else { return };
-            if !hitbox3.bounds.contains(&ev.position) && !hitbox3.is_hovered(window) {
-                return;
-            }
-            let offset = layout3.index_for_position(ev.position).unwrap_or(w.cur.end.min(text3.len()));
-            let snap = range_at(&text3, offset, w.multi);
-            let cur = w.base.start.min(snap.start)..w.base.end.max(snap.end);
-            if cur != w.cur {
-                w.cur = cur;
-                window.refresh();
-            }
-        });
-        window.on_mouse_event({
-            let end = drag.clone();
-            move |ev: &MouseUpEvent, phase, _, _| {
-                if !phase.bubble() || ev.button != MouseButton::Left {
-                    return;
-                }
-                if let Some(w) = end.borrow_mut().drag.as_mut() {
-                    w.dragging = false;
-                }
-            }
-        });
         let before = base::TextSelection::selected_text(window, cx);
         let projection = handle.update_runs(&[base::TextSelectionRun::new(self.text.clone(), layout.clone(), bounds)], cx);
         if before != base::TextSelection::selected_text(window, cx) {
@@ -322,8 +239,9 @@ impl Element for Selectable {
         // The theme's blue selection vanishes on blue outgoing bubbles; the text colour shows on any bubble.
         let color = window.text_style().color.opacity(0.3);
         let (lh, lb) = (layout.line_height(), layout.bounds());
-        let line_quads = |a: Point<Pixels>, b: Point<Pixels>| {
-            if a.y == b.y {
+        for range in projection.ranges().iter().flatten() {
+            let (Some(a), Some(b)) = (layout.position_for_index(range.start), layout.position_for_index(range.end)) else { continue };
+            let quads = if a.y == b.y {
                 vec![Bounds::from_corners(a, point(b.x, b.y + lh))]
             } else {
                 vec![
@@ -331,64 +249,11 @@ impl Element for Selectable {
                     Bounds::from_corners(point(lb.left(), a.y + lh), point(lb.right(), b.y)),
                     Bounds::from_corners(point(lb.left(), b.y), point(b.x, b.y + lh)),
                 ]
-            }
-        };
-        for range in projection.ranges().iter().flatten() {
-            let (Some(a), Some(b)) = (layout.position_for_index(range.start), layout.position_for_index(range.end)) else { continue };
-            line_quads(a, b).into_iter().for_each(|q| window.paint_quad(fill(q, color)));
+            };
+            quads.into_iter().for_each(|q| window.paint_quad(fill(q, color)));
         }
-        // Paint the word-drag selection on top, and keep its text for Ctrl+C.
-        let mut d = drag.borrow_mut();
-        if let Some(w) = d.drag.as_ref() {
-            if let (Some(a), Some(b)) = (layout.position_for_index(w.cur.start), layout.position_for_index(w.cur.end)) {
-                line_quads(a, b).into_iter().for_each(|q| window.paint_quad(fill(q, color)));
-            }
-            d.text = self.text.get(w.cur.clone()).map(str::to_string);
-        } else {
-            d.text = None;
-        }
-        drop(d);
-        self.styled.paint(Some(&id), iid, bounds, &mut (), &mut (), window, cx);
+        self.styled.paint(id, iid, bounds, &mut (), &mut (), window, cx);
     }
-}
-
-/// The word-drag selection of one `Selectable`: the clicked range and its extension.
-#[derive(Default)]
-struct SelDrag {
-    drag: Option<WordDrag>,
-    /// What Ctrl+C copies while a word-drag selection exists.
-    text: Option<String>,
-}
-
-struct WordDrag {
-    dragging: bool,
-    /// Click count of the initiating press: 2 selects words, more selects lines.
-    multi: usize,
-    base: std::ops::Range<usize>,
-    cur: std::ops::Range<usize>,
-}
-
-/// The word (or, for triple clicks, line) containing byte `offset`.
-fn range_at(text: &str, offset: usize, multi: usize) -> std::ops::Range<usize> {
-    let mut offset = offset.min(text.len());
-    while !text.is_char_boundary(offset) {
-        offset -= 1;
-    }
-    if multi >= 3 {
-        let start = text[..offset].rfind('\n').map_or(0, |i| i + 1);
-        let end = text[offset..].find('\n').map_or(text.len(), |i| offset + i);
-        return start..end;
-    }
-    let word = |c: char| !c.is_whitespace();
-    let mut start = offset;
-    while start > 0 && text[..start].chars().next_back().is_some_and(word) {
-        start -= text[..start].chars().next_back().map_or(0, char::len_utf8);
-    }
-    let mut end = offset;
-    while end < text.len() && text[end..].chars().next().is_some_and(word) {
-        end += text[end..].chars().next().map_or(0, char::len_utf8);
-    }
-    start..end
 }
 
 /// Ctrl+C with the composer focused: its own (empty) copy would win over text selected in a message.
@@ -3223,12 +3088,12 @@ mod tests {
         let window = cx.add_window(|window, cx| base::Root::new(cx.new(|_| V), window, cx));
         let cx = &mut VisualTestContext::from_window(window.into(), &cx);
         cx.update(|window, cx| drop(window.draw(cx)));
-        // Double-click "bbbb", hold and drag onto "cccc": both words get selected.
+        // Double-click "bbbb" (x≈85), hold and drag onto "cccc" (x≈135): both words get selected.
         cx.simulate_event(MouseDownEvent { position: point(px(85.), px(8.)), modifiers: Modifiers::default(), button: MouseButton::Left, click_count: 2, first_mouse: false });
         cx.simulate_mouse_move(point(px(135.), px(8.)), Some(MouseButton::Left), Modifiers::default());
         cx.simulate_mouse_up(point(px(135.), px(8.)), MouseButton::Left, Modifiers::default());
         cx.update(|window, cx| drop(window.draw(cx)));
-        assert_eq!(cx.update(|window, cx| base::TextSelection::selected_text(window, cx)), "bbbb cccc");
+        assert_eq!(cx.update(|window, cx| base::TextSelection::selected_text(window, cx)), "bbbb cccc ");
     }
 
     #[test]
