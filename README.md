@@ -5,7 +5,7 @@
 # Crabber
 
 [![Build](https://github.com/auf-gg/crabber/actions/workflows/build.yml/badge.svg)](https://github.com/auf-gg/crabber/actions/workflows/build.yml)
-[![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 Cross-platform XMPP messenger with a GPU-accelerated [GPUI](https://github.com/zed-industries/gpui) interface.
 
@@ -198,4 +198,4 @@ package on every release).
 
 ## License
 
-[Apache-2.0](LICENSE)
+[MIT](LICENSE)

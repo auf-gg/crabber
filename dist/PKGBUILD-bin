@@ -14,7 +14,7 @@ pkgrel=1
 pkgdesc='XMPP messenger built on GPUI (release binaries)'
 arch=('x86_64' 'aarch64')
 url="$_giturl"
-license=('Apache-2.0')
+license=('MIT')
 depends=(
   'libxkbcommon'
   'wayland'
