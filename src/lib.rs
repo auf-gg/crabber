@@ -5,8 +5,11 @@ pub mod pgp;
 pub mod connector;
 pub mod e2e;
 pub mod i18n;
+#[cfg(target_os = "linux")]
+pub mod screencast;
 pub mod store;
 pub mod update;
 pub mod video;
+pub mod videocall;
 pub mod voice;
 pub mod xmpp;

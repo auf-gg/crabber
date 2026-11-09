@@ -9,14 +9,14 @@ use std::sync::mpsc::{Receiver, Sender, TryRecvError, sync_channel};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use cpal::traits::{DeviceTrait, StreamTrait};
 use cpal::{FromSample, SampleFormat, SizedSample, StreamConfig};
 
 /// Frames are resampled to a constant rate, so frame N is due at N / FPS.
 const FPS: f64 = 30.0;
 const MAX_W: u32 = 1280;
 
-fn cmd(name: &str) -> Command {
+pub(crate) fn cmd(name: &str) -> Command {
     let mut c = Command::new(name);
     c.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
     #[cfg(windows)]
@@ -163,7 +163,7 @@ impl Drop for Playback {
 fn start_audio(path: std::path::PathBuf, from: f64, paused: Arc<AtomicBool>, volume: Arc<AtomicU32>) -> Sender<()> {
     let (stop, stop_rx) = std::sync::mpsc::channel::<()>();
     std::thread::spawn(move || {
-        let Some(output) = cpal::default_host().default_output_device() else { return };
+        let Some(output) = crate::audio::output_device() else { return };
         let Ok(cfg) = output.default_output_config() else { return };
         let (rate, ch) = (cfg.sample_rate(), cfg.channels());
         let queue = Arc::new(Mutex::new(VecDeque::<f32>::new()));

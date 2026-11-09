@@ -9,6 +9,94 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, Sample as _, SampleFormat, SizedSample, StreamConfig};
 
 pub const RATE: u32 = 8000;
+
+/// Chosen microphone and speaker as cpal device ids ("pipewire:…", "wasapi:…"); None = system default.
+static INPUT: Mutex<Option<String>> = Mutex::new(None);
+static OUTPUT: Mutex<Option<String>> = Mutex::new(None);
+
+/// RNNoise noise suppression on the microphone; read when a capture stream opens.
+static DENOISE: AtomicBool = AtomicBool::new(false);
+
+pub fn set_denoise(on: bool) {
+    DENOISE.store(on, Ordering::Relaxed);
+}
+
+pub fn set_devices(input: Option<String>, output: Option<String>) {
+    *INPUT.lock().unwrap() = input;
+    *OUTPUT.lock().unwrap() = output;
+}
+
+/// Host for the system default devices. On Linux that stays ALSA (routed to PipeWire/Pulse by the
+/// system) even with the PipeWire host built in: its own "default" node does not open everywhere.
+fn system_host() -> cpal::Host {
+    #[cfg(target_os = "linux")]
+    if let Ok(h) = cpal::host_from_id(cpal::HostId::Alsa) {
+        return h;
+    }
+    cpal::default_host()
+}
+
+/// The chosen device if it is still there; an unplugged one falls back to the default.
+fn chosen(id: &Mutex<Option<String>>) -> Option<cpal::Device> {
+    let id: cpal::DeviceId = id.lock().unwrap().as_deref()?.parse().ok()?;
+    cpal::host_from_id(id.host()).ok()?.device_by_id(&id)
+}
+
+/// Opens a stream on the chosen device, else the system default, else any listed one: on some
+/// PipeWire setups the ALSA default can't capture while the PipeWire nodes work.
+pub(crate) fn with_device<T>(input: bool, mut build: impl FnMut(&cpal::Device) -> Result<T, String>) -> Result<T, String> {
+    let first = if input { input_device() } else { output_device() };
+    let mut err = if input { t!("audio.no_mic") } else { t!("audio.no_output") }.to_string();
+    let rest = || devices(input).into_iter().filter_map(|d| {
+        let id: cpal::DeviceId = d.id.parse().ok()?;
+        cpal::host_from_id(id.host()).ok()?.device_by_id(&id)
+    });
+    for dev in first.into_iter().chain(rest()) {
+        match build(&dev) {
+            Ok(v) => return Ok(v),
+            Err(e) => err = e,
+        }
+    }
+    Err(err)
+}
+
+pub fn input_device() -> Option<cpal::Device> {
+    chosen(&INPUT).or_else(|| system_host().default_input_device())
+}
+
+pub fn output_device() -> Option<cpal::Device> {
+    chosen(&OUTPUT).or_else(|| system_host().default_output_device())
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct MediaDevice {
+    pub id: String,
+    pub name: String,
+}
+
+/// Devices to choose from. On Linux these are PipeWire nodes when PipeWire runs (real names,
+/// headsets included); plain ALSA lists dozens of plugins, so only its per-card defaults are kept.
+pub fn devices(input: bool) -> Vec<MediaDevice> {
+    let list = |host: &cpal::Host, input: bool| -> Vec<MediaDevice> {
+        let devs = if input { host.input_devices().map(|d| d.collect::<Vec<_>>()) } else { host.output_devices().map(|d| d.collect()) };
+        devs.unwrap_or_default().into_iter().filter_map(|d| Some(MediaDevice { id: d.id().ok()?.to_string(), name: d.to_string() })).collect()
+    };
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(pw) = cpal::host_from_id(cpal::HostId::PipeWire) {
+            let outputs = list(&pw, false);
+            let mut out = if input { list(&pw, true) } else { outputs.clone() };
+            // "…_default" aliases duplicate the system default; inputs that are also outputs are monitors.
+            out.retain(|d| !d.id.ends_with("_default") && !(input && outputs.iter().any(|o| o.id == d.id)));
+            return out;
+        }
+        let mut out = list(&system_host(), input);
+        out.retain(|d| d.id.starts_with("alsa:sysdefault:"));
+        out
+    }
+    #[cfg(not(target_os = "linux"))]
+    list(&cpal::default_host(), input)
+}
 /// 20 ms at 8 kHz.
 pub const FRAME: usize = 160;
 
@@ -81,6 +169,53 @@ impl Up {
     }
 }
 
+/// RNNoise (nnnoiseless) works on 48 kHz audio in 10 ms frames.
+const DENOISE_RATE: u32 = 48000;
+const DENOISE_FRAME: usize = nnnoiseless::DenoiseState::FRAME_SIZE;
+
+/// Microphone chain: mono samples at the device rate in, `rate` samples out; with noise
+/// suppression on, they pass through RNNoise at 48 kHz first (10 ms of extra latency).
+pub(crate) struct Mic {
+    /// RNNoise state, the resampler to 48 kHz (none if the device runs at it) and pending samples.
+    denoise: Option<(Box<nnnoiseless::DenoiseState<'static>>, Option<Up>, VecDeque<f32>)>,
+    tmp: Vec<f32>,
+    down: Down,
+}
+
+impl Mic {
+    pub(crate) fn new(device_rate: u32, rate: u32) -> Self {
+        Self::with(device_rate, rate, DENOISE.load(Ordering::Relaxed))
+    }
+
+    fn with(device_rate: u32, rate: u32, on: bool) -> Self {
+        let src = if on { DENOISE_RATE } else { device_rate };
+        let up = (device_rate != DENOISE_RATE).then(|| Up { step: device_rate as f64 / DENOISE_RATE as f64, frac: 0.0, last: 0.0 });
+        Self {
+            denoise: on.then(|| (nnnoiseless::DenoiseState::new(), up, VecDeque::new())),
+            tmp: vec![],
+            down: Down { ratio: src as f64 / rate as f64, pos: 0.0, acc: 0.0, n: 0 },
+        }
+    }
+
+    pub(crate) fn push(&mut self, x: f32, out: &mut Vec<f32>) {
+        let Some((state, up, buf)) = self.denoise.as_mut() else { return self.down.push(x, out) };
+        match up {
+            Some(up) => up.push(x, buf),
+            None => buf.push_back(x),
+        }
+        while buf.len() >= DENOISE_FRAME {
+            // RNNoise expects 16-bit sample magnitudes.
+            let input: Vec<f32> = buf.drain(..DENOISE_FRAME).map(|s| s * 32767.0).collect();
+            let mut clean = [0f32; DENOISE_FRAME];
+            state.process_frame(&mut clean, &input);
+            self.tmp.extend(clean.iter().map(|s| s / 32767.0));
+        }
+        for y in self.tmp.drain(..) {
+            self.down.push(y, out);
+        }
+    }
+}
+
 struct Playback {
     buf: VecDeque<f32>,
     up: Up,
@@ -90,13 +225,9 @@ struct Playback {
 pub struct Audio {
     pub muted: Arc<AtomicBool>,
     playback: Arc<Mutex<Playback>>,
-    stop: std::sync::mpsc::Sender<()>,
-}
-
-impl Drop for Audio {
-    fn drop(&mut self) {
-        let _ = self.stop.send(());
-    }
+    /// Dropping it stops the streams' thread.
+    stop: Mutex<std::sync::mpsc::Sender<()>>,
+    on_frame: Arc<dyn Fn(Vec<u8>) + Send + Sync>,
 }
 
 impl Audio {
@@ -116,54 +247,74 @@ impl Audio {
     }
 }
 
-/// Opens the default microphone and speaker. `on_frame` receives 160-byte µ-law frames.
-/// cpal streams are not Send, so they live on their own thread until `Audio` is dropped.
-pub fn start(on_frame: impl Fn(Vec<u8>) + Send + 'static) -> Result<Audio, String> {
+/// Opens the chosen (or default) microphone and speaker. `on_frame` receives 160-byte µ-law frames.
+pub fn start(on_frame: impl Fn(Vec<u8>) + Send + Sync + 'static) -> Result<Audio, String> {
+    let playback = Arc::new(Mutex::new(Playback { buf: VecDeque::new(), up: Up { step: 1.0, frac: 0.0, last: 0.0 }, rate: RATE }));
     let muted = Arc::new(AtomicBool::new(false));
+    let on_frame: Arc<dyn Fn(Vec<u8>) + Send + Sync> = Arc::new(on_frame);
+    let stop = open(&playback, &muted, &on_frame)?;
+    Ok(Audio { muted, playback, stop: Mutex::new(stop), on_frame })
+}
+
+impl Audio {
+    /// Reopens the streams on the currently chosen devices (switching mid-call).
+    pub fn restart(&self) -> Result<(), String> {
+        let mut stop = self.stop.lock().unwrap();
+        // Close the old streams first: some devices can't be opened twice.
+        *stop = std::sync::mpsc::channel().0;
+        *stop = open(&self.playback, &self.muted, &self.on_frame)?;
+        Ok(())
+    }
+}
+
+/// Starts the streams; cpal streams are not Send, so they live on their own thread until the
+/// returned sender is dropped.
+fn open(playback: &Arc<Mutex<Playback>>, muted: &Arc<AtomicBool>, on_frame: &Arc<dyn Fn(Vec<u8>) + Send + Sync>) -> Result<std::sync::mpsc::Sender<()>, String> {
     let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
-    let (init_tx, init_rx) = std::sync::mpsc::channel::<Result<Arc<Mutex<Playback>>, String>>();
-    let m = muted.clone();
+    let (init_tx, init_rx) = std::sync::mpsc::channel::<Result<(), String>>();
+    let (playback, m, on_frame) = (playback.clone(), muted.clone(), on_frame.clone());
     std::thread::spawn(move || {
         let streams = (|| {
-            let host = cpal::default_host();
-            let output = host.default_output_device().ok_or(t!("audio.no_output"))?;
-            let out_cfg = output.default_output_config().map_err(|e| e.to_string())?;
-            let out_rate = out_cfg.sample_rate();
-            let playback = Arc::new(Mutex::new(Playback {
-                buf: VecDeque::new(),
-                up: Up { step: RATE as f64 / out_rate as f64, frac: 0.0, last: 0.0 },
-                rate: out_rate,
-            }));
-            let out_stream = match out_cfg.sample_format() {
-                SampleFormat::I16 => build_output::<i16>(&output, out_cfg.config(), playback.clone()),
-                SampleFormat::U16 => build_output::<u16>(&output, out_cfg.config(), playback.clone()),
-                _ => build_output::<f32>(&output, out_cfg.config(), playback.clone()),
-            }?;
-
-            let input = host.default_input_device().ok_or(t!("audio.no_mic"))?;
-            let in_cfg = input.default_input_config().map_err(|e| e.to_string())?;
-            let in_stream = match in_cfg.sample_format() {
-                SampleFormat::I16 => build_input::<i16>(&input, in_cfg.config(), m, on_frame),
-                SampleFormat::U16 => build_input::<u16>(&input, in_cfg.config(), m, on_frame),
-                _ => build_input::<f32>(&input, in_cfg.config(), m, on_frame),
-            }?;
-            out_stream.play().map_err(|e| e.to_string())?;
-            in_stream.play().map_err(|e| e.to_string())?;
-            Ok::<_, String>((in_stream, out_stream, playback))
+            let out_stream = with_device(false, |output| {
+                let out_cfg = output.default_output_config().map_err(|e| e.to_string())?;
+                let out_rate = out_cfg.sample_rate();
+                *playback.lock().unwrap() = Playback { buf: VecDeque::new(), up: Up { step: RATE as f64 / out_rate as f64, frac: 0.0, last: 0.0 }, rate: out_rate };
+                let stream = match out_cfg.sample_format() {
+                    SampleFormat::I16 => build_output::<i16>(output, out_cfg.config(), playback.clone()),
+                    SampleFormat::U16 => build_output::<u16>(output, out_cfg.config(), playback.clone()),
+                    _ => build_output::<f32>(output, out_cfg.config(), playback.clone()),
+                }?;
+                stream.play().map_err(|e| e.to_string())?;
+                Ok(stream)
+            })?;
+            let in_stream = with_device(true, |input| {
+                let in_cfg = input.default_input_config().map_err(|e| e.to_string())?;
+                let (m, on_frame) = (m.clone(), on_frame.clone());
+                let send = move |f| on_frame(f);
+                let stream = match in_cfg.sample_format() {
+                    SampleFormat::I16 => build_input::<i16>(input, in_cfg.config(), m, send),
+                    SampleFormat::U16 => build_input::<u16>(input, in_cfg.config(), m, send),
+                    _ => build_input::<f32>(input, in_cfg.config(), m, send),
+                }?;
+                stream.play().map_err(|e| e.to_string())?;
+                Ok(stream)
+            })?;
+            Ok::<_, String>((in_stream, out_stream))
         })();
         match streams {
-            Ok((in_stream, out_stream, playback)) => {
-                let _ = init_tx.send(Ok(playback));
+            Ok(streams) => {
+                let _ = init_tx.send(Ok(()));
+                // Returns when the sender is dropped (hang-up or device switch).
                 let _ = stop_rx.recv();
-                drop((in_stream, out_stream));
+                drop(streams);
             }
             Err(e) => {
                 let _ = init_tx.send(Err(e));
             }
         }
     });
-    let playback = init_rx.recv().map_err(|_| t!("audio.stream_ended").to_string())??;
-    Ok(Audio { muted, playback, stop: stop_tx })
+    init_rx.recv().map_err(|_| t!("audio.stream_ended").to_string())??;
+    Ok(stop_tx)
 }
 
 /// Ringing played on the default speaker until dropped.
@@ -174,7 +325,7 @@ pub fn tone(incoming: bool) -> Tone {
     let (tx, rx) = std::sync::mpsc::channel::<()>();
     std::thread::spawn(move || {
         let res = (|| {
-            let output = cpal::default_host().default_output_device().ok_or(t!("audio.no_output"))?;
+            let output = output_device().ok_or(t!("audio.no_output"))?;
             let cfg = output.default_output_config().map_err(|e| e.to_string())?;
             let stream = match cfg.sample_format() {
                 SampleFormat::I16 => build_tone::<i16>(&output, cfg.config(), incoming),
@@ -243,7 +394,7 @@ where
     f32: FromSample<T>,
 {
     let channels = config.channels as usize;
-    let mut down = Down { ratio: config.sample_rate as f64 / RATE as f64, pos: 0.0, acc: 0.0, n: 0 };
+    let mut mic = Mic::new(config.sample_rate, RATE);
     let mut pcm: Vec<f32> = Vec::with_capacity(FRAME * 2);
     device
         .build_input_stream(
@@ -251,7 +402,7 @@ where
             move |data: &[T], _: &cpal::InputCallbackInfo| {
                 for frame in data.chunks(channels) {
                     let mono = frame.iter().map(|&s| f32::from_sample(s)).sum::<f32>() / channels as f32;
-                    down.push(mono, &mut pcm);
+                    mic.push(mono, &mut pcm);
                 }
                 while pcm.len() >= FRAME {
                     let silent = muted.load(Ordering::Relaxed);
@@ -312,6 +463,51 @@ mod tests {
             assert!(peak(incoming, period - 0.3, period) < 0.02, "{incoming}: fades out before repeating");
             assert!(peak(incoming, period, period + 0.2) > 0.1, "{incoming}: repeats");
         }
+    }
+
+    fn noise(n: usize) -> Vec<f32> {
+        let mut seed = 1u32;
+        (0..n)
+            .map(|_| {
+                seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                (seed >> 8) as f32 / (1 << 24) as f32 * 0.04 - 0.02
+            })
+            .collect()
+    }
+
+    fn run_mic(on: bool, device_rate: u32, rate: u32, input: &[f32]) -> Vec<f32> {
+        let mut mic = Mic::with(device_rate, rate, on);
+        let mut out = vec![];
+        input.iter().for_each(|&x| mic.push(x, &mut out));
+        out
+    }
+
+    /// At 48 kHz the chain hands RNNoise exactly its 10 ms frames, in its 16-bit scale.
+    #[test]
+    fn denoise_matches_rnnoise() {
+        let input = noise(48000);
+        let got = run_mic(true, 48000, 48000, &input);
+        let mut st = nnnoiseless::DenoiseState::new();
+        let mut want = vec![];
+        for f in input.as_chunks::<DENOISE_FRAME>().0 {
+            let scaled: Vec<f32> = f.iter().map(|x| x * 32767.0).collect();
+            let mut out = [0f32; DENOISE_FRAME];
+            st.process_frame(&mut out, &scaled);
+            want.extend(out.iter().map(|x| x / 32767.0));
+        }
+        assert_eq!(got.len(), want.len());
+        assert!(got.iter().zip(&want).all(|(a, b)| (a - b).abs() < 1e-6));
+        assert!(got.iter().map(|x| x * x).sum::<f32>() < input.iter().map(|x| x * x).sum::<f32>());
+    }
+
+    /// From 44.1 kHz through the 48 kHz denoiser down to the 8 kHz call rate: the rate holds.
+    #[test]
+    fn denoise_keeps_rate() {
+        let input = noise(44100 * 2);
+        assert!((run_mic(false, 44100, RATE, &input).len() as i64 - 16000).abs() < 10);
+        // Up to one 10 ms frame stays buffered in the denoiser.
+        let n = run_mic(true, 44100, RATE, &input).len() as i64;
+        assert!((n - 16000).abs() <= 90, "{n}");
     }
 
     #[test]

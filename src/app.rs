@@ -16,6 +16,8 @@ use gpui_kit::component::{
 };
 use gpui_kit::*;
 use crabber::call::{CallCmd, CallEv, CallState};
+use crabber::audio::MediaDevice;
+use crabber::videocall::{FRAMES, PREVIEW, REMOTE, Source};
 use crabber::store::{self, ChatRow, Msg, Store};
 use crabber::e2e::DeviceInfo;
 use crabber::xmpp::{self, Account, Bookmark, Cmd, Ev, Occupant, Reply};
@@ -131,6 +133,12 @@ pub struct Settings {
     pub start_minimized: bool,
     /// "system" | "ru" | "en" | "zh"
     pub lang: String,
+    /// Chosen call devices; None = system default (first camera).
+    pub mic: Option<MediaDevice>,
+    pub speaker: Option<MediaDevice>,
+    pub camera: Option<MediaDevice>,
+    /// RNNoise noise suppression on the microphone.
+    pub denoise: bool,
 }
 
 impl Settings {
@@ -148,7 +156,18 @@ impl Settings {
             autostart: desktop::autostart(),
             start_minimized: flag("start_minimized"),
             lang: s.get("lang").unwrap_or_else(|| "system".into()),
+            mic: load_device(s, "mic"),
+            speaker: load_device(s, "speaker"),
+            camera: load_device(s, "camera"),
+            denoise: s.get("denoise").is_some_and(|v| v == "1"),
         }
+    }
+    /// Hands the chosen devices to the audio and video code; open streams pick them up on `CallCmd::Devices`.
+    fn apply_devices(&self) {
+        let id = |d: &Option<MediaDevice>| d.as_ref().map(|d| d.id.clone());
+        crabber::audio::set_devices(id(&self.mic), id(&self.speaker));
+        crabber::videocall::set_camera(id(&self.camera));
+        crabber::audio::set_denoise(self.denoise);
     }
     /// Switches the UI texts to the chosen language; "system" follows the OS.
     fn apply_lang(&self) {
@@ -168,7 +187,43 @@ impl Settings {
         s.set("ui_scale", &self.ui_scale.to_string());
         s.set("start_minimized", b(self.start_minimized));
         s.set("lang", &self.lang);
+        s.set("denoise", b(self.denoise));
+        for (k, d) in [("mic", &self.mic), ("speaker", &self.speaker), ("camera", &self.camera)] {
+            s.set(k, d.as_ref().map_or("", |d| d.id.as_str()));
+            s.set(&format!("{k}_name"), d.as_ref().map_or("", |d| d.name.as_str()));
+        }
     }
+}
+
+/// The call devices offered in settings.
+#[derive(Clone, Copy)]
+pub enum DeviceKind {
+    Mic,
+    Speaker,
+    Camera,
+}
+
+impl DeviceKind {
+    pub fn slot(self, s: &mut Settings) -> &mut Option<MediaDevice> {
+        match self {
+            Self::Mic => &mut s.mic,
+            Self::Speaker => &mut s.speaker,
+            Self::Camera => &mut s.camera,
+        }
+    }
+    /// What is plugged in now (queried when the menu opens).
+    pub fn list(self) -> Vec<MediaDevice> {
+        match self {
+            Self::Mic => crabber::audio::devices(true),
+            Self::Speaker => crabber::audio::devices(false),
+            Self::Camera => crabber::videocall::cameras(),
+        }
+    }
+}
+
+fn load_device(s: &Store, key: &str) -> Option<MediaDevice> {
+    let id = s.get(key).filter(|v| !v.is_empty())?;
+    Some(MediaDevice { id, name: s.get(&format!("{key}_name")).unwrap_or_default() })
 }
 
 pub struct CallUi {
@@ -177,6 +232,20 @@ pub struct CallUi {
     pub muted: bool,
     pub started: Option<Instant>,
     pub outgoing: bool,
+    /// The call carries video (proposed with it or upgraded).
+    pub video: bool,
+    /// What we send as video.
+    pub sending: Option<Source>,
+    /// Latest decoded frames: the peer's picture and our preview.
+    pub remote: Option<Arc<RenderImage>>,
+    pub local: Option<Arc<RenderImage>>,
+}
+
+impl CallUi {
+    pub fn new(peer: String, state: CallState) -> Self {
+        let outgoing = state == CallState::Outgoing;
+        Self { peer, state, muted: false, started: None, outgoing, video: false, sending: None, remote: None, local: None }
+    }
 }
 
 pub struct Session {
@@ -504,6 +573,7 @@ impl App {
         let app_store = Store::open(&store::data_dir().join("app.db")).expect("cannot open settings database");
         let settings = Settings::load(&app_store);
         settings.apply_lang();
+        settings.apply_devices();
         let saved_jid = app_store.get("jid").unwrap_or_default();
         let saved_host = app_store.get("host").unwrap_or_default();
         let insecure = app_store.get("insecure").is_some_and(|v| v == "1");
@@ -924,6 +994,59 @@ impl App {
             }
         })
         .detach();
+        // Pulls decoded call video into images; the peer's picture goes away when its frames stop.
+        cx.spawn(async move |this, cx| {
+            let mut shown: [Option<Arc<RenderImage>>; 2] = [None, None];
+            loop {
+                cx.background_executor().timer(std::time::Duration::from_millis(33)).await;
+                let alive = this.update(cx, |app, cx| {
+                    let Some(s) = app.sess.as_mut() else { return false };
+                    let call = s.call.as_mut();
+                    let mut changed = false;
+                    let (sending, mut targets) = match call {
+                        Some(c) => (c.sending.is_some(), [Some(&mut c.remote), Some(&mut c.local)]),
+                        None => (false, [None, None]),
+                    };
+                    for (i, (slot, (w, h))) in [(&FRAMES.remote, REMOTE), (&FRAMES.local, PREVIEW)].into_iter().enumerate() {
+                        let (frame, live) = {
+                            let mut sl = slot.lock().unwrap();
+                            let live = sl.at.is_some_and(|t| t.elapsed().as_secs() < 3);
+                            (sl.frame.take(), live)
+                        };
+                        let keep = targets[i].is_some() && if i == 0 { live } else { sending };
+                        let img = frame
+                            .filter(|_| keep)
+                            .and_then(|b| image::RgbaImage::from_raw(w, h, b))
+                            .map(|b| Arc::new(RenderImage::new(vec![image::Frame::new(b)])));
+                        if let Some(img) = img {
+                            if let Some(t) = targets[i].as_mut() {
+                                **t = Some(img.clone());
+                            }
+                            if let Some(old) = shown[i].replace(img) {
+                                cx.drop_image(old, None);
+                            }
+                            changed = true;
+                        } else if !keep && shown[i].is_some() {
+                            if let Some(t) = targets[i].as_mut() {
+                                **t = None;
+                            }
+                            if let Some(old) = shown[i].take() {
+                                cx.drop_image(old, None);
+                            }
+                            changed = true;
+                        }
+                    }
+                    if changed {
+                        cx.notify();
+                    }
+                    true
+                });
+                if !matches!(alive, Ok(true)) {
+                    break;
+                }
+            }
+        })
+        .detach();
         // Ticks the call timer and expires stale "typing..." indicators.
         cx.spawn(async move |this, cx| {
             loop {
@@ -986,8 +1109,15 @@ impl App {
     /// Changes a preference, persists it and re-applies the theme.
     pub fn update_settings(&mut self, window: &mut Window, cx: &mut Context<Self>, f: impl FnOnce(&mut Settings)) {
         let lang = self.settings.lang.clone();
+        let devices = (self.settings.mic.clone(), self.settings.speaker.clone(), self.settings.camera.clone(), self.settings.denoise);
         f(&mut self.settings);
         self.settings.save(&self.app_store);
+        if devices != (self.settings.mic.clone(), self.settings.speaker.clone(), self.settings.camera.clone(), self.settings.denoise) {
+            self.settings.apply_devices();
+            if let Some(sess) = self.sess.as_ref().filter(|s| s.call.is_some()) {
+                sess.send(Cmd::Call(CallCmd::Devices));
+            }
+        }
         if self.settings.lang != lang {
             self.settings.apply_lang();
             // Placeholders are set once at startup; the rest of the UI re-reads texts on render.
@@ -1516,7 +1646,7 @@ impl App {
                     if ended {
                         call_log.extend(sess.call.take());
                     } else {
-                        let call = sess.call.get_or_insert(CallUi { peer: peer.clone(), state: state.clone(), muted: false, started: None, outgoing: state == CallState::Outgoing });
+                        let call = sess.call.get_or_insert_with(|| CallUi::new(peer.clone(), state.clone()));
                         if state == CallState::Active && call.started.is_none() {
                             call.started = Some(Instant::now());
                         }
@@ -1524,6 +1654,13 @@ impl App {
                         call.state = state;
                     }
                 }
+                Ev::Call(CallEv::Media { video, sending }) => {
+                    if let Some(c) = sess.call.as_mut() {
+                        c.video = video;
+                        c.sending = sending;
+                    }
+                }
+                Ev::Call(CallEv::Notice(text)) => notes.push(text),
             }
         }
         sess.store.commit();
@@ -2400,11 +2537,18 @@ impl App {
         let Some(sess) = self.sess.as_mut() else { return };
         let mut ended = None;
         match &cmd {
-            CallCmd::Start { to } => {
+            CallCmd::Start { to, video } => {
                 if sess.call.is_some() {
                     return;
                 }
-                sess.call = Some(CallUi { peer: to.clone(), state: CallState::Outgoing, muted: false, started: None, outgoing: true });
+                let mut c = CallUi::new(to.clone(), CallState::Outgoing);
+                c.video = *video;
+                sess.call = Some(c);
+            }
+            CallCmd::Video(src) => {
+                if let Some(c) = sess.call.as_mut() {
+                    c.sending = *src;
+                }
             }
             CallCmd::Mute(m) => {
                 if let Some(c) = sess.call.as_mut() {
@@ -2412,11 +2556,12 @@ impl App {
                 }
             }
             CallCmd::Hangup => ended = sess.call.take(),
-            CallCmd::Accept => {
+            CallCmd::Accept { .. } => {
                 if let Some(c) = sess.call.as_mut() {
                     c.state = CallState::Connecting;
                 }
             }
+            CallCmd::Devices => {}
         }
         sess.send(Cmd::Call(cmd));
         if let Some(c) = ended {

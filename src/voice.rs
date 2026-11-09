@@ -5,12 +5,12 @@ use std::io::Cursor;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use cpal::traits::{DeviceTrait, StreamTrait};
 use cpal::{FromSample, Sample as _, SampleFormat, SizedSample, StreamConfig};
 use ogg::{PacketReader, PacketWriteEndInfo, PacketWriter};
 use unsafe_libopus as opus;
 
-use crate::audio::{Down, Up};
+use crate::audio::{Mic, Up};
 
 const RATE: u32 = 16000;
 /// 20 ms at 16 kHz.
@@ -39,15 +39,17 @@ impl Recorder {
         let buf = pcm.clone();
         std::thread::spawn(move || {
             let stream = (|| {
-                let input = cpal::default_host().default_input_device().ok_or(t!("audio.no_mic"))?;
-                let cfg = input.default_input_config().map_err(|e| e.to_string())?;
-                let stream = match cfg.sample_format() {
-                    SampleFormat::I16 => record::<i16>(&input, cfg.config(), buf, lv),
-                    SampleFormat::U16 => record::<u16>(&input, cfg.config(), buf, lv),
-                    _ => record::<f32>(&input, cfg.config(), buf, lv),
-                }?;
-                stream.play().map_err(|e| e.to_string())?;
-                Ok::<_, String>(stream)
+                crate::audio::with_device(true, |input| {
+                    let cfg = input.default_input_config().map_err(|e| e.to_string())?;
+                    let (buf, lv) = (buf.clone(), lv.clone());
+                    let stream = match cfg.sample_format() {
+                        SampleFormat::I16 => record::<i16>(input, cfg.config(), buf, lv),
+                        SampleFormat::U16 => record::<u16>(input, cfg.config(), buf, lv),
+                        _ => record::<f32>(input, cfg.config(), buf, lv),
+                    }?;
+                    stream.play().map_err(|e| e.to_string())?;
+                    Ok(stream)
+                })
             })();
             match stream {
                 Ok(stream) => {
@@ -82,14 +84,14 @@ where
     f32: FromSample<T>,
 {
     let channels = config.channels as usize;
-    let mut down = Down { ratio: config.sample_rate as f64 / RATE as f64, pos: 0.0, acc: 0.0, n: 0 };
+    let mut mic = Mic::new(config.sample_rate, RATE);
     let mut tmp = Vec::new();
     device
         .build_input_stream(
             config,
             move |data: &[T], _: &cpal::InputCallbackInfo| {
                 for frame in data.chunks(channels) {
-                    down.push(frame.iter().map(|&s| f32::from_sample(s)).sum::<f32>() / channels as f32, &mut tmp);
+                    mic.push(frame.iter().map(|&s| f32::from_sample(s)).sum::<f32>() / channels as f32, &mut tmp);
                 }
                 level.store(tmp.iter().fold(0f32, |m, x| m.max(x.abs())).to_bits(), Ordering::Relaxed);
                 pcm.lock().unwrap().extend(tmp.drain(..).map(|x| (x.clamp(-1.0, 1.0) * 32767.0) as i16));
@@ -209,7 +211,7 @@ impl Player {
         let (init_tx, init_rx) = std::sync::mpsc::channel::<Result<(Arc<AtomicUsize>, usize, Arc<AtomicBool>), String>>();
         std::thread::spawn(move || {
             let res = (|| {
-                let output = cpal::default_host().default_output_device().ok_or(t!("audio.no_output"))?;
+                let output = crate::audio::output_device().ok_or(t!("audio.no_output"))?;
                 let cfg = output.default_output_config().map_err(|e| e.to_string())?;
                 let mut up = Up { step: 48000.0 / cfg.sample_rate() as f64, frac: 0.0, last: 0.0 };
                 let mut buf = VecDeque::new();

@@ -23,6 +23,7 @@ depends=(
   'fontconfig'
   'freetype2'
   'alsa-lib'
+  'pipewire'
   'vulkan-icd-loader'
   'dbus'
   'noto-fonts-emoji'   # colour emojis (reactions, picker)

@@ -14,8 +14,10 @@ Cross-platform XMPP messenger with a GPU-accelerated [GPUI](https://github.com/z
 - XMPP instant messaging with STARTTLS/TLS (rustls)
 - OMEMO end-to-end encryption (libsignal-compatible) and PGP support
 - Encrypted file transfer
-- Voice calls over WebRTC
+- Voice and video calls over WebRTC, screen sharing (video needs ffmpeg on PATH; screen sharing on Wayland goes through the desktop portal and PipeWire)
 - Voice messages (Ogg Opus, compatible with Conversations)
+- Microphone, speaker and camera chosen in settings, switched on the fly during a call
+- Noise suppression for the microphone ([nnnoiseless](https://github.com/jneem/nnnoiseless), RNNoise in Rust)
 - Message history stored in SQLite with per-chat search
 - Account credentials kept in the system keyring
 - Desktop integration: tray icon, native notifications
@@ -73,8 +75,8 @@ Crabber stands on each.
 | [0115](https://xmpp.org/extensions/xep-0115.html) | Entity Capabilities | ✅ | |
 | [0153](https://xmpp.org/extensions/xep-0153.html) | vCard-Based Avatars | ✅ | |
 | [0163](https://xmpp.org/extensions/xep-0163.html) | Personal Eventing Protocol | 🟡 | OMEMO device lists and bundles only |
-| [0166](https://xmpp.org/extensions/xep-0166.html) | Jingle | 🟡 | Audio calls; no file transfer |
-| [0167](https://xmpp.org/extensions/xep-0167.html) | Jingle RTP Sessions | 🟡 | Audio only (G.711 µ-law), no video |
+| [0166](https://xmpp.org/extensions/xep-0166.html) | Jingle | 🟡 | Audio and video calls; no file transfer |
+| [0167](https://xmpp.org/extensions/xep-0167.html) | Jingle RTP Sessions | 🟡 | G.711 µ-law audio, VP8 video; video added mid-call via content-add |
 | [0172](https://xmpp.org/extensions/xep-0172.html) | User Nickname | ❌ | |
 | [0176](https://xmpp.org/extensions/xep-0176.html) | Jingle ICE-UDP Transport | ✅ | |
 | [0184](https://xmpp.org/extensions/xep-0184.html) | Message Delivery Receipts | ✅ | |

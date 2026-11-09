@@ -173,13 +173,13 @@ fn audio_call_connects() {
     wait(&mut b_rx, |e| matches!(e, Ev::Online { .. }).then_some(()));
     std::thread::sleep(Duration::from_millis(500)); // initial presence
 
-    a.unbounded_send(Cmd::Call(CallCmd::Start { to: "bob@localhost".into() })).unwrap();
+    a.unbounded_send(Cmd::Call(CallCmd::Start { to: "bob@localhost".into(), video: false })).unwrap();
     let call_state = |e: &Ev| match e {
         Ev::Call(CallEv::State { state, .. }) => Some(state.clone()),
         _ => None,
     };
     assert_eq!(wait(&mut b_rx, call_state), CallState::Incoming);
-    b.unbounded_send(Cmd::Call(CallCmd::Accept)).unwrap();
+    b.unbounded_send(Cmd::Call(CallCmd::Accept { video: false })).unwrap();
     for (name, rx) in [("alice", &mut a_rx), ("bob", &mut b_rx)] {
         let state = wait(rx, |e| match call_state(e) {
             Some(s @ (CallState::Active | CallState::Ended(_))) => Some(s),
