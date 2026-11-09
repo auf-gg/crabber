@@ -1,5 +1,6 @@
 //! OpenPGP for XEP-0027 (`jabber:x:encrypted` / `jabber:x:signed`) on top of rpgp.
 //! XEP-0027 carries ASCII armor without the BEGIN/END lines and headers.
+use crate::t;
 use pgp::composed::{
     ArmorOptions, Deserializable, DetachedSignature, EncryptionCaps, KeyType, Message, MessageBuilder, SecretKeyParamsBuilder, SignedPublicKey, SignedSecretKey,
     SubkeyParamsBuilder,
@@ -39,13 +40,13 @@ pub fn generate(user_id: &str) -> Result<SignedSecretKey, String> {
 }
 
 pub fn parse_secret(armored: &str) -> Result<SignedSecretKey, String> {
-    let (key, _) = SignedSecretKey::from_string(armored).map_err(|e| format!("не удалось прочитать закрытый ключ: {e}"))?;
+    let (key, _) = SignedSecretKey::from_string(armored).map_err(|e| t!("pgp.bad_secret", e = e))?;
     key.verify_bindings().map_err(err)?;
     Ok(key)
 }
 
 pub fn parse_public(armored: &str) -> Result<SignedPublicKey, String> {
-    let (key, _) = SignedPublicKey::from_string(armored).map_err(|e| format!("не удалось прочитать открытый ключ: {e}"))?;
+    let (key, _) = SignedPublicKey::from_string(armored).map_err(|e| t!("pgp.bad_public", e = e))?;
     key.verify_bindings().map_err(err)?;
     Ok(key)
 }
@@ -123,7 +124,7 @@ pub fn encrypt(text: &str, recipients: &[&SignedPublicKey]) -> Result<String, St
         }
     }
     if !any {
-        return Err("в ключе собеседника нет подключа для шифрования".into());
+        return Err(t!("pgp.no_subkey").into());
     }
     let armored = builder.to_armored_string(thread_rng(), ArmorOptions::default()).map_err(err)?;
     Ok(strip_armor(&armored))
@@ -131,13 +132,13 @@ pub fn encrypt(text: &str, recipients: &[&SignedPublicKey]) -> Result<String, St
 
 pub fn decrypt(payload: &str, secret: &SignedSecretKey) -> Result<String, String> {
     let armored = add_armor("MESSAGE", payload);
-    let (msg, _) = Message::from_string(&armored).map_err(|e| format!("неверное PGP-сообщение: {e}"))?;
-    let mut msg = msg.decrypt(&Password::empty(), secret).map_err(|e| format!("не удалось расшифровать: {e}"))?;
+    let (msg, _) = Message::from_string(&armored).map_err(|e| t!("pgp.bad_message", e = e))?;
+    let mut msg = msg.decrypt(&Password::empty(), secret).map_err(|e| t!("pgp.decrypt_failed", e = e))?;
     if msg.is_compressed() {
         msg = msg.decompress().map_err(err)?;
     }
     let data = msg.as_data_vec().map_err(err)?;
-    String::from_utf8(data).map_err(|_| "сообщение не в UTF-8".into())
+    String::from_utf8(data).map_err(|_| t!("pgp.not_utf8").into())
 }
 
 /// Detached signature of the presence status (announces our key to XEP-0027 clients).

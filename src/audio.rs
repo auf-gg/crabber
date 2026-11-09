@@ -1,5 +1,6 @@
 //! Call audio: microphone -> 8 kHz G.711 µ-law frames, and µ-law RTP payloads -> speaker.
 //! G.711 needs no native codec library and every WebRTC stack (Conversations, Dino) offers it.
+use crate::t;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -125,7 +126,7 @@ pub fn start(on_frame: impl Fn(Vec<u8>) + Send + 'static) -> Result<Audio, Strin
     std::thread::spawn(move || {
         let streams = (|| {
             let host = cpal::default_host();
-            let output = host.default_output_device().ok_or("нет устройства вывода звука")?;
+            let output = host.default_output_device().ok_or(t!("audio.no_output"))?;
             let out_cfg = output.default_output_config().map_err(|e| e.to_string())?;
             let out_rate = out_cfg.sample_rate();
             let playback = Arc::new(Mutex::new(Playback {
@@ -139,7 +140,7 @@ pub fn start(on_frame: impl Fn(Vec<u8>) + Send + 'static) -> Result<Audio, Strin
                 _ => build_output::<f32>(&output, out_cfg.config(), playback.clone()),
             }?;
 
-            let input = host.default_input_device().ok_or("нет микрофона")?;
+            let input = host.default_input_device().ok_or(t!("audio.no_mic"))?;
             let in_cfg = input.default_input_config().map_err(|e| e.to_string())?;
             let in_stream = match in_cfg.sample_format() {
                 SampleFormat::I16 => build_input::<i16>(&input, in_cfg.config(), m, on_frame),
@@ -161,7 +162,7 @@ pub fn start(on_frame: impl Fn(Vec<u8>) + Send + 'static) -> Result<Audio, Strin
             }
         }
     });
-    let playback = init_rx.recv().map_err(|_| "аудиопоток завершился".to_string())??;
+    let playback = init_rx.recv().map_err(|_| t!("audio.stream_ended").to_string())??;
     Ok(Audio { muted, playback, stop: stop_tx })
 }
 
@@ -173,7 +174,7 @@ pub fn tone(incoming: bool) -> Tone {
     let (tx, rx) = std::sync::mpsc::channel::<()>();
     std::thread::spawn(move || {
         let res = (|| {
-            let output = cpal::default_host().default_output_device().ok_or("нет устройства вывода звука")?;
+            let output = cpal::default_host().default_output_device().ok_or(t!("audio.no_output"))?;
             let cfg = output.default_output_config().map_err(|e| e.to_string())?;
             let stream = match cfg.sample_format() {
                 SampleFormat::I16 => build_tone::<i16>(&output, cfg.config(), incoming),

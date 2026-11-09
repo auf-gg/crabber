@@ -2,6 +2,7 @@
 //!
 //! One loop owns the `Client`. Background tasks (uploads, MAM paging, vCards) never touch it
 //! directly; they go through `Net`, which queues stanzas and IQs back into that loop.
+use crate::t;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -236,13 +237,13 @@ impl Net {
     }
     pub async fn iq(&self, to: Option<Jid>, req: IqRequest) -> Result<Option<Element>, String> {
         let (tx, rx) = oneshot::channel();
-        self.out.unbounded_send(Out::Iq(to, req, tx)).map_err(|_| "нет соединения".to_string())?;
-        let token = rx.await.map_err(|_| "нет соединения".to_string())?;
+        self.out.unbounded_send(Out::Iq(to, req, tx)).map_err(|_| t!("err.no_connection").to_string())?;
+        let token = rx.await.map_err(|_| t!("err.no_connection").to_string())?;
         match tokio::time::timeout(Duration::from_secs(30), token).await {
             Ok(Ok(IqResponse::Result(el))) => Ok(el),
             Ok(Ok(IqResponse::Error(e))) => Err(format!("{:?}", e.defined_condition)),
             Ok(Err(e)) => Err(e.to_string()),
-            Err(_) => Err("таймаут".into()),
+            Err(_) => Err(t!("err.timeout").into()),
         }
     }
 }
@@ -314,7 +315,7 @@ async fn run(acc: Account, mut cmds: UnboundedReceiver<Cmd>, ev: UnboundedSender
             *st.pgp_presence.lock().unwrap() = e.pgp_secret.as_ref().and_then(|k| pgp::sign_status("", k).ok());
             st.e2e = Some(std::sync::Arc::new(tokio::sync::Mutex::new(e)));
         }
-        Err(e) => st.net.emit(Ev::Error(format!("OMEMO недоступен: {e}"))),
+        Err(e) => st.net.emit(Ev::Error(t!("err.omemo_unavailable", e = e))),
     }
 
     // XEP-0410: check now and then that we are still in our rooms.
@@ -525,7 +526,7 @@ impl State {
                         .append(Element::builder("moderate", "urn:xmpp:message-moderate:0").append(Element::builder("retract", "urn:xmpp:message-retract:0")))
                         .build();
                     if let Err(e) = net.iq(Some(to), IqRequest::Set(v0)).await {
-                        net.emit(Ev::Error(format!("Не удалось удалить сообщение: {e}")));
+                        net.emit(Ev::Error(t!("err.retract_failed", e = e)));
                     }
                 });
             }
@@ -542,10 +543,10 @@ impl State {
                 tokio::spawn(async move {
                     if let Err(e) = net.iq(Some(to), IqRequest::Set(req)).await {
                         let why = match e.as_str() {
-                            "NotAllowed" | "Forbidden" => "недостаточно прав".to_string(),
+                            "NotAllowed" | "Forbidden" => t!("err.forbidden").to_string(),
                             _ => e,
                         };
-                        net.emit(Ev::Error(format!("Не удалось выполнить действие в группе: {why}")));
+                        net.emit(Ev::Error(t!("err.muc_admin_failed", why = why)));
                     }
                 });
             }
@@ -558,7 +559,7 @@ impl State {
                 let net = self.net.clone();
                 tokio::spawn(async move {
                     if let Err(e) = net.iq(None, IqRequest::Set(req)).await {
-                        net.emit(Ev::Error(format!("Не удалось изменить блокировку: {e}")));
+                        net.emit(Ev::Error(t!("err.block_failed", e = e)));
                     }
                 });
             }
@@ -646,11 +647,11 @@ impl State {
                         };
                         let resp = http.get(&fetch).send().await.map_err(|e| e.to_string())?.error_for_status().map_err(|e| e.to_string())?;
                         if resp.content_length().is_some_and(|n| n > MAX) {
-                            return Err("файл больше 100 МБ".to_string());
+                            return Err(t!("err.file_too_big").to_string());
                         }
                         let bytes = resp.bytes().await.map_err(|e| e.to_string())?;
                         if bytes.len() as u64 > MAX {
-                            return Err("файл больше 100 МБ".to_string());
+                            return Err(t!("err.file_too_big").to_string());
                         }
                         match fragment {
                             Some(f) => omemo::decrypt_file(&bytes, &f).map(bytes::Bytes::from),
@@ -691,7 +692,7 @@ impl State {
                 let net = self.net.clone();
                 tokio::spawn(async move {
                     if let Err(e) = net.iq(None, IqRequest::Set(Roster { ver: None, items: vec![item] }.into())).await {
-                        net.emit(Ev::Error(format!("Не удалось добавить контакт: {e}")));
+                        net.emit(Ev::Error(t!("err.add_contact_failed", e = e)));
                     }
                     net.send(Presence::subscribe().with_to(to));
                 });
@@ -772,7 +773,7 @@ impl State {
                             let _ = tokio::fs::write(store::avatar_path(&dir, &me), data).await;
                             net.emit(Ev::Avatar { jid: me });
                         }
-                        Err(e) => net.emit(Ev::Error(format!("Не удалось сменить аватар: {e}"))),
+                        Err(e) => net.emit(Ev::Error(t!("err.avatar_failed", e = e))),
                     }
                 });
             }
@@ -799,7 +800,7 @@ impl State {
                     let key = match cmd_kind {
                         Ok(None) => match pgp::generate(&format!("<xmpp:{me}>")) {
                             Ok(k) => Some(k),
-                            Err(e) => return net.emit(Ev::Error(format!("Не удалось создать ключ: {e}"))),
+                            Err(e) => return net.emit(Ev::Error(t!("err.pgp_generate_failed", e = e))),
                         },
                         Ok(Some(armored)) => match pgp::parse_secret(&armored) {
                             Ok(k) => Some(k),
@@ -1005,7 +1006,7 @@ impl State {
                     .iter()
                     .find_map(|e| StanzaError::try_from(e.clone()).ok())
                     .map(|e| format!("{:?}", e.defined_condition))
-                    .unwrap_or_else(|| "ошибка".into());
+                    .unwrap_or_else(|| t!("err.generic").into());
                 self.rooms.remove(&bare);
                 self.net.emit(Ev::RoomError { room: bare.to_string(), error });
                 return;
@@ -1016,13 +1017,13 @@ impl State {
             let gone = p.type_ == PresenceType::Unavailable;
             if statuses.contains(&MucStatus::SelfPresence) && gone && !statuses.contains(&MucStatus::NewNick) {
                 let reason = if statuses.contains(&MucStatus::Banned) {
-                    "вас заблокировали в группе"
+                    t!("room.banned")
                 } else if statuses.contains(&MucStatus::Kicked) {
-                    "вас исключили из группы"
+                    t!("room.kicked")
                 } else if statuses.contains(&MucStatus::ServiceShutdown) {
-                    "сервер групп выключается"
+                    t!("room.shutdown")
                 } else {
-                    "вы больше не участник группы"
+                    t!("room.left")
                 };
                 self.rooms.remove(&bare);
                 self.net.emit(Ev::RoomRemoved { room: bare.to_string(), reason: reason.into() });
@@ -1053,7 +1054,7 @@ impl State {
                 tokio::spawn(async move {
                     let form = room_config_form(&name);
                     if let Err(e) = net.iq(Some(to.into()), IqRequest::Set(form)).await {
-                        net.emit(Ev::Error(format!("Не удалось настроить группу: {e}")));
+                        net.emit(Ev::Error(t!("err.room_config_failed", e = e)));
                     }
                 });
             }
@@ -1156,7 +1157,7 @@ impl State {
                     .find_map(|p| StanzaError::try_from(p.clone()).ok())
                     .map(|e| format!("{:?}{}", e.defined_condition, e.texts.values().next().map(|t| format!(": {t}")).unwrap_or_default()))
                     .unwrap_or_default();
-                self.net.emit(Ev::SendFailed { peer: f.to_bare().to_string(), id: id.0.clone(), error: format!("сервер отклонил сообщение {reason}") });
+                self.net.emit(Ev::SendFailed { peer: f.to_bare().to_string(), id: id.0.clone(), error: t!("err.server_rejected", reason = reason) });
             }
             return;
         }
@@ -1303,8 +1304,8 @@ impl State {
                 let (text, enc) = match e2e::decrypt(&e2e, &net, &sender, &el).await {
                     Ok(Some(text)) => (text, 1),
                     Ok(None) => return, // key transport / session completion
-                    Err(e) if e == e2e::NOT_FOR_THIS_DEVICE => ("🔒 Сообщение зашифровано для другого устройства — здесь его не прочитать".to_string(), 3),
-                    Err(e) => (format!("🔒 Не удалось расшифровать сообщение OMEMO: {e}"), 3),
+                    Err(e) if e == e2e::NOT_FOR_THIS_DEVICE => (t!("enc.other_device").to_string(), 3),
+                    Err(e) => (t!("enc.omemo_failed", e = e), 3),
                 };
                 let mut plain = m;
                 plain.bodies.clear();
@@ -1323,11 +1324,11 @@ impl State {
             tokio::spawn(async move {
                 let res = match e2e.lock().await.pgp_secret.clone() {
                     Some(key) => tokio::task::spawn_blocking(move || pgp::decrypt(&payload, &key)).await.unwrap_or_else(|e| Err(e.to_string())),
-                    None => Err("нет вашего ключа OpenPGP — добавьте его в настройках".into()),
+                    None => Err(t!("enc.no_own_pgp").into()),
                 };
                 let (text, enc) = match res {
                     Ok(t) => (t, 2),
-                    Err(e) => (format!("🔒 Не удалось расшифровать сообщение OpenPGP: {e}"), 3),
+                    Err(e) => (t!("enc.pgp_failed", e = e), 3),
                 };
                 let mut plain = m;
                 plain.bodies.clear();
@@ -1346,7 +1347,7 @@ impl State {
         if enc == 0
             && let Some(ns) = m.payloads.iter().find(|p| p.is("encryption", e2e::NS_EME)).and_then(|p| p.attr("namespace"))
         {
-            body = format!("🔒 Сообщение зашифровано ({}) — этот протокол не поддерживается", e2e::eme_name(ns));
+            body = t!("enc.unsupported", protocol = e2e::eme_name(ns));
         }
         let mut url = m.payloads.iter().find_map(|p| Oob::try_from(p.clone()).ok()).map(|o| o.url);
         if url.is_none() && body.starts_with("aesgcm://") && !body.contains(char::is_whitespace) {
@@ -1423,8 +1424,8 @@ fn encrypted_message(to: &str, id: &str, encrypted: Element) -> Message {
 async fn pgp_encrypt(e2e: &e2e::Shared, to: &str, body: &str) -> Result<String, String> {
     let (theirs, ours) = {
         let e = e2e.lock().await;
-        let ours = e.pgp_secret.as_ref().map(pgp::public_of).ok_or("сначала создайте или импортируйте свой ключ OpenPGP в настройках")?;
-        (e.pgp_contact(to).ok_or("нет открытого ключа собеседника — импортируйте его в настройках шифрования чата")?, ours)
+        let ours = e.pgp_secret.as_ref().map(pgp::public_of).ok_or(t!("enc.need_own_pgp"))?;
+        (e.pgp_contact(to).ok_or(t!("enc.need_peer_pgp"))?, ours)
     };
     let body = body.to_string();
     tokio::task::spawn_blocking(move || pgp::encrypt(&body, &[&theirs, &ours])).await.map_err(|e| e.to_string())?
@@ -1441,7 +1442,7 @@ fn pgp_message(to: &str, id: &str, payload: String) -> Message {
 async fn encrypt_for(e2e: &e2e::Shared, net: &Net, to: &str, enc: &str, body: &str) -> Result<Option<Element>, String> {
     let want = match enc {
         "omemo" => true,
-        "pgp" => return Err("XEP-0027 не поддерживает файлы — переключите чат на OMEMO, чтобы отправлять их зашифрованными".into()),
+        "pgp" => return Err(t!("enc.pgp_no_files").into()),
         _ => e2e::has_devices(e2e, net, to).await,
     };
     if !want {
@@ -1636,7 +1637,7 @@ fn mime(path: &std::path::Path) -> &'static str {
 }
 
 async fn upload_file(net: &Net, http: &reqwest::Client, upload_service: Arc<Mutex<Option<Jid>>>, path: &std::path::Path) -> Result<String, String> {
-    let service = upload_service.lock().unwrap().clone().ok_or("сервер не поддерживает загрузку файлов")?;
+    let service = upload_service.lock().unwrap().clone().ok_or(t!("upload.unsupported"))?;
     drop(service);
     // shortcut: the whole file is read into memory; switch to a streamed body for multi-GB uploads.
     let data = tokio::fs::read(path).await.map_err(|e| e.to_string())?;
@@ -1645,9 +1646,9 @@ async fn upload_file(net: &Net, http: &reqwest::Client, upload_service: Arc<Mute
 }
 
 async fn upload_bytes(net: &Net, http: &reqwest::Client, service: Arc<Mutex<Option<Jid>>>, data: Vec<u8>, filename: String, content_type: &str) -> Result<String, String> {
-    let service = service.lock().unwrap().clone().ok_or("сервер не поддерживает загрузку файлов")?;
+    let service = service.lock().unwrap().clone().ok_or(t!("upload.unsupported"))?;
     let req = SlotRequest { filename, size: data.len() as u64, content_type: Some(content_type.into()) };
-    let slot = net.iq(Some(service), IqRequest::Get(req.into())).await?.ok_or("пустой ответ")?;
+    let slot = net.iq(Some(service), IqRequest::Get(req.into())).await?.ok_or(t!("err.empty_response"))?;
     let slot = SlotResult::try_from(slot).map_err(|e| e.to_string())?;
     let mut put = http.put(&slot.put.url).header("Content-Type", content_type).body(data);
     for Header { name, value } in slot.put.headers {

@@ -1,5 +1,6 @@
 //! End-to-end encryption manager on the network thread: OMEMO key storage, PEP publishing
 //! (device list + bundle) and turning plaintext into `<encrypted/>` and back.
+use crate::t;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::str::FromStr;
@@ -199,7 +200,7 @@ pub fn bundle_element(b: &Bundle) -> Element {
 }
 
 pub fn parse_bundle(el: &Element) -> Result<Bundle, String> {
-    let child = |name: &str| el.get_child(name, NS).ok_or(format!("в бандле нет {name}"));
+    let child = |name: &str| el.get_child(name, NS).ok_or(t!("e2e.bundle_missing", name = name));
     let spk = child("signedPreKeyPublic")?;
     let prekeys = child("prekeys")?
         .children()
@@ -281,7 +282,7 @@ pub async fn on_online(shared: Shared, net: Net) {
         (e.me.bundle(), e.my_jid.clone(), e.me.device_id)
     };
     if let Err(err) = publish(&net, &node_bundle(my_id), bundle_element(&bundle)).await {
-        net.emit(crate::xmpp::Ev::Error(format!("OMEMO: не удалось опубликовать ключи: {err}")));
+        net.emit(crate::xmpp::Ev::Error(t!("e2e.publish_failed", err = err)));
     }
     let mut ids = match fetch_item(&net, &my_jid, NODE_DEVICES).await {
         Some(list) => parse_devicelist(&list),
@@ -342,7 +343,7 @@ pub async fn encrypt(shared: &Shared, net: &Net, to: &str, plaintext: &str) -> R
     };
     let theirs = device_list(shared, net, to).await;
     if theirs.is_empty() {
-        return Err("у собеседника нет устройств с OMEMO".into());
+        return Err(t!("e2e.err_no_devices").into());
     }
     let mine: Vec<u32> = device_list(shared, net, &my_jid).await.into_iter().filter(|d| *d != my_id).collect();
     let targets: Vec<(String, u32)> = theirs.into_iter().map(|d| (to.to_string(), d)).chain(mine.into_iter().map(|d| (my_jid.clone(), d))).collect();
@@ -385,7 +386,7 @@ pub async fn encrypt(shared: &Shared, net: &Net, to: &str, plaintext: &str) -> R
         }
     }
     if for_peer == 0 {
-        return Err("нет доверенных устройств собеседника с OMEMO".into());
+        return Err(t!("e2e.err_no_trusted").into());
     }
     header = header.append(Element::builder("iv", NS).append(b64(&payload.iv)));
     Ok(Element::builder("encrypted", NS).append(header).append(Element::builder("payload", NS).append(b64(&payload.ciphertext))).build())
@@ -393,9 +394,9 @@ pub async fn encrypt(shared: &Shared, net: &Net, to: &str, plaintext: &str) -> R
 
 /// Decrypts an `<encrypted/>` from `from` (bare JID). `Ok(None)`: key-transport element, nothing to show.
 pub async fn decrypt(shared: &Shared, net: &Net, from: &str, enc: &Element) -> Result<Option<String>, String> {
-    let header = enc.get_child("header", NS).ok_or("нет заголовка OMEMO")?;
-    let sid: u32 = header.attr("sid").and_then(|v| v.parse().ok()).ok_or("нет id устройства отправителя")?;
-    let iv = unb64(&header.get_child("iv", NS).ok_or("нет IV")?.text())?;
+    let header = enc.get_child("header", NS).ok_or(t!("e2e.err_no_header"))?;
+    let sid: u32 = header.attr("sid").and_then(|v| v.parse().ok()).ok_or(t!("e2e.err_no_sid"))?;
+    let iv = unb64(&header.get_child("iv", NS).ok_or(t!("e2e.err_no_iv"))?.text())?;
     let mut e = shared.lock().await;
     let my_id = e.me.device_id;
     let key = header
@@ -408,7 +409,7 @@ pub async fn decrypt(shared: &Shared, net: &Net, from: &str, enc: &Element) -> R
     let me = e.me.clone();
     let d = omemo::decrypt_key(&me, existing.as_ref(), &data, prekey)?;
     if !e.check_identity(from, sid, &d.session.their_identity) {
-        return Err("ключ устройства собеседника изменился — подтвердите его в настройках шифрования чата".into());
+        return Err(t!("e2e.err_key_changed").into());
     }
     e.put_session(from, sid, d.session);
     if let Some(id) = d.used_prekey {
@@ -435,6 +436,6 @@ pub fn eme_name(ns: &str) -> &str {
         "urn:xmpp:openpgp:0" => "OpenPGP for XMPP (OX)",
         "jabber:x:encrypted" => "OpenPGP",
         "urn:xmpp:otr:0" => "OTR",
-        _ => "неизвестный протокол",
+        _ => t!("e2e.unknown_protocol"),
     }
 }

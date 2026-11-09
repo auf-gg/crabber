@@ -97,7 +97,7 @@ mod imp {
     impl Tray {
         pub fn set_unread(&mut self, unread: u32) {
             let badge = unread > 0;
-            let tip = if badge { format!("Crabber — непрочитанных: {unread}") } else { "Crabber".into() };
+            let tip = if badge { crabber::t!("tray.unread", unread = unread) } else { "Crabber".into() };
             let _ = self.icon.set_tooltip(Some(tip));
             if badge != self.badge {
                 self.badge = badge;
@@ -192,8 +192,8 @@ mod imp {
         }
 
         let menu = Menu::new();
-        let open = MenuItem::new("Открыть", true, None);
-        let quit = MenuItem::new("Выход", true, None);
+        let open = MenuItem::new(crabber::t!("action.open"), true, None);
+        let quit = MenuItem::new(crabber::t!("tray.quit"), true, None);
         let _ = menu.append_items(&[&open, &PredefinedMenuItem::separator(), &quit]);
         let (open_id, quit_id) = (open.id().clone(), quit.id().clone());
         let menu_tx = tx.clone();
@@ -266,10 +266,12 @@ mod imp {
             .unwrap_or_default();
         let body: String = body.chars().take(300).collect();
         let xml = format!(
-            r#"<toast launch="open:{peer}"><visual><binding template="ToastGeneric"><text>{title}</text><text>{body}</text>{image}</binding></visual><actions><input id="reply" type="text" placeHolderContent="Ответить..."/><action content="Отправить" arguments="reply:{peer}" hint-inputId="reply" activationType="foreground"/></actions></toast>"#,
+            r#"<toast launch="open:{peer}"><visual><binding template="ToastGeneric"><text>{title}</text><text>{body}</text>{image}</binding></visual><actions><input id="reply" type="text" placeHolderContent="{reply}"/><action content="{send}" arguments="reply:{peer}" hint-inputId="reply" activationType="foreground"/></actions></toast>"#,
             peer = esc(peer),
             title = esc(title),
             body = esc(&body),
+            reply = esc(crabber::t!("toast.reply")),
+            send = esc(crabber::t!("toast.send")),
         );
         let show = || -> windows::core::Result<()> {
             let doc = XmlDocument::new()?;
@@ -376,7 +378,7 @@ mod imp {
             vec![ksni::Icon { width: 32, height: 32, data }]
         }
         fn tool_tip(&self) -> ksni::ToolTip {
-            let title = if self.unread > 0 { format!("Crabber — непрочитанных: {}", self.unread) } else { "Crabber".into() };
+            let title = if self.unread > 0 { crabber::t!("tray.unread", unread = self.unread) } else { "Crabber".into() };
             ksni::ToolTip { title, ..Default::default() }
         }
         fn activate(&mut self, _: i32, _: i32) {
@@ -385,9 +387,9 @@ mod imp {
         fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
             use ksni::menu::StandardItem;
             vec![
-                StandardItem { label: "Открыть".into(), activate: Box::new(|_| send(DesktopEvent::Show)), ..Default::default() }.into(),
+                StandardItem { label: crabber::t!("action.open").into(), activate: Box::new(|_| send(DesktopEvent::Show)), ..Default::default() }.into(),
                 ksni::MenuItem::Separator,
-                StandardItem { label: "Выход".into(), activate: Box::new(|_| send(DesktopEvent::Quit)), ..Default::default() }.into(),
+                StandardItem { label: crabber::t!("tray.quit").into(), activate: Box::new(|_| send(DesktopEvent::Quit)), ..Default::default() }.into(),
             ]
         }
     }
@@ -452,7 +454,7 @@ mod imp {
                 .summary(&title)
                 .body(&body)
                 .icon(&icon)
-                .action("default", "Открыть")
+                .action("default", crabber::t!("action.open"))
                 .show();
             match shown {
                 Ok(handle) => handle.wait_for_action(|action| {

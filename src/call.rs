@@ -1,6 +1,7 @@
 //! Audio calls: XEP-0353 (Jingle Message Initiation) for ringing, XEP-0166/0167/0176/0320
 //! (Jingle RTP over ICE-UDP with DTLS-SRTP) for the session, webrtc-rs for the media stack.
 //! Signalling is translated between Jingle XML and the SDP that webrtc-rs speaks.
+use crate::t;
 use std::collections::BTreeMap;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
@@ -215,7 +216,7 @@ impl Actor {
                     RTCPeerConnectionState::Connected => self.set_state(CallState::Active),
                     RTCPeerConnectionState::Failed => {
                         self.terminate("failed-transport").await;
-                        self.end("не удалось установить соединение").await;
+                        self.end(t!("call.reason_connect_failed")).await;
                     }
                     _ => {}
                 }
@@ -236,7 +237,7 @@ impl Actor {
             Msg::Timeout(sid) => {
                 if let Some(c) = self.call.as_ref().filter(|c| c.sid == sid && c.state == CallState::Outgoing) {
                     self.net.send(chat_with(c.peer_bare.clone().into(), jmi("retract", &sid)));
-                    self.end("нет ответа").await;
+                    self.end(t!("call.reason_no_answer")).await;
                 }
             }
         }
@@ -337,13 +338,13 @@ impl Actor {
                 }
                 self.start_call(sid, from.to_bare(), Some(from), false, CallState::Incoming);
             }
-            "retract" if self.call.as_ref().is_some_and(|c| c.sid == sid) => self.end("звонящий отменил вызов").await,
+            "retract" if self.call.as_ref().is_some_and(|c| c.sid == sid) => self.end(t!("call.reason_retracted")).await,
             "reject" if self.call.as_ref().is_some_and(|c| c.sid == sid) => {
-                let reason = if from_self { "отклонён на другом устройстве" } else { "собеседник отклонил вызов" };
+                let reason = if from_self { t!("call.reason_rejected_elsewhere") } else { t!("call.reason_declined") };
                 self.end(reason).await;
             }
             "accept" if from_self && self.call.as_ref().is_some_and(|c| c.sid == sid && c.state == CallState::Incoming) => {
-                self.end("принят на другом устройстве").await;
+                self.end(t!("call.reason_accepted_elsewhere")).await;
             }
             "proceed" if !from_self => {
                 let Some(c) = self.call.as_mut().filter(|c| c.sid == sid && c.state == CallState::Outgoing) else { return };
@@ -389,7 +390,7 @@ impl Actor {
                     true => self.flush_candidates(&pc).await,
                     false => {
                         self.terminate("failed-application").await;
-                        self.end("несовместимые параметры звонка").await;
+                        self.end(t!("call.reason_incompatible")).await;
                     }
                 }
             }
@@ -426,10 +427,10 @@ impl Actor {
                     .map(|c| c.name().to_string())
                     .unwrap_or_default();
                 let text = match why.as_str() {
-                    "busy" => "собеседник занят",
-                    "decline" => "собеседник отклонил вызов",
+                    "busy" => t!("call.reason_busy"),
+                    "decline" => t!("call.reason_declined"),
                     "success" | "" => "",
-                    _ => "соединение прервано",
+                    _ => t!("call.reason_dropped"),
                 };
                 self.end(text).await;
             }
@@ -473,7 +474,7 @@ impl Actor {
 
     /// Builds the peer connection, local audio track and audio devices.
     async fn setup_pc(&mut self) -> Result<Arc<dyn PeerConnection>, String> {
-        let sid = self.call.as_ref().ok_or("нет звонка")?.sid.clone();
+        let sid = self.call.as_ref().ok_or(t!("call.err_no_call"))?.sid.clone();
         let ice_servers = ice_servers(&self.net, self.me.domain().as_str()).await;
 
         let mut media = MediaEngine::default();
@@ -533,7 +534,7 @@ impl Actor {
                 let _ = track.write_sample(ssrc, 0, &sample, &[]).await;
             }
         });
-        let c = self.call.as_mut().ok_or("нет звонка")?;
+        let c = self.call.as_mut().ok_or(t!("call.err_no_call"))?;
         c.audio = Some(Arc::new(audio));
         c.pc = Some(pc.clone());
         Ok(pc)
@@ -547,7 +548,7 @@ impl Actor {
         let res = async {
             let offer = pc.create_offer(None).await.map_err(|e| e.to_string())?;
             pc.set_local_description(offer).await.map_err(|e| e.to_string())?;
-            pc.local_description().await.ok_or("нет SDP".to_string())
+            pc.local_description().await.ok_or(t!("call.err_no_sdp").to_string())
         }
         .await;
         match res {
@@ -571,7 +572,7 @@ impl Actor {
             pc.set_remote_description(desc).await.map_err(|e| e.to_string())?;
             let answer = pc.create_answer(None).await.map_err(|e| e.to_string())?;
             pc.set_local_description(answer).await.map_err(|e| e.to_string())?;
-            pc.local_description().await.ok_or("нет SDP".to_string())
+            pc.local_description().await.ok_or(t!("call.err_no_sdp").to_string())
         }
         .await;
         match res {
@@ -602,7 +603,7 @@ impl Actor {
 
     async fn fail(&mut self, error: &str) {
         self.terminate("failed-application").await;
-        self.end(&format!("ошибка: {error}")).await;
+        self.end(&t!("call.reason_error", error = error)).await;
     }
 }
 

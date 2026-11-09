@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use crate::t;
 use std::process::Command;
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -98,7 +99,7 @@ pub fn install(rel: &Release, portable: bool, progress: &AtomicU32) -> Result<()
     let ok = hidden("tar").arg("-xf").arg(&file).arg("-C").arg(&dir).status().is_ok_and(|s| s.success());
     let new = dir.join(format!("crabber-{}-{}-windows-portable", rel.version, std::env::consts::ARCH)).join("crabber.exe");
     if !ok || !new.is_file() {
-        return Err("не удалось распаковать архив".into());
+        return Err(t!("update.unpack_failed").into());
     }
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let old = old_exe(&exe);

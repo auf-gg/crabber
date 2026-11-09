@@ -1,4 +1,5 @@
 //! Rendering. Telegram-like layout: chat list on the left, conversation on the right.
+use crabber::t;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -35,10 +36,15 @@ fn dp(x: f32) -> Rems {
     rems(x / 16.)
 }
 
-const MONTHS: [&str; 12] = ["января", "февраля", "марта", "апреля", "мая", "июня", "июля", "августа", "сентября", "октября", "ноября", "декабря"];
-
 /// The scheme editor's editable colors, in `App::color_pickers` order.
-const COLOR_FIELDS: [&str; 6] = ["Акцент", "Панель", "Фон чата", "Входящие", "Исходящие", "Текст"];
+fn color_fields() -> [&'static str; 6] {
+    [t!("colors.accent"), t!("colors.panel"), t!("colors.chat"), t!("colors.bubble_in"), t!("colors.bubble_out"), t!("colors.text")]
+}
+
+/// Month name in the date form `date.day_month` expects.
+fn month_name(m0: u32) -> &'static str {
+    t!("date.months").split(',').nth(m0 as usize).unwrap_or_default()
+}
 
 fn local(ts: i64) -> chrono::DateTime<Local> {
     Local.timestamp_millis_opt(ts).single().unwrap_or_else(Local::now)
@@ -53,13 +59,13 @@ fn day_label(ts: i64) -> String {
     let t = local(ts);
     let today = Local::now().date_naive();
     if t.date_naive() == today {
-        "Сегодня".into()
+        t!("date.today").into()
     } else if Some(t.date_naive()) == today.pred_opt() {
-        "Вчера".into()
+        t!("date.yesterday").into()
     } else if t.year() == Local::now().year() {
-        format!("{} {}", t.day(), MONTHS[t.month0() as usize])
+        t!("date.day_month", day = t.day(), month = month_name(t.month0()))
     } else {
-        format!("{} {} {}", t.day(), MONTHS[t.month0() as usize], t.year())
+        t!("date.day_month_year", day = t.day(), month = month_name(t.month0()), year = t.year())
     }
 }
 
@@ -449,9 +455,9 @@ fn code_bg() -> Hsla {
 
 fn human_size(n: u64) -> String {
     match n {
-        n if n >= 1 << 20 => format!("{:.1} МБ", n as f64 / (1 << 20) as f64),
-        n if n >= 1 << 10 => format!("{:.0} КБ", n as f64 / (1 << 10) as f64),
-        n => format!("{n} Б"),
+        n if n >= 1 << 20 => t!("unit.mb", n = format!("{:.1}", n as f64 / (1 << 20) as f64)),
+        n if n >= 1 << 10 => t!("unit.kb", n = format!("{:.0}", n as f64 / (1 << 10) as f64)),
+        n => t!("unit.b", n = n),
     }
 }
 
@@ -474,13 +480,13 @@ fn icon_box(icon: IconName, size: f32) -> Div {
 fn preview(c: &ChatRow) -> String {
     let Some(m) = &c.last else { return String::new() };
     let text = if m.retracted {
-        "Сообщение удалено".to_string()
+        t!("msg.deleted").to_string()
     } else if m.url.is_some() {
-        if is_image(&m.body) { "Фото".to_string() } else if is_video(&m.body) { "Видео".to_string() } else if is_audio(&m.body) { "Голосовое сообщение".to_string() } else { "Файл".to_string() }
+        if is_image(&m.body) { t!("media.photo").to_string() } else if is_video(&m.body) { t!("media.video").to_string() } else if is_audio(&m.body) { t!("media.voice").to_string() } else { t!("media.file").to_string() }
     } else {
         m.body.replace("```", " ").split_whitespace().collect::<Vec<_>>().join(" ")
     };
-    let prefix = if is_call(m) { String::new() } else if m.outgoing { "Вы: ".to_string() } else if c.is_room { format!("{}: ", m.sender) } else { String::new() };
+    let prefix = if is_call(m) { String::new() } else if m.outgoing { format!("{}: ", t!("msg.you")) } else if c.is_room { format!("{}: ", m.sender) } else { String::new() };
     let full = prefix + &text;
     full.chars().take(60).collect()
 }
@@ -595,7 +601,7 @@ impl App {
                     .when(unread > 0, |d| {
                         d.child(div().px_1p5().h(dp(18.)).rounded_full().flex().items_center().bg(p.accent).text_color(white()).text_xs().font_weight(FontWeight::SEMIBOLD).child(unread.to_string()))
                     })
-                    .when(offline, |d| d.child(div().text_xs().text_color(p.muted).child("· соединение...")))
+                    .when(offline, |d| d.child(div().text_xs().text_color(p.muted).child(t!("titlebar.connecting"))))
                     .when(self.settings.ui_scale != 1.0, |d| d.child(div().text_xs().text_color(p.muted).child(format!("· {:.0}%", self.settings.ui_scale * 100.)))),
             )
             .child(control("win-min", line(10., 1.).into_any_element(), WindowControlArea::Min, false))
@@ -626,14 +632,14 @@ impl App {
                         .pb_2()
                         .child(img(self.logo.clone()).size(dp(88.)))
                         .child(div().text_2xl().font_weight(FontWeight::BOLD).child("Crabber"))
-                        .child(div().text_sm().text_color(p.muted).child("Вход в XMPP-аккаунт")),
+                        .child(div().text_sm().text_color(p.muted).child(t!("login.subtitle"))),
                 )
                 .child(Input::new(&self.login_jid))
                 .child(Input::new(&self.login_pass).mask_toggle())
                 .child(Input::new(&self.login_host))
                 .child(
                     Checkbox::new("insecure")
-                        .label("Доверять самоподписанному сертификату")
+                        .label(t!("login.insecure"))
                         .checked(self.insecure)
                         .on_click(cx.listener(|this, v: &bool, _, cx| {
                             this.insecure = *v;
@@ -642,7 +648,7 @@ impl App {
                 )
                 .child(
                     Checkbox::new("remember")
-                        .label("Запомнить меня")
+                        .label(t!("login.remember"))
                         .checked(self.remember)
                         .on_click(cx.listener(|this, v: &bool, _, cx| {
                             this.remember = *v;
@@ -654,7 +660,7 @@ impl App {
                         .primary()
                         .large()
                         .w_full()
-                        .label("Войти")
+                        .label(t!("login.submit"))
                         .loading(self.connecting)
                         .on_click(cx.listener(|this, _, _, cx| this.login(cx))),
                 )
@@ -676,10 +682,10 @@ impl App {
         let sess = self.sess.as_ref().unwrap();
         let query = self.search.read(cx).value().to_lowercase();
         let (show_label, show_color) = match sess.show {
-            None => ("в сети", p.online),
-            Some(Show::Away) => ("отошёл", rgb(0xF5A623).into()),
-            Some(Show::Dnd) => ("не беспокоить", p.danger),
-            _ => ("в сети", p.online),
+            None => (t!("status.online"), p.online),
+            Some(Show::Away) => (t!("status.away"), rgb(0xF5A623).into()),
+            Some(Show::Dnd) => (t!("status.dnd"), p.danger),
+            _ => (t!("status.online"), p.online),
         };
         let me_name = sess.localpart();
 
@@ -710,17 +716,17 @@ impl App {
                             .text_xs()
                             .text_color(p.muted)
                             .child(div().size(dp(8.)).rounded_full().bg(if sess.online { show_color } else { p.muted }))
-                            .child(if sess.online { show_label } else { "нет связи" })
+                            .child(if sess.online { show_label } else { t!("status.no_connection") })
                             .on_click(cx.listener(|this, _, _, cx| this.cycle_show(cx))),
                     ),
             )
             .child(
                 h_flex()
                     .gap_0p5()
-                    .child(Button::new("add-contact").ghost().small().icon(IconName::UserPlus).tooltip("Добавить контакт").on_click(cx.listener(|this, _, w, cx| this.open_modal(Modal::AddContact, w, cx))))
-                    .child(Button::new("new-group").ghost().small().icon(IconName::Users).tooltip("Новая группа").on_click(cx.listener(|this, _, w, cx| this.open_modal(Modal::NewGroup, w, cx))))
-                    .child(Button::new("join-group").ghost().small().icon(IconName::Hash).tooltip("Войти в группу по адресу").on_click(cx.listener(|this, _, w, cx| this.open_modal(Modal::JoinGroup, w, cx))))
-                    .child(Button::new("settings").ghost().small().icon(IconName::Settings).tooltip("Настройки").on_click(cx.listener(|this, _, _, cx| this.open_settings(cx)))),
+                    .child(Button::new("add-contact").ghost().small().icon(IconName::UserPlus).tooltip(t!("sidebar.add_contact")).on_click(cx.listener(|this, _, w, cx| this.open_modal(Modal::AddContact, w, cx))))
+                    .child(Button::new("new-group").ghost().small().icon(IconName::Users).tooltip(t!("group.new")).on_click(cx.listener(|this, _, w, cx| this.open_modal(Modal::NewGroup, w, cx))))
+                    .child(Button::new("join-group").ghost().small().icon(IconName::Hash).tooltip(t!("sidebar.join_group")).on_click(cx.listener(|this, _, w, cx| this.open_modal(Modal::JoinGroup, w, cx))))
+                    .child(Button::new("settings").ghost().small().icon(IconName::Settings).tooltip(t!("settings.title")).on_click(cx.listener(|this, _, _, cx| this.open_settings(cx)))),
             );
 
         let search = div().mx_3().mb_2().px_3().py_0p5().rounded_full().bg(p.field).child(
@@ -737,14 +743,14 @@ impl App {
                 .gap_2()
                 .rounded_xl()
                 .bg(p.accent_soft)
-                .child(div().text_sm().child(format!("{jid} хочет добавить вас в контакты")))
+                .child(div().text_sm().child(t!("request.text", jid = jid)))
                 .child(
                     h_flex()
                         .gap_2()
-                        .child(Button::new(SharedString::from(format!("acc-{jid}"))).primary().small().label("Принять").on_click(cx.listener(move |this, _, _, cx| this.answer_request(a.clone(), true, cx))))
-                        .child(Button::new(SharedString::from(format!("rej-{jid}"))).ghost().small().label("Отклонить").on_click(cx.listener(move |this, _, _, cx| this.answer_request(d.clone(), false, cx))))
+                        .child(Button::new(SharedString::from(format!("acc-{jid}"))).primary().small().label(t!("request.accept")).on_click(cx.listener(move |this, _, _, cx| this.answer_request(a.clone(), true, cx))))
+                        .child(Button::new(SharedString::from(format!("rej-{jid}"))).ghost().small().label(t!("request.decline")).on_click(cx.listener(move |this, _, _, cx| this.answer_request(d.clone(), false, cx))))
                         .when(can_block, |d| {
-                            d.child(Button::new(SharedString::from(format!("spam-{jid}"))).ghost().small().label("Спам").tooltip("Пожаловаться и заблокировать").on_click(cx.listener(move |this, _, _, cx| {
+                            d.child(Button::new(SharedString::from(format!("spam-{jid}"))).ghost().small().label(t!("profile.spam")).tooltip(t!("request.spam_tip")).on_click(cx.listener(move |this, _, _, cx| {
                                 this.answer_request(sp.clone(), false, cx);
                                 this.block(sp.clone(), true, true, cx);
                             })))
@@ -775,7 +781,7 @@ impl App {
                 let online = sess.presence.contains(&c.peer);
                 let typing = sess.typing.get(&c.peer).is_some_and(|(_, at)| at.elapsed().as_secs() < 30);
                 let peer = c.peer.clone();
-                let sub = if typing { "печатает...".to_string() } else { preview(c) };
+                let sub = if typing { t!("typing").to_string() } else { preview(c) };
                 let locked = c.last.as_ref().is_some_and(|m| m.enc > 0);
                 // The row is filled with the accent: its text must contrast with it (not always white).
                 let on_acc = style::on_color(p.accent);
@@ -849,7 +855,7 @@ impl App {
                 .child(
                     Button::new("scope-chat")
                         .small()
-                        .label(format!("В чате «{chat_name}»"))
+                        .label(t!("search.in_chat", chat = chat_name))
                         .when(!all, |b| b.primary())
                         .when(all, |b| b.ghost())
                         .on_click(cx.listener(|this, _, _, cx| this.set_search_all(false, cx))),
@@ -857,7 +863,7 @@ impl App {
                 .child(
                     Button::new("scope-all")
                         .small()
-                        .label("Во всех чатах")
+                        .label(t!("search.all_chats"))
                         .when(all, |b| b.primary())
                         .when(!all, |b| b.ghost())
                         .on_click(cx.listener(|this, _, _, cx| this.set_search_all(true, cx))),
@@ -866,7 +872,7 @@ impl App {
 
         let hits = (!self.search_results.is_empty()).then(|| {
             v_flex()
-                .child(div().px_4().pt_3().pb_1().text_xs().font_weight(FontWeight::SEMIBOLD).text_color(p.muted).child(if scoped { "В ЭТОМ ЧАТЕ" } else { "СООБЩЕНИЯ" }))
+                .child(div().px_4().pt_3().pb_1().text_xs().font_weight(FontWeight::SEMIBOLD).text_color(p.muted).child(if scoped { t!("search.this_chat_header") } else { t!("search.messages_header") }))
                 .children(self.search_results.iter().enumerate().map(|(i, (peer, m))| {
                     let name = sess.display_name(peer);
                     let (pr, id, ts) = (peer.clone(), m.msg_id.clone(), m.ts);
@@ -913,7 +919,7 @@ impl App {
                         .items_center()
                         .text_center()
                         .child(Icon::new(IconName::Users).size(dp(40.)).text_color(p.muted))
-                        .child(div().text_sm().text_color(p.muted).child("Пока нет чатов. Добавьте контакт или создайте группу.")),
+                        .child(div().text_sm().text_color(p.muted).child(t!("chats.empty"))),
                 )
             })
             .when_some(self.update.as_ref().filter(|_| !self.update_popup && self.update_hidden_until.is_none_or(|t| std::time::Instant::now() >= t)), |d, rel| {
@@ -934,8 +940,8 @@ impl App {
                             v_flex()
                                 .flex_1()
                                 .min_w_0()
-                                .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).child("Доступно обновление"))
-                                .child(div().text_xs().opacity(0.85).truncate().child(if self.updating { format!("Загрузка обновления... {}%", self.update_percent()) } else { format!("Версия {} · нажмите, чтобы обновить", rel.version) })),
+                                .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).child(t!("update.available")))
+                                .child(div().text_xs().opacity(0.85).truncate().child(if self.updating { t!("update.downloading_banner", percent = self.update_percent()) } else { t!("update.banner_version", version = rel.version) })),
                         )
                         .child(
                             div()
@@ -969,7 +975,7 @@ impl App {
                 .relative()
                 .bg(wallpaper)
                 .child(doodles(pattern))
-                .child(div().px_4().py_1p5().rounded_full().bg(p.chip).text_sm().text_color(p.chip_text).child("Выберите чат, чтобы начать общение"))
+                .child(div().px_4().py_1p5().rounded_full().bg(p.chip).text_sm().text_color(p.chip_text).child(t!("chat.select")))
                 .when(!sess.online, |d| d.child(div().px_3().py_1().rounded_full().bg(p.chip).text_xs().text_color(p.chip_text).child(sess.status.clone())))
                 .into_any_element();
         };
@@ -978,18 +984,18 @@ impl App {
         let typing = sess.typing.get(&peer).filter(|(_, at)| at.elapsed().as_secs() < 30).map(|(who, _)| who.clone());
         let online = sess.presence.contains(&peer);
         let (subtitle, highlight) = if let Some(who) = typing {
-            (if chat.is_room { format!("{who} печатает...") } else { "печатает...".into() }, true)
+            (if chat.is_room { t!("typing.who", who = who) } else { t!("typing").into() }, true)
         } else if chat.is_room {
             (match sess.occupants.get(&peer) {
-                Some(n) => format!("{n} в сети"),
-                None => "группа".into(),
+                Some(n) => t!("room.online", n = n),
+                None => t!("room.label").into(),
             }, false)
         } else if online {
-            ("в сети".into(), true)
+            (t!("status.online").into(), true)
         } else if chat.in_roster && (chat.subscription == "none" || chat.subscription == "from") {
-            ("ожидает подтверждения".into(), false)
+            (t!("status.pending").into(), false)
         } else {
-            ("не в сети".into(), false)
+            (t!("status.offline").into(), false)
         };
 
         let header = h_flex()
@@ -1029,7 +1035,7 @@ impl App {
                     Button::new("call")
                         .ghost()
                         .icon(IconName::Phone)
-                        .tooltip("Аудиозвонок")
+                        .tooltip(t!("chat.call"))
                         .disabled(sess.call.is_some() || !sess.online)
                         .on_click(cx.listener(move |this, _, _, cx| this.call(CallCmd::Start { to: to.clone() }, cx))),
                 )
@@ -1041,17 +1047,17 @@ impl App {
                     Button::new("e2e")
                         .ghost()
                         .icon(if secure || chat.enc == "pgp" { IconName::Lock } else { IconName::LockOpen })
-                        .tooltip("Шифрование")
+                        .tooltip(t!("e2e.title"))
                         .on_click(cx.listener(move |this, _, _, cx| this.open_encryption(pr.clone(), cx))),
                 )
             })
             .child({
                 let pr = peer.clone();
-                Button::new("media").ghost().icon(IconName::Image).tooltip("Медиа, файлы и ссылки").on_click(cx.listener(move |this, _, _, cx| this.open_media(pr.clone(), cx)))
+                Button::new("media").ghost().icon(IconName::Image).tooltip(t!("chat.media")).on_click(cx.listener(move |this, _, _, cx| this.open_media(pr.clone(), cx)))
             })
             .when(chat.is_room, |d| {
                 let room = peer.clone();
-                d.child(Button::new("invite").ghost().icon(IconName::UserPlus).tooltip("Пригласить").on_click(cx.listener(move |this, _, w, cx| this.open_modal(Modal::Invite { room: room.clone() }, w, cx))))
+                d.child(Button::new("invite").ghost().icon(IconName::UserPlus).tooltip(t!("chat.invite")).on_click(cx.listener(move |this, _, w, cx| this.open_modal(Modal::Invite { room: room.clone() }, w, cx))))
             });
 
         let is_room = chat.is_room;
@@ -1064,7 +1070,7 @@ impl App {
 
         let pending = (!sess.pending.is_empty()).then(|| {
             h_flex().flex_wrap().gap_2().px_4().pt_3().bg(p.panel).border_t_1().border_color(p.border).children(sess.pending.iter().enumerate().map(|(ix, f)| {
-                let name = f.file_name().and_then(|n| n.to_str()).unwrap_or("файл").to_string();
+                let name = f.file_name().and_then(|n| n.to_str()).unwrap_or(t!("media.file_fallback")).to_string();
                 let size = std::fs::metadata(f).map(|m| human_size(m.len())).unwrap_or_default();
                 let thumb = if is_image(&name) {
                     img(f.clone()).size(dp(48.)).rounded_lg().object_fit(ObjectFit::Cover).into_any_element()
@@ -1079,7 +1085,7 @@ impl App {
                     .bg(p.field)
                     .child(thumb)
                     .child(v_flex().max_w(dp(160.)).child(div().text_sm().truncate().child(name)).child(div().text_xs().text_color(p.muted).child(size)))
-                    .child(Button::new(SharedString::from(format!("rm-{ix}"))).ghost().xsmall().icon(IconName::X).tooltip("Убрать").on_click(cx.listener(move |this, _, _, cx| this.remove_pending(ix, cx))))
+                    .child(Button::new(SharedString::from(format!("rm-{ix}"))).ghost().xsmall().icon(IconName::X).tooltip(t!("compose.remove")).on_click(cx.listener(move |this, _, _, cx| this.remove_pending(ix, cx))))
             }))
         });
 
@@ -1103,13 +1109,13 @@ impl App {
                 )
         };
         let editing = sess.editing.as_ref().and_then(|id| sess.history.iter().find(|m| m.msg_id == *id)).map(|m| {
-            bar(IconName::Pencil, "Изменение сообщения".into(), m.body.clone())
-                .child(Button::new("edit-cancel").ghost().xsmall().icon(IconName::X).tooltip("Отменить").on_click(cx.listener(|this, _, w, cx| this.cancel_edit(w, cx))))
+            bar(IconName::Pencil, t!("compose.editing").into(), m.body.clone())
+                .child(Button::new("edit-cancel").ghost().xsmall().icon(IconName::X).tooltip(t!("compose.cancel")).on_click(cx.listener(|this, _, w, cx| this.cancel_edit(w, cx))))
         });
         let replying = sess.replying.as_ref().map(|m| {
-            let who = if m.outgoing { "себе".to_string() } else if chat.is_room { m.sender.clone() } else { sess.display_name(&peer) };
-            bar(IconName::Reply, format!("Ответ {who}"), m.url.clone().unwrap_or_else(|| m.body.clone()))
-                .child(Button::new("reply-cancel").ghost().xsmall().icon(IconName::X).tooltip("Отменить").on_click(cx.listener(|this, _, _, cx| this.cancel_reply(cx))))
+            let who = if m.outgoing { t!("compose.reply_self").to_string() } else if chat.is_room { m.sender.clone() } else { sess.display_name(&peer) };
+            bar(IconName::Reply, t!("compose.reply_to", who = who), m.url.clone().unwrap_or_else(|| m.body.clone()))
+                .child(Button::new("reply-cancel").ghost().xsmall().icon(IconName::X).tooltip(t!("compose.cancel")).on_click(cx.listener(|this, _, _, cx| this.cancel_reply(cx))))
         });
         let editing = editing.or(replying);
         let blocked = !chat.is_room && sess.blocked.as_ref().is_some_and(|b| b.contains(&peer));
@@ -1127,8 +1133,8 @@ impl App {
                 .border_color(p.border)
                 .text_sm()
                 .text_color(p.muted)
-                .child("Вы заблокировали этот контакт")
-                .child(Button::new("unblock").small().ghost().label("Разблокировать").on_click(cx.listener(move |this, _, _, cx| this.block(jid.clone(), false, false, cx))))
+                .child(t!("chat.blocked"))
+                .child(Button::new("unblock").small().ghost().label(t!("block.unblock")).on_click(cx.listener(move |this, _, _, cx| this.block(jid.clone(), false, false, cx))))
         });
 
         let has_text = !self.compose.read(cx).value().trim().is_empty() || !sess.pending.is_empty() || sess.editing.is_some();
@@ -1176,7 +1182,7 @@ impl App {
                     .gap_2()
                     .items_center()
                     .child(div().size(dp(10.)).rounded_full().bg(p.danger))
-                    .child(div().text_sm().child(format!("Запись {}:{:02}", secs / 60, secs % 60)))
+                    .child(div().text_sm().child(t!("compose.recording", time = format!("{}:{:02}", secs / 60, secs % 60))))
                     // Level meter: sqrt so speech fills a visible part of the bar.
                     .child(div().w(dp(80.)).h(px(4.)).rounded_full().bg(hsla(0., 0., 0.5, 0.3)).child(div().h_full().rounded_full().bg(p.accent).w(relative(level.sqrt().min(1.))))),
             )
@@ -1276,16 +1282,16 @@ impl App {
         let quote = m.reply_to.as_ref().map(|id| {
             let orig = sess.history.iter().find(|q| q.msg_id == *id).cloned().or_else(|| sess.store.msg(sess.selected.as_deref().unwrap_or_default(), id));
             let who = match &orig {
-                Some(o) if o.outgoing => "Вы".to_string(),
+                Some(o) if o.outgoing => t!("msg.you").to_string(),
                 Some(o) if is_room => o.sender.clone(),
                 Some(_) => sess.selected.as_deref().map(|p| sess.display_name(p)).unwrap_or_default(),
-                None => "Сообщение".to_string(),
+                None => t!("msg.message").to_string(),
             };
             let text = match &orig {
-                Some(o) if o.retracted => "Сообщение удалено".to_string(),
-                Some(o) if o.url.is_some() => "Файл".to_string(),
+                Some(o) if o.retracted => t!("msg.deleted").to_string(),
+                Some(o) if o.url.is_some() => t!("media.file").to_string(),
                 Some(o) => o.body.replace('\n', " "),
-                None => "недоступно".to_string(),
+                None => t!("msg.unavailable").to_string(),
             };
             (id.clone(), orig.map(|o| o.ts), who, text, sess.selected.clone().unwrap_or_default())
         });
@@ -1319,7 +1325,7 @@ impl App {
             }))
         });
         let content = match &m.url {
-            _ if m.retracted => h_flex().gap_2().items_center().italic().opacity(0.7).child(Icon::new(IconName::Ban).small()).child("Сообщение удалено").into_any_element(),
+            _ if m.retracted => h_flex().gap_2().items_center().italic().opacity(0.7).child(Icon::new(IconName::Ban).small()).child(t!("msg.deleted")).into_any_element(),
             _ if is_call(&m) => h_flex().gap_2().items_center().child(Icon::new(IconName::Phone).small()).child(m.body.clone()).into_any_element(),
             Some(url) => self.render_attachment(url, &m, cx),
             None => v_flex()
@@ -1364,7 +1370,7 @@ impl App {
                                         .text_xs()
                                         .font_weight(FontWeight::SEMIBOLD)
                                         .opacity(0.8)
-                                        .child(if lang.is_empty() { "код".to_string() } else { lang.to_string() })
+                                        .child(if lang.is_empty() { t!("code.label").to_string() } else { lang.to_string() })
                                         .child(
                                             // Plain icon so it takes the bubble's text colour (a Button would not on dark bubbles).
                                             div()
@@ -1396,7 +1402,7 @@ impl App {
             .items_center()
             .text_xs()
             .text_color(meta_c)
-            .when(m.edited, |d| d.child("изменено"))
+            .when(m.edited, |d| d.child(t!("msg.edited")))
             .when(m.enc > 0, |d| d.child(Icon::new(IconName::Lock).xsmall()))
             .child(local(m.ts).format("%H:%M").to_string())
             .children(ticks);
@@ -1484,8 +1490,8 @@ impl App {
             let label = match progress {
                 Some(f) => format!("{} / {}", clock(f * len), clock(len)),
                 None if downloaded => clock(len),
-                None if failed => "недоступно · нажмите, чтобы повторить".to_string(),
-                None => "Голосовое сообщение".to_string(),
+                None if failed => t!("media.unavailable_retry").to_string(),
+                None => t!("media.voice").to_string(),
             };
             let u = url.to_string();
             return h_flex()
@@ -1518,7 +1524,7 @@ impl App {
         }
         let video = is_video(url) && crabber::video::available();
         if is_image(url) || video {
-            let kind = if video { "Видео" } else { "Изображение" };
+            let kind = if video { t!("media.video") } else { t!("media.image") };
             if !downloaded {
                 if failed {
                     return div()
@@ -1526,7 +1532,7 @@ impl App {
                         .cursor_pointer()
                         .text_sm()
                         .opacity(0.7)
-                        .child(format!("{kind} недоступно · нажмите, чтобы повторить"))
+                        .child(t!("media.kind_unavailable", kind = kind))
                         .on_click(open)
                         .into_any_element();
                 }
@@ -1535,12 +1541,12 @@ impl App {
                     return div()
                         .id(SharedString::from(format!("img-{}", m.msg_id)))
                         .cursor_pointer()
-                        .child(h_flex().gap_2().items_center().child(icon_box(IconName::Download, 40.)).child(div().text_sm().child(if video { "Видео · нажмите, чтобы загрузить" } else { "Фото · нажмите, чтобы загрузить" })))
+                        .child(h_flex().gap_2().items_center().child(icon_box(IconName::Download, 40.)).child(div().text_sm().child(if video { t!("media.video_click") } else { t!("media.photo_click") })))
                         .on_click(open)
                         .into_any_element();
                 }
                 self.request_download(url);
-                return div().text_sm().opacity(0.7).child(if video { "Загрузка видео..." } else { "Загрузка изображения..." }).into_any_element();
+                return div().text_sm().opacity(0.7).child(if video { t!("media.loading_video") } else { t!("media.loading_image") }).into_any_element();
             }
             if video {
                 let thumb = self.video_thumb(&path, cx);
@@ -1586,11 +1592,11 @@ impl App {
         }
         let subtitle = if downloaded {
             let size = std::fs::metadata(&path).map(|m| human_size(m.len())).unwrap_or_default();
-            if is_text(url) { format!("{size} · открыть") } else { format!("{size} · показать в папке") }
+            if is_text(url) { t!("file.open_hint", size = size) } else { t!("file.folder_hint", size = size) }
         } else if failed {
-            "файл недоступен · повторить".to_string()
+            t!("file.unavailable").to_string()
         } else {
-            "нажмите, чтобы скачать".to_string()
+            t!("file.click_download").to_string()
         };
         let preview = (downloaded && is_text(url)).then(|| {
             let bytes = std::fs::read(&path).map(|b| b[..b.len().min(4096)].to_vec()).unwrap_or_default();
@@ -1643,61 +1649,77 @@ impl App {
                 .when(s.scheme != value, |b| b.outline())
                 .on_click(cx.listener(move |this, _, w, cx| this.update_settings(w, cx, |st| st.scheme = value.into())))
         };
+        let lang_btn = |id: SharedString, label: &'static str, value: &'static str| {
+            Button::new(id)
+                .label(label)
+                .small()
+                .when(s.lang == value, |b| b.primary())
+                .when(s.lang != value, |b| b.outline())
+                .on_click(cx.listener(move |this, _, w, cx| this.update_settings(w, cx, |st| st.lang = value.into())))
+        };
         let me = sess.localpart();
         let body = v_flex()
-            .child(section("АККАУНТ"))
+            .child(section(t!("settings.account")))
             .child(
                 h_flex()
                     .gap_3()
                     .items_center()
                     .child(avatar(sess, &sess.me, &me, 56.))
                     .child(v_flex().flex_1().min_w_0().child(div().font_weight(FontWeight::SEMIBOLD).child(me)).child(div().text_xs().text_color(t.muted_foreground).truncate().child(sess.me.clone())))
-                    .child(Button::new("set-avatar").small().outline().label("Сменить аватар").on_click(cx.listener(|this, _, _, cx| this.change_avatar(cx))))
-                    .child(Button::new("set-logout").small().danger().icon(IconName::LogOut).label("Выйти").on_click(cx.listener(|this, _, _, cx| this.logout(cx)))),
+                    .child(Button::new("set-avatar").small().outline().label(t!("settings.change_avatar")).on_click(cx.listener(|this, _, _, cx| this.change_avatar(cx))))
+                    .child(Button::new("set-logout").small().danger().icon(IconName::LogOut).label(t!("settings.logout")).on_click(cx.listener(|this, _, _, cx| this.logout(cx)))),
             )
-            .child(section("ТЕМА"))
-            .child(h_flex().gap_2().flex_wrap().child(theme_btn("theme-system", "Системная", "system")).child(theme_btn("theme-light", "Светлая", "light")).child(theme_btn("theme-dark", "Тёмная", "dark")))
-            .child(section("ЦВЕТОВОЙ АКЦЕНТ"))
+            .child(section(t!("settings.theme")))
+            .child(h_flex().gap_2().flex_wrap().child(theme_btn("theme-system", t!("settings.theme_system"), "system")).child(theme_btn("theme-light", t!("settings.theme_light"), "light")).child(theme_btn("theme-dark", t!("settings.theme_dark"), "dark")))
+            .child(section(t!("settings.language")))
+            .child(
+                h_flex()
+                    .gap_2()
+                    .flex_wrap()
+                    .child(lang_btn("lang-system".into(), t!("settings.lang_system"), "system"))
+                    .children(crabber::i18n::Lang::ALL.map(|l| lang_btn(format!("lang-{}", l.code()).into(), l.name(), l.code()))),
+            )
+            .child(section(t!("settings.accent")))
             .child(
                 h_flex()
                     .gap_1()
                     .flex_wrap()
-                    .child(scheme_btn("scheme-default", "Стандартный", "default"))
+                    .child(scheme_btn("scheme-default", t!("settings.scheme_default"), "default"))
                     .children(style::PRESETS.iter().map(|p| {
                         Button::new(SharedString::from(format!("scheme-{}", p.0)))
-                            .label(p.1)
+                            .label(crabber::i18n::get(p.1))
                             .small()
                             .when(s.scheme == p.0, |b| b.primary())
                             .when(s.scheme != p.0, |b| b.outline())
                             .on_click(cx.listener(move |this, _, w, cx| this.update_settings(w, cx, |st| st.scheme = p.0.into())))
                     }))
-                    .child(scheme_btn("scheme-custom", "Свой", "custom")),
+                    .child(scheme_btn("scheme-custom", t!("settings.scheme_custom"), "custom")),
             )
             .when(s.scheme == "custom", |d| {
                 d.child(
                     v_flex()
                         .gap_2()
                         .pt_2()
-                        .children([(0usize, "Светлая схема"), (6, "Тёмная схема")].map(|(off, title)| {
+                        .children([(0usize, t!("settings.light_scheme")), (6, t!("settings.dark_scheme"))].map(|(off, title)| {
                             v_flex()
                                 .gap_1()
                                 .child(div().text_xs().text_color(t.muted_foreground).child(title))
-                                .child(h_flex().gap_2().flex_wrap().children(COLOR_FIELDS.iter().enumerate().map(|(j, label)| {
-                                    v_flex().gap_1().w(dp(104.)).child(div().text_xs().text_color(t.muted_foreground).child(*label)).child(ColorSelect::new(&self.color_pickers[off + j]))
+                                .child(h_flex().gap_2().flex_wrap().children(color_fields().into_iter().enumerate().map(|(j, label)| {
+                                    v_flex().gap_1().w(dp(104.)).child(div().text_xs().text_color(t.muted_foreground).child(label)).child(ColorSelect::new(&self.color_pickers[off + j]))
                                 })))
                         }))
-                        .child(Button::new("colors-reset").small().outline().label("Сбросить цвета").on_click(cx.listener(|this, _, w, cx| this.reset_custom_colors(w, cx)))),
+                        .child(Button::new("colors-reset").small().outline().label(t!("settings.reset_colors")).on_click(cx.listener(|this, _, w, cx| this.reset_custom_colors(w, cx)))),
                 )
             })
             .when(cfg!(target_os = "linux"), |d| {
-                d.child(section("ЦВЕТОВОЙ АКЦЕНТ ИЗ"))
+                d.child(section(t!("settings.accent_from")))
                     .child(
                         h_flex().gap_1().flex_wrap()
                             .child(scheme_btn("scheme-matugen", "Matugen", "matugen").when(!style::source_available("matugen"), |b| b.disabled(true)))
                             .child(scheme_btn("scheme-dux", "Dux", "dux").when(!style::source_available("dux"), |b| b.disabled(true))),
                     )
             })
-            .child(section("МАСШТАБ"))
+            .child(section(t!("settings.scale")))
             .child(
                 h_flex().gap_1().flex_wrap().children(App::SCALES.iter().enumerate().map(|(i, &scale)| {
                     let active = (s.ui_scale - scale).abs() < 0.01;
@@ -1709,10 +1731,10 @@ impl App {
                         .on_click(cx.listener(move |this, _, w, cx| this.update_settings(w, cx, |st| st.ui_scale = scale)))
                 })),
             )
-            .child(div().pt_1().text_xs().text_color(t.muted_foreground).child("Также Ctrl + «+» / «−», Ctrl + 0 — сбросить"))
-            .child(section("СИСТЕМА"))
+            .child(div().pt_1().text_xs().text_color(t.muted_foreground).child(t!("settings.scale_hint")))
+            .child(section(t!("settings.system")))
             .child(
-                h_flex().gap_3().py_1().items_center().child(row("Запускать при входе в систему", "Crabber будет открываться автоматически после входа в систему")).child(
+                h_flex().gap_3().py_1().items_center().child(row(t!("settings.autostart"), t!("settings.autostart_desc"))).child(
                     Switch::new("set-autostart").checked(s.autostart).on_click(cx.listener(|this, v: &bool, w, cx| {
                         crate::desktop::set_autostart(*v, this.settings.start_minimized);
                         this.update_settings(w, cx, |st| st.autostart = crate::desktop::autostart())
@@ -1720,7 +1742,7 @@ impl App {
                 ),
             )
             .child(
-                h_flex().gap_3().py_1().items_center().child(row("Запускать свёрнутым", "После автозапуска Crabber окажется в трее, а не на экране")).child(
+                h_flex().gap_3().py_1().items_center().child(row(t!("settings.start_min"), t!("settings.start_min_desc"))).child(
                     Switch::new("set-start-min").checked(s.start_minimized).on_click(cx.listener(|this, v: &bool, w, cx| {
                         let v = *v;
                         this.update_settings(w, cx, |st| st.start_minimized = v);
@@ -1731,9 +1753,9 @@ impl App {
                     })),
                 ),
             )
-            .child(section("УВЕДОМЛЕНИЯ"))
+            .child(section(t!("settings.notifications")))
             .child(
-                h_flex().gap_3().py_1().items_center().child(row("Отключить уведомления", "Не показывать всплывающие уведомления о новых сообщениях")).child(
+                h_flex().gap_3().py_1().items_center().child(row(t!("settings.notify_off"), t!("settings.notify_off_desc"))).child(
                     Switch::new("set-notify").checked(!s.notify).on_click(cx.listener(|this, v: &bool, w, cx| {
                         let v = !*v;
                         this.update_settings(w, cx, |st| st.notify = v)
@@ -1741,16 +1763,16 @@ impl App {
                 ),
             )
             .child(
-                h_flex().gap_3().py_1().items_center().child(row("Скрывать текст в уведомлениях", "В уведомлении будет только «Новое сообщение»")).child(
+                h_flex().gap_3().py_1().items_center().child(row(t!("settings.hide_text"), t!("settings.hide_text_desc"))).child(
                     Switch::new("set-notify-text").checked(!s.notify_text).on_click(cx.listener(|this, v: &bool, w, cx| {
                         let v = !*v;
                         this.update_settings(w, cx, |st| st.notify_text = v)
                     })),
                 ),
             )
-            .child(section("ШИФРОВАНИЕ (OMEMO)"))
+            .child(section(t!("settings.omemo")))
             .child(
-                h_flex().gap_3().py_1().items_center().child(row("Слепое доверие (BTBV)", "Новые устройства контактов доверенные, пока вы не подтвердили ключ контакта вручную")).child(
+                h_flex().gap_3().py_1().items_center().child(row(t!("settings.btbv"), t!("settings.btbv_desc"))).child(
                     Switch::new("set-btbv").checked(s.blind_trust).on_click(cx.listener(|this, v: &bool, w, cx| {
                         let v = *v;
                         this.update_settings(w, cx, |st| st.blind_trust = v);
@@ -1769,25 +1791,25 @@ impl App {
                         .child(
                             h_flex()
                                 .gap_2()
-                                .child(Button::new("pgp-copy").small().outline().icon(IconName::Copy).label("Скопировать открытый ключ").on_click(move |_, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(public.clone()))))
-                                .child(Button::new("pgp-del").small().ghost().label("Удалить ключ").on_click(cx.listener(|this, _, _, _| this.pgp_cmd(crabber::xmpp::Cmd::PgpDeleteSecret)))),
+                                .child(Button::new("pgp-copy").small().outline().icon(IconName::Copy).label(t!("settings.pgp_copy")).on_click(move |_, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(public.clone()))))
+                                .child(Button::new("pgp-del").small().ghost().label(t!("settings.pgp_delete")).on_click(cx.listener(|this, _, _, _| this.pgp_cmd(crabber::xmpp::Cmd::PgpDeleteSecret)))),
                         )
                         .into_any_element()
                 }
                 None => v_flex()
                     .gap_2()
-                    .child(div().text_xs().text_color(t.muted_foreground).child("Ключа нет. PGP нужен только для собеседников без OMEMO (например, Psi или старый Gajim)."))
+                    .child(div().text_xs().text_color(t.muted_foreground).child(t!("settings.pgp_none")))
                     .child(
                         h_flex()
                             .gap_2()
-                            .child(Button::new("pgp-gen").small().primary().icon(IconName::Key).label("Создать ключ").on_click(cx.listener(|this, _, _, _| this.pgp_cmd(crabber::xmpp::Cmd::PgpGenerate))))
-                            .child(Button::new("pgp-imp").small().outline().label("Импортировать закрытый ключ").on_click(cx.listener(|this, _, w, cx| this.open_pgp_import(None, w, cx)))),
+                            .child(Button::new("pgp-gen").small().primary().icon(IconName::Key).label(t!("settings.pgp_generate")).on_click(cx.listener(|this, _, _, _| this.pgp_cmd(crabber::xmpp::Cmd::PgpGenerate))))
+                            .child(Button::new("pgp-imp").small().outline().label(t!("settings.pgp_import")).on_click(cx.listener(|this, _, w, cx| this.open_pgp_import(None, w, cx)))),
                     )
                     .into_any_element(),
             })
-            .child(section("ФАЙЛЫ"))
+            .child(section(t!("settings.files")))
             .child(
-                h_flex().gap_3().py_1().items_center().child(row("Показывать превью фото и текстовых файлов", "Скачивать их автоматически и показывать прямо в чате. Если выключено, файл скачивается только по нажатию")).child(
+                h_flex().gap_3().py_1().items_center().child(row(t!("settings.auto_dl"), t!("settings.auto_dl_desc"))).child(
                     Switch::new("set-autodl").checked(s.auto_download).on_click(cx.listener(|this, v: &bool, w, cx| {
                         let v = *v;
                         this.update_settings(w, cx, |st| st.auto_download = v)
@@ -1799,12 +1821,12 @@ impl App {
                     .gap_3()
                     .py_1()
                     .items_center()
-                    .child(row("Папка загрузок", "Загрузки\\CrabberDesktop"))
-                    .child(Button::new("open-dl").small().outline().icon(IconName::FolderOpen).label("Открыть").on_click(|_, _, cx| cx.open_with_system(&crabber::store::downloads_dir()))),
+                    .child(row(t!("settings.downloads"), t!("settings.downloads_path")))
+                    .child(Button::new("open-dl").small().outline().icon(IconName::FolderOpen).label(t!("action.open")).on_click(|_, _, cx| cx.open_with_system(&crabber::store::downloads_dir()))),
             )
             .child(div().pt_4().text_xs().text_center().text_color(t.muted_foreground).child(format!("Crabber {}", env!("CARGO_PKG_VERSION"))))
             ;
-        Some(self.panel("settings", "Настройки", body.into_any_element(), cx))
+        Some(self.panel("settings", t!("settings.title"), body.into_any_element(), cx))
     }
 
     /// OMEMO devices of `jid` with fingerprints and trust switches.
@@ -1812,17 +1834,17 @@ impl App {
         let t = cx.theme().clone();
         let Some(sess) = self.sess.as_ref() else { return vec![] };
         let Some(devices) = sess.e2e_devices.get(jid) else {
-            return vec![div().py_2().text_sm().text_color(t.muted_foreground).child("Загрузка ключей...").into_any_element()];
+            return vec![div().py_2().text_sm().text_color(t.muted_foreground).child(t!("e2e.loading")).into_any_element()];
         };
         if devices.is_empty() {
-            let text = if own { "Ключи ещё не опубликованы" } else { "У собеседника нет устройств с OMEMO — сообщения уйдут без шифрования" };
+            let text = if own { t!("e2e.own_none") } else { t!("e2e.peer_none") };
             return vec![div().py_2().text_sm().text_color(t.muted_foreground).child(text).into_any_element()];
         }
         let mut list: Vec<&DeviceInfo> = devices.iter().collect();
         list.sort_by_key(|d| !d.own);
         list.into_iter()
             .map(|d| {
-                let title = if d.own { format!("Это устройство · {}", d.id) } else { format!("Устройство {}", d.id) };
+                let title = if d.own { t!("e2e.this_device", id = d.id) } else { t!("e2e.device", id = d.id) };
                 let (j, id) = (jid.to_string(), d.id);
                 h_flex()
                     .gap_3()
@@ -1834,13 +1856,13 @@ impl App {
                             .flex_1()
                             .min_w_0()
                             .child(div().text_sm().child(title))
-                            .child(div().text_xs().font_family("Consolas").text_color(t.muted_foreground).child(d.fingerprint.clone().unwrap_or_else(|| "ключ ещё не получен".into()))),
+                            .child(div().text_xs().font_family("Consolas").text_color(t.muted_foreground).child(d.fingerprint.clone().unwrap_or_else(|| t!("e2e.no_fingerprint").into()))),
                     )
                     .when(!d.own, |row| {
                         row.child(
                             Switch::new(SharedString::from(format!("trust-{}-{}", jid, d.id)))
                                 .checked(d.trusted)
-                                .tooltip("Доверять устройству")
+                                .tooltip(t!("e2e.trust"))
                                 .on_click(cx.listener(move |this, v: &bool, _, _| this.set_trust(j.clone(), id, *v))),
                         )
                     })
@@ -1886,14 +1908,14 @@ impl App {
         };
         let body = v_flex()
             .gap_2()
-            .child(option("enc-auto", "auto", "Автоматически (рекомендуется)", "OMEMO, если собеседник его поддерживает, иначе без шифрования"))
-            .child(option("enc-omemo", "omemo", "Только OMEMO", "Не отправлять сообщение, если зашифровать невозможно"))
-            .child(option("enc-pgp", "pgp", "OpenPGP (XEP-0027)", "Для клиентов без OMEMO. Шифруется только текст, файлы отправить нельзя"))
-            .child(option("enc-plain", "plain", "Без шифрования", "Сообщения видны серверу"))
-            .child(div().pt_4().pb_1().text_xs().font_weight(FontWeight::SEMIBOLD).text_color(t.muted_foreground).child("УСТРОЙСТВА СОБЕСЕДНИКА"))
+            .child(option("enc-auto", "auto", t!("e2e.auto"), t!("e2e.auto_desc")))
+            .child(option("enc-omemo", "omemo", t!("e2e.omemo"), t!("e2e.omemo_desc")))
+            .child(option("enc-pgp", "pgp", "OpenPGP (XEP-0027)", t!("e2e.pgp_desc")))
+            .child(option("enc-plain", "plain", t!("e2e.plain"), t!("e2e.plain_desc")))
+            .child(div().pt_4().pb_1().text_xs().font_weight(FontWeight::SEMIBOLD).text_color(t.muted_foreground).child(t!("e2e.peer_devices")))
             .children(self.device_rows(&peer, false, cx))
-            .child(div().pt_2().text_xs().text_color(t.muted_foreground).child("Сверьте отпечатки с собеседником лично или по другому каналу. Отключите доверие, если отпечаток не совпадает."))
-            .child(div().pt_4().pb_1().text_xs().font_weight(FontWeight::SEMIBOLD).text_color(t.muted_foreground).child("КЛЮЧ OPENPGP СОБЕСЕДНИКА"))
+            .child(div().pt_2().text_xs().text_color(t.muted_foreground).child(t!("e2e.verify_hint")))
+            .child(div().pt_4().pb_1().text_xs().font_weight(FontWeight::SEMIBOLD).text_color(t.muted_foreground).child(t!("e2e.peer_pgp")))
             .child({
                 let (fp, hint) = sess.pgp_contacts.get(&peer).cloned().unwrap_or_default();
                 let p = peer.clone();
@@ -1903,12 +1925,12 @@ impl App {
                     .child(Icon::new(IconName::Key).text_color(if fp.is_some() { t.success } else { t.muted_foreground }))
                     .child(div().flex_1().text_xs().font_family("Consolas").child(match (fp, hint) {
                         (Some(fp), _) => fp,
-                        (None, Some(id)) => format!("Ключ {id} указан в статусе, но не найден — импортируйте его"),
-                        (None, None) => "Ключ не добавлен".to_string(),
+                        (None, Some(id)) => t!("e2e.pgp_hint_missing", id = id),
+                        (None, None) => t!("e2e.pgp_none").to_string(),
                     }))
-                    .child(Button::new("pgp-imp-contact").small().outline().label("Импортировать").on_click(cx.listener(move |this, _, w, cx| this.open_pgp_import(Some(p.clone()), w, cx))))
+                    .child(Button::new("pgp-imp-contact").small().outline().label(t!("pgp.import")).on_click(cx.listener(move |this, _, w, cx| this.open_pgp_import(Some(p.clone()), w, cx))))
             });
-        Some(self.panel("e2e-panel", "Шифрование", body.into_any_element(), cx))
+        Some(self.panel("e2e-panel", t!("e2e.title"), body.into_any_element(), cx))
     }
 
     /// Right-click menu of a message, at the cursor (flipped to stay inside the window).
@@ -1977,7 +1999,7 @@ impl App {
         if !is_call(&m) && !m.retracted && m.status >= 0 {
             let msg = m.clone();
             items.push(
-                item("mm-reply", IconName::Reply, "Ответить", false)
+                item("mm-reply", IconName::Reply, t!("menu.reply"), false)
                     .on_click(cx.listener(move |this, _, w, cx| this.start_reply(&msg, w, cx)))
                     .into_any_element(),
             );
@@ -1985,7 +2007,7 @@ impl App {
         if m.outgoing && m.url.is_none() && !is_call(&m) && m.status >= 0 {
             let msg = m.clone();
             items.push(
-                item("mm-edit", IconName::Pencil, "Изменить", false)
+                item("mm-edit", IconName::Pencil, t!("menu.edit"), false)
                     .on_click(cx.listener(move |this, _, w, cx| this.start_edit(&msg, w, cx)))
                     .into_any_element(),
             );
@@ -1993,7 +2015,7 @@ impl App {
         if m.url.is_none() && !m.retracted {
             let text = m.body.clone();
             items.push(
-                item("mm-copy", IconName::Copy, "Копировать текст", false)
+                item("mm-copy", IconName::Copy, t!("menu.copy_text"), false)
                     .on_click(cx.listener(move |this, _, _, cx| {
                         cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
                         this.msg_menu = None;
@@ -2005,7 +2027,7 @@ impl App {
         if let Some(url) = m.url.clone() {
             let open = url.clone();
             items.push(
-                item("mm-open", IconName::Image, "Открыть", false)
+                item("mm-open", IconName::Image, t!("action.open"), false)
                     .on_click(cx.listener(move |this, _, w, cx| {
                         this.msg_menu = None;
                         this.open_attachment(open.clone(), w, cx);
@@ -2013,7 +2035,7 @@ impl App {
                     .into_any_element(),
             );
             items.push(
-                item("mm-save", IconName::Download, "Сохранить как…", false)
+                item("mm-save", IconName::Download, t!("menu.save_as"), false)
                     .on_click(cx.listener(move |this, _, w, cx| {
                         this.msg_menu = None;
                         this.save_attachment_as(url.clone(), w, cx);
@@ -2023,14 +2045,14 @@ impl App {
         }
         if let Some(f) = file.clone().filter(|_| m.url.as_deref().is_some_and(is_image)) {
             items.push(
-                item("mm-copy-img", IconName::Copy, "Копировать изображение", false)
+                item("mm-copy-img", IconName::Copy, t!("menu.copy_image"), false)
                     .on_click(cx.listener(move |this, _, _, cx| this.copy_image(&f, cx)))
                     .into_any_element(),
             );
         }
         if let Some(f) = file {
             items.push(
-                item("mm-folder", IconName::FolderOpen, "Показать в папке", false)
+                item("mm-folder", IconName::FolderOpen, t!("menu.show_in_folder"), false)
                     .on_click(cx.listener(move |this, _, _, cx| {
                         cx.reveal_path(&f);
                         this.msg_menu = None;
@@ -2045,7 +2067,7 @@ impl App {
         if can_retract {
             let (msg, moderate) = (m.clone(), !m.outgoing);
             items.push(
-                item("mm-retract", IconName::Ban, if moderate { "Удалить у всех (модератор)" } else { "Удалить у всех" }, true)
+                item("mm-retract", IconName::Ban, if moderate { t!("menu.retract_mod") } else { t!("menu.retract") }, true)
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.msg_menu = None;
                         this.modal = Some(Modal::ConfirmRetract { msg: msg.clone(), moderate });
@@ -2055,7 +2077,7 @@ impl App {
             );
         }
         items.push(
-            item("mm-delete", IconName::X, "Удалить у себя", true)
+            item("mm-delete", IconName::X, t!("menu.delete_local"), true)
                 .on_click(cx.listener(move |this, _, _, cx| this.delete_message(&id, cx)))
                 .into_any_element(),
         );
@@ -2192,13 +2214,13 @@ impl App {
         let name = sess.display_name(&peer);
         let status = if chat.is_room {
             match sess.occupants.get(&peer) {
-                Some(n) => format!("группа · {n} в сети"),
-                None => "группа".into(),
+                Some(n) => t!("room.online_profile", n = n),
+                None => t!("room.label").into(),
             }
         } else if sess.presence.contains(&peer) {
-            "в сети".into()
+            t!("status.online").into()
         } else {
-            "не в сети".into()
+            t!("status.offline").into()
         };
         let has_photo = sess.avatars.contains_key(&peer);
         let (pa, pc, pd) = (peer.clone(), peer.clone(), peer.clone());
@@ -2215,7 +2237,7 @@ impl App {
                     .on_click(cx.listener(move |this, _, w, cx| this.open_avatar(&pa, w, cx))),
             )
             .child(div().pt_2().text_xl().font_weight(FontWeight::SEMIBOLD).child(name))
-            .child(div().text_sm().text_color(if status == "в сети" { p.accent } else { p.muted }).child(status))
+            .child(div().text_sm().text_color(if status == t!("status.online") { p.accent } else { p.muted }).child(status))
             .child(
                 h_flex()
                     .id("profile-jid")
@@ -2243,7 +2265,7 @@ impl App {
                             Button::new("profile-block")
                                 .flex_1()
                                 .icon(IconName::Ban)
-                                .label(if blocked { "Разблокировать" } else { "Заблокировать" })
+                                .label(if blocked { t!("block.unblock") } else { t!("block.block") })
                                 .on_click(cx.listener(move |this, _, _, cx| this.block(pb.clone(), !blocked, false, cx))),
                         )
                         .when(!blocked, |d| {
@@ -2251,8 +2273,8 @@ impl App {
                                 Button::new("profile-spam")
                                     .flex_1()
                                     .icon(IconName::TriangleAlert)
-                                    .label("Спам")
-                                    .tooltip("Пожаловаться серверу и заблокировать")
+                                    .label(t!("profile.spam"))
+                                    .tooltip(t!("profile.spam_tip"))
                                     .on_click(cx.listener(move |this, _, _, cx| this.block(ps.clone(), true, true, cx))),
                             )
                         }),
@@ -2275,11 +2297,11 @@ impl App {
                         .text_color(white())
                         .font_weight(FontWeight::SEMIBOLD)
                         .child(Icon::new(if chat.is_room { IconName::DoorOpen } else { IconName::UserMinus }))
-                        .child(if chat.is_room { "Покинуть группу" } else { "Удалить контакт и переписку" })
+                        .child(if chat.is_room { t!("profile.leave") } else { t!("profile.delete") })
                         .on_click(cx.listener(move |this, _, w, cx| this.open_modal(Modal::ConfirmDelete { peer: pd.clone() }, w, cx))),
                 ),
             );
-        Some(self.panel("profile", if chat.is_room { "Группа" } else { "Контакт" }, body.into_any_element(), cx))
+        Some(self.panel("profile", if chat.is_room { t!("profile.group_title") } else { t!("profile.contact_title") }, body.into_any_element(), cx))
     }
 
     /// Occupants of a group; moderators get kick, owners/admins also ban and (un)make moderator.
@@ -2299,10 +2321,10 @@ impl App {
         list.sort_by(|a, b| rank(a).cmp(&rank(b)).then(a.nick.to_lowercase().cmp(&b.nick.to_lowercase())));
         let rows = list.into_iter().map(|o| {
             let badge = match (o.affiliation.as_str(), o.role.as_str()) {
-                ("owner", _) => "владелец",
-                ("admin", _) => "админ",
-                (_, "moderator") => "модератор",
-                (_, "visitor") => "без голоса",
+                ("owner", _) => t!("role.owner"),
+                ("admin", _) => t!("role.admin"),
+                (_, "moderator") => t!("role.moderator"),
+                (_, "visitor") => t!("role.visitor"),
                 _ => "",
             };
             let mine = me.as_ref().is_some_and(|m| m.nick == o.nick);
@@ -2321,19 +2343,19 @@ impl App {
                         Button::new(SharedString::from(format!("mod-{}", o.nick)))
                             .xsmall()
                             .ghost()
-                            .label(if is_moderator { "Снять модератора" } else { "Модератор" })
+                            .label(if is_moderator { t!("role.revoke_mod") } else { t!("role.make_mod") })
                             .on_click(cx.listener(move |this, _, _, cx| this.muc_admin(Some(n3.clone()), None, Some(if is_moderator { "participant" } else { "moderator" }), None, cx))),
                     )
                 })
                 .when(kick, |d| {
-                    d.child(Button::new(SharedString::from(format!("kick-{}", o.nick))).xsmall().ghost().label("Исключить").on_click(cx.listener(move |this, _, _, cx| this.muc_admin(Some(n1.clone()), None, Some("none"), None, cx))))
+                    d.child(Button::new(SharedString::from(format!("kick-{}", o.nick))).xsmall().ghost().label(t!("role.kick")).on_click(cx.listener(move |this, _, _, cx| this.muc_admin(Some(n1.clone()), None, Some("none"), None, cx))))
                 })
                 .when(ban, |d| {
                     d.child(
                         Button::new(SharedString::from(format!("ban-{}", o.nick)))
                             .xsmall()
                             .ghost()
-                            .label("Заблокировать")
+                            .label(t!("block.block"))
                             .on_click(cx.listener(move |this, _, _, cx| this.muc_admin(None, jid.clone(), None, Some("outcast"), cx))),
                     )
                 })
@@ -2341,25 +2363,25 @@ impl App {
         v_flex()
             .w_full()
             .pt_3()
-            .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).text_color(p.muted).child("Участники"))
+            .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).text_color(p.muted).child(t!("room.members")))
             .child(v_flex().id("members").max_h(dp(220.)).overflow_y_scroll().children(rows))
             .into_any_element()
     }
 
     fn render_pgp_import(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let Some(Modal::PgpImport { jid }) = self.modal.as_ref() else { return None };
-        let title = if jid.is_some() { "Открытый ключ собеседника" } else { "Импорт закрытого ключа" };
+        let title = if jid.is_some() { t!("pgp.peer_key_title") } else { t!("pgp.import_secret_title") };
         let hint = if jid.is_some() {
-            "Вставьте ключ, начинающийся с -----BEGIN PGP PUBLIC KEY BLOCK-----"
+            t!("pgp.peer_key_hint")
         } else {
-            "Вставьте ключ без пароля, начинающийся с -----BEGIN PGP PRIVATE KEY BLOCK-----"
+            t!("pgp.secret_hint")
         };
         let t = cx.theme().clone();
         let body = v_flex()
             .gap_3()
             .child(div().text_xs().text_color(t.muted_foreground).child(hint))
             .child(Textarea::new(&self.field3))
-            .child(h_flex().justify_end().child(Button::new("pgp-import-ok").primary().label("Импортировать").on_click(cx.listener(|this, _, _, cx| this.submit_pgp_import(cx)))));
+            .child(h_flex().justify_end().child(Button::new("pgp-import-ok").primary().label(t!("pgp.import")).on_click(cx.listener(|this, _, _, cx| this.submit_pgp_import(cx)))));
         Some(self.panel("pgp-import", title, body.into_any_element(), cx))
     }
 
@@ -2420,12 +2442,12 @@ impl App {
         let tabs = h_flex()
             .gap_1()
             .pb_3()
-            .child(tab_btn("tab-photos", format!("Фото · {}", photos.len()), MediaTab::Photos))
-            .child(tab_btn("tab-files", format!("Файлы · {}", files.len()), MediaTab::Files))
-            .child(tab_btn("tab-links", format!("Ссылки · {}", urls.len()), MediaTab::Links));
+            .child(tab_btn("tab-photos", t!("media.tab_photos", n = photos.len()), MediaTab::Photos))
+            .child(tab_btn("tab-files", t!("media.tab_files", n = files.len()), MediaTab::Files))
+            .child(tab_btn("tab-links", t!("media.tab_links", n = urls.len()), MediaTab::Links));
         let empty = |text: &'static str| div().py_8().text_center().text_sm().text_color(t.muted_foreground).child(text).into_any_element();
         let content = match tab {
-            MediaTab::Photos if photos.is_empty() => empty("В этом чате пока нет фото"),
+            MediaTab::Photos if photos.is_empty() => empty(t!("media.no_photos")),
             MediaTab::Photos => {
                 let mut tiles = vec![];
                 for m in photos {
@@ -2449,14 +2471,14 @@ impl App {
                 }
                 h_flex().flex_wrap().gap_2().children(tiles).into_any_element()
             }
-            MediaTab::Files if files.is_empty() => empty("В этом чате пока нет файлов"),
+            MediaTab::Files if files.is_empty() => empty(t!("media.no_files")),
             MediaTab::Files => v_flex()
                 .gap_1()
                 .children(files.into_iter().map(|m| {
                     let url = m.url.clone().unwrap_or_default();
                     let name = file_name(&url);
                     let path = self.sess.as_ref().and_then(|s| s.store.file_for(&url)).filter(|p| p.is_file());
-                    let size = path.as_ref().and_then(|p| std::fs::metadata(p).ok()).map(|md| human_size(md.len())).unwrap_or_else(|| "не загружен".into());
+                    let size = path.as_ref().and_then(|p| std::fs::metadata(p).ok()).map(|md| human_size(md.len())).unwrap_or_else(|| t!("media.not_downloaded").into());
                     let u = url.clone();
                     h_flex()
                         .id(SharedString::from(format!("frow-{}", m.msg_id)))
@@ -2471,7 +2493,7 @@ impl App {
                         .on_click(cx.listener(move |this, _, w, cx| this.open_attachment(u.clone(), w, cx)))
                 }))
                 .into_any_element(),
-            MediaTab::Links if urls.is_empty() => empty("В этом чате пока нет ссылок"),
+            MediaTab::Links if urls.is_empty() => empty(t!("media.no_links")),
             MediaTab::Links => v_flex()
                 .gap_1()
                 .children(urls.into_iter().enumerate().map(|(i, (url, ts))| {
@@ -2490,7 +2512,7 @@ impl App {
                 }))
                 .into_any_element(),
         };
-        let title = format!("Медиа · {}", self.sess.as_ref().map(|s| s.display_name(&peer)).unwrap_or_default());
+        let title = t!("media.title", name = self.sess.as_ref().map(|s| s.display_name(&peer)).unwrap_or_default());
         Some(self.panel("media", &title, v_flex().child(tabs).child(content).into_any_element(), cx))
     }
 
@@ -2516,11 +2538,11 @@ impl App {
             .border_1()
             .border_color(p.divider)
             .shadow_xl()
-            .child(entry("vm-copy", IconName::Copy, "Копировать изображение").on_click(cx.listener(move |this, _, _, cx| {
+            .child(entry("vm-copy", IconName::Copy, t!("menu.copy_image")).on_click(cx.listener(move |this, _, _, cx| {
                 cx.stop_propagation();
                 this.copy_image(&path, cx);
             })))
-            .child(entry("vm-save", IconName::Download, "Сохранить как…").on_click(cx.listener(move |this, _, w, cx| {
+            .child(entry("vm-save", IconName::Download, t!("menu.save_as")).on_click(cx.listener(move |this, _, w, cx| {
                 cx.stop_propagation();
                 this.viewer_menu = None;
                 this.save_attachment_as(url.clone(), w, cx);
@@ -2608,7 +2630,7 @@ impl App {
                     .child(if path.is_file() {
                         img(path.clone()).absolute().inset_0().size_full().object_fit(ObjectFit::Contain).into_any_element()
                     } else {
-                        div().size_full().flex().items_center().justify_center().text_color(white()).child("Загрузка...").into_any_element()
+                        div().size_full().flex().items_center().justify_center().text_color(white()).child(t!("viewer.loading")).into_any_element()
                     })
                     .when(pos.is_some_and(|i| i > 0), |d| {
                         d.child(overlay_icon("viewer-prev", IconName::ChevronLeft).absolute().left_0().top(relative(0.5)).on_click(cx.listener(|this, _, _, cx| {
@@ -2623,7 +2645,7 @@ impl App {
                         })))
                     });
                 let title = match pos {
-                    Some(i) if gallery.len() > 1 => format!("{} · {} из {}", file_name(url), i + 1, gallery.len()),
+                    Some(i) if gallery.len() > 1 => t!("viewer.counter", name = file_name(url), n = i + 1, total = gallery.len()),
                     _ => file_name(url),
                 };
                 (title, path.clone(), body.into_any_element())
@@ -2792,9 +2814,9 @@ impl App {
         let p = style::palette(cx);
         let notes: Vec<Div> = rel.notes.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with("**Full Changelog**")).map(|l| div().text_sm().child(l.to_string())).collect();
         let action = if self.updating {
-            Button::new("update-go").primary().label(format!("Загрузка... {}%", self.update_percent())).disabled(true)
+            Button::new("update-go").primary().label(t!("update.downloading", percent = self.update_percent())).disabled(true)
         } else {
-            Button::new("update-go").primary().label("Обновить").on_click(cx.listener(|this, _, _, cx| this.install_update(cx)))
+            Button::new("update-go").primary().label(t!("update.install")).on_click(cx.listener(|this, _, _, cx| this.install_update(cx)))
         };
         Some(
             div()
@@ -2821,26 +2843,26 @@ impl App {
                         .child(
                             v_flex()
                                 .gap_1()
-                                .child(div().text_lg().font_weight(FontWeight::SEMIBOLD).child("Доступно обновление"))
-                                .child(div().text_sm().text_color(t.muted_foreground).child(format!("Версия {} · у вас {}", rel.version, env!("CARGO_PKG_VERSION")))),
+                                .child(div().text_lg().font_weight(FontWeight::SEMIBOLD).child(t!("update.available")))
+                                .child(div().text_sm().text_color(t.muted_foreground).child(t!("update.version_line", version = rel.version, current = env!("CARGO_PKG_VERSION")))),
                         )
                         .when(!notes.is_empty(), |d| {
                             d.child(
                                 v_flex()
                                     .gap_2()
-                                    .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).child("Что нового"))
+                                    .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).child(t!("update.whats_new")))
                                     .child(v_flex().id("update-notes").max_h(dp(280.)).overflow_y_scroll().gap_1().children(notes)),
                             )
                         })
                         .when(self.updating, |d| {
                             d.child(div().h(px(4.)).w_full().rounded_full().bg(hsla(0., 0., 0.5, 0.3)).child(div().h_full().rounded_full().bg(p.accent).w(relative(self.update_percent() as f32 / 100.))))
                         })
-                        .when_some(self.update_error.clone(), |d, e| d.child(div().text_sm().text_color(p.danger).child(format!("Не удалось обновить: {e}"))))
+                        .when_some(self.update_error.clone(), |d, e| d.child(div().text_sm().text_color(p.danger).child(t!("update.failed", e = e))))
                         .child(
                             h_flex()
                                 .gap_2()
                                 .justify_end()
-                                .child(Button::new("update-later").ghost().label("Позже").on_click(cx.listener(|this, _, _, cx| this.show_update(false, cx))))
+                                .child(Button::new("update-later").ghost().label(t!("update.later")).on_click(cx.listener(|this, _, _, cx| this.show_update(false, cx))))
                                 .child(action),
                         ),
                 )
@@ -2853,9 +2875,9 @@ impl App {
         let t = cx.theme().clone();
         let sess = self.sess.as_ref()?;
         let (title, body): (&str, AnyElement) = match modal {
-            Modal::AddContact => ("Новый контакт", v_flex().gap_2().child(Input::new(&self.field1)).child(Input::new(&self.field2)).into_any_element()),
-            Modal::NewGroup => ("Новая группа", Input::new(&self.field2).into_any_element()),
-            Modal::JoinGroup => ("Войти в группу", Input::new(&self.field2).into_any_element()),
+            Modal::AddContact => (t!("modal.add_contact"), v_flex().gap_2().child(Input::new(&self.field1)).child(Input::new(&self.field2)).into_any_element()),
+            Modal::NewGroup => (t!("group.new"), Input::new(&self.field2).into_any_element()),
+            Modal::JoinGroup => (t!("modal.join_group"), Input::new(&self.field2).into_any_element()),
             Modal::Invite { room } => {
                 let contacts = sess.chats.iter().filter(|c| !c.is_room && c.in_roster).map(|c| {
                     let (room, jid) = (room.clone(), c.peer.clone());
@@ -2872,16 +2894,16 @@ impl App {
                         .child(name)
                         .on_click(cx.listener(move |this, _, w, cx| this.invite(room.clone(), jid.clone(), w, cx)))
                 });
-                ("Пригласить в группу", v_flex().id("invite-list").max_h(dp(320.)).overflow_y_scroll().children(contacts).into_any_element())
+                (t!("modal.invite"), v_flex().id("invite-list").max_h(dp(320.)).overflow_y_scroll().children(contacts).into_any_element())
             }
             Modal::ConfirmRetract { moderate, .. } => {
-                let text = if *moderate { "Удалить сообщение участника у всех в группе?" } else { "Удалить сообщение у всех? Клиенты без поддержки удаления могут продолжать его показывать." };
-                ("Удалить у всех", div().child(text).into_any_element())
+                let text = if *moderate { t!("modal.retract_mod_text") } else { t!("modal.retract_text") };
+                (t!("menu.retract"), div().child(text).into_any_element())
             }
             Modal::ConfirmDelete { peer } => {
                 let room = sess.chat(peer).is_some_and(|c| c.is_room);
-                let text = if room { "Покинуть группу и удалить переписку?" } else { "Удалить контакт и всю переписку?" };
-                ("Подтверждение", div().child(text).into_any_element())
+                let text = if room { t!("modal.leave_text") } else { t!("modal.delete_text") };
+                (t!("modal.confirm"), div().child(text).into_any_element())
             }
             Modal::Settings | Modal::Media { .. } | Modal::Encryption { .. } | Modal::PgpImport { .. } | Modal::Profile { .. } => return None,
         };
@@ -2889,13 +2911,13 @@ impl App {
             Modal::Invite { .. } => None,
             Modal::ConfirmRetract { msg, moderate } => {
                 let (msg, moderate) = (msg.clone(), *moderate);
-                Some(Button::new("modal-ok").danger().label("Удалить").on_click(cx.listener(move |this, _, _, cx| this.retract(&msg, moderate, cx))))
+                Some(Button::new("modal-ok").danger().label(t!("modal.delete")).on_click(cx.listener(move |this, _, _, cx| this.retract(&msg, moderate, cx))))
             }
             Modal::ConfirmDelete { peer } => {
                 let p = peer.clone();
-                Some(Button::new("modal-ok").danger().label("Удалить").on_click(cx.listener(move |this, _, _, cx| this.delete_chat(p.clone(), cx))))
+                Some(Button::new("modal-ok").danger().label(t!("modal.delete")).on_click(cx.listener(move |this, _, _, cx| this.delete_chat(p.clone(), cx))))
             }
-            _ => Some(Button::new("modal-ok").primary().label("Готово").on_click(cx.listener(|this, _, w, cx| this.submit_modal(w, cx)))),
+            _ => Some(Button::new("modal-ok").primary().label(t!("modal.done")).on_click(cx.listener(|this, _, w, cx| this.submit_modal(w, cx)))),
         };
         Some(
             div()
@@ -2925,7 +2947,7 @@ impl App {
                             h_flex()
                                 .gap_2()
                                 .justify_end()
-                                .child(Button::new("modal-cancel").ghost().label("Отмена").on_click(cx.listener(|this, _, _, cx| this.close_modal(cx))))
+                                .child(Button::new("modal-cancel").ghost().label(t!("modal.cancel")).on_click(cx.listener(|this, _, _, cx| this.close_modal(cx))))
                                 .children(confirm),
                         ),
                 )
@@ -2939,9 +2961,9 @@ impl App {
         let p = style::palette(cx);
         let name = sess.display_name(&call.peer);
         let status = match &call.state {
-            CallState::Outgoing => "Вызов...".to_string(),
-            CallState::Incoming => "Входящий аудиозвонок".to_string(),
-            CallState::Connecting => "Соединение...".to_string(),
+            CallState::Outgoing => t!("call.calling").to_string(),
+            CallState::Incoming => t!("call.incoming").to_string(),
+            CallState::Connecting => t!("call.connecting").to_string(),
             CallState::Active => {
                 let secs = call.started.map_or(0, |s| s.elapsed().as_secs());
                 format!("{:02}:{:02}", secs / 60, secs % 60)

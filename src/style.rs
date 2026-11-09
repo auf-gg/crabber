@@ -141,13 +141,13 @@ pub const DEFAULT_BASE: SchemeColors = SchemeColors {
     },
 };
 
-/// Built-in color scheme: id, label, base colors.
+/// Built-in color scheme: id, label key (locales/*.json), base colors.
 pub struct Preset(pub &'static str, pub &'static str, pub SchemeColors);
 
 pub const PRESETS: &[Preset] = &[
     Preset(
         "emerald",
-        "Изумруд",
+        "scheme.emerald",
         SchemeColors {
             light: SchemeBase { accent: 0x1E9E61, panel: 0xFFFFFF, chat: 0xDCF2E7, bubble_in: 0xFFFFFF, bubble_out: 0x2EB67D, text: 0x0E1A14 },
             dark: SchemeBase { accent: 0x34C98B, panel: 0x152019, chat: 0x0E1712, bubble_in: 0x1A2921, bubble_out: 0x1E6B4C, text: 0xF1F7F4 },
@@ -155,7 +155,7 @@ pub const PRESETS: &[Preset] = &[
     ),
     Preset(
         "sunset",
-        "Закат",
+        "scheme.sunset",
         SchemeColors {
             light: SchemeBase { accent: 0xD95F2B, panel: 0xFFFFFF, chat: 0xFAE6DA, bubble_in: 0xFFFFFF, bubble_out: 0xC95C1E, text: 0x201510 },
             dark: SchemeBase { accent: 0xF0824E, panel: 0x231A15, chat: 0x191009, bubble_in: 0x2B201A, bubble_out: 0x8A4B2F, text: 0xF8F3EF },
@@ -163,7 +163,7 @@ pub const PRESETS: &[Preset] = &[
     ),
     Preset(
         "lilac",
-        "Сирень",
+        "scheme.lilac",
         SchemeColors {
             light: SchemeBase { accent: 0x6B5CE7, panel: 0xFFFFFF, chat: 0xEAE6FB, bubble_in: 0xFFFFFF, bubble_out: 0x5B4DC7, text: 0x161220 },
             dark: SchemeBase { accent: 0x9C8CF2, panel: 0x1C1926, chat: 0x14111F, bubble_in: 0x241F35, bubble_out: 0x4A3F8F, text: 0xF4F2FA },
@@ -171,7 +171,7 @@ pub const PRESETS: &[Preset] = &[
     ),
     Preset(
         "graphite",
-        "Графит",
+        "scheme.graphite",
         SchemeColors {
             light: SchemeBase { accent: 0x5A646E, panel: 0xFFFFFF, chat: 0xE8ECEF, bubble_in: 0xFFFFFF, bubble_out: 0x6B7680, text: 0x14171A },
             dark: SchemeBase { accent: 0x9AA5B1, panel: 0x15181C, chat: 0x101316, bubble_in: 0x1B1F24, bubble_out: 0x3A424C, text: 0xF0F2F4 },

@@ -1,4 +1,5 @@
 //! Voice messages: microphone -> Ogg Opus file (16 kHz mono, like Conversations), and Ogg Opus -> speaker.
+use crate::t;
 use std::collections::VecDeque;
 use std::io::Cursor;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
@@ -38,7 +39,7 @@ impl Recorder {
         let buf = pcm.clone();
         std::thread::spawn(move || {
             let stream = (|| {
-                let input = cpal::default_host().default_input_device().ok_or("нет микрофона")?;
+                let input = cpal::default_host().default_input_device().ok_or(t!("audio.no_mic"))?;
                 let cfg = input.default_input_config().map_err(|e| e.to_string())?;
                 let stream = match cfg.sample_format() {
                     SampleFormat::I16 => record::<i16>(&input, cfg.config(), buf, lv),
@@ -59,7 +60,7 @@ impl Recorder {
                 }
             }
         });
-        init_rx.recv().map_err(|_| "аудиопоток завершился".to_string())??;
+        init_rx.recv().map_err(|_| t!("audio.stream_ended").to_string())??;
         Ok(Self { pcm, level, stop })
     }
 
@@ -102,7 +103,7 @@ where
 /// 16 kHz mono PCM -> Ogg Opus file bytes (RFC 7845).
 pub fn encode(pcm: &[i16]) -> Result<Vec<u8>, String> {
     if pcm.is_empty() {
-        return Err("пустая запись".into());
+        return Err(t!("voice.empty").into());
     }
     let mut out = Vec::new();
     let mut w = PacketWriter::new(&mut out);
@@ -122,7 +123,7 @@ pub fn encode(pcm: &[i16]) -> Result<Vec<u8>, String> {
     let mut err = 0;
     let enc = unsafe { opus::opus_encoder_create(RATE as i32, 1, opus::OPUS_APPLICATION_VOIP, &mut err) };
     if enc.is_null() || err != opus::OPUS_OK {
-        return Err(format!("opus: ошибка {err}"));
+        return Err(t!("audio.opus_error", code = err));
     }
     let frames = pcm.len().div_ceil(FRAME);
     // The last page's granule trims the zero padding of the final frame.
@@ -134,7 +135,7 @@ pub fn encode(pcm: &[i16]) -> Result<Vec<u8>, String> {
         let mut packet = [0u8; 1500];
         let n = unsafe { opus::opus_encode(enc, frame.as_ptr(), FRAME as i32, packet.as_mut_ptr(), packet.len() as i32) };
         if n < 0 {
-            res = Err(format!("opus: ошибка {n}"));
+            res = Err(t!("audio.opus_error", code = n));
             break;
         }
         let last = i + 1 == frames;
@@ -160,9 +161,9 @@ pub fn encode(pcm: &[i16]) -> Result<Vec<u8>, String> {
 pub fn decode(bytes: &[u8]) -> Result<Vec<f32>, String> {
     let mut r = PacketReader::new(Cursor::new(bytes));
     let next = |r: &mut PacketReader<Cursor<&[u8]>>| r.read_packet().map_err(|e| e.to_string());
-    let head = next(&mut r)?.ok_or("пустой файл")?.data;
+    let head = next(&mut r)?.ok_or(t!("voice.empty_file"))?.data;
     if head.len() < 19 || !head.starts_with(b"OpusHead") {
-        return Err("не Opus".into());
+        return Err(t!("voice.not_opus").into());
     }
     let channels = head[9].clamp(1, 2) as usize;
     let pre_skip = u16::from_le_bytes([head[10], head[11]]) as usize;
@@ -170,7 +171,7 @@ pub fn decode(bytes: &[u8]) -> Result<Vec<f32>, String> {
     let mut err = 0;
     let dec = unsafe { opus::opus_decoder_create(48000, channels as i32, &mut err) };
     if dec.is_null() || err != opus::OPUS_OK {
-        return Err(format!("opus: ошибка {err}"));
+        return Err(t!("audio.opus_error", code = err));
     }
     let mut out = Vec::new();
     let mut buf = vec![0i16; 5760 * channels]; // 120 ms, the longest Opus packet
@@ -208,7 +209,7 @@ impl Player {
         let (init_tx, init_rx) = std::sync::mpsc::channel::<Result<(Arc<AtomicUsize>, usize, Arc<AtomicBool>), String>>();
         std::thread::spawn(move || {
             let res = (|| {
-                let output = cpal::default_host().default_output_device().ok_or("нет устройства вывода звука")?;
+                let output = cpal::default_host().default_output_device().ok_or(t!("audio.no_output"))?;
                 let cfg = output.default_output_config().map_err(|e| e.to_string())?;
                 let mut up = Up { step: 48000.0 / cfg.sample_rate() as f64, frac: 0.0, last: 0.0 };
                 let mut buf = VecDeque::new();
@@ -234,7 +235,7 @@ impl Player {
                 }
             }
         });
-        let (pos, len, done) = init_rx.recv().map_err(|_| "аудиопоток завершился".to_string())??;
+        let (pos, len, done) = init_rx.recv().map_err(|_| t!("audio.stream_ended").to_string())??;
         Ok(Self { pos, len, done, _stop: stop })
     }
 

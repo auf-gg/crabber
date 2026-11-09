@@ -3,6 +3,7 @@
 //!
 //! This module is pure crypto and state; `crate::xmpp` does PEP publishing and stanza plumbing.
 //! Interop is checked against python-oldmemo in `tests/omemo_interop.rs`.
+use crate::t;
 use std::collections::BTreeMap;
 
 use aes_gcm::aead::{Aead, KeyInit};
@@ -79,7 +80,7 @@ pub fn parse_pub(data: &[u8]) -> Result<[u8; 32], String> {
     match data {
         [0x05, rest @ ..] if rest.len() == 32 => Ok(rest.try_into().unwrap()),
         rest if rest.len() == 32 => Ok(rest.try_into().unwrap()),
-        _ => Err("неверный открытый ключ".into()),
+        _ => Err(t!("omemo.bad_pubkey").into()),
     }
 }
 
@@ -167,7 +168,7 @@ fn aes_cbc_encrypt(key: &[u8; 32], iv: &[u8; 16], pt: &[u8]) -> Vec<u8> {
 
 fn aes_cbc_decrypt(key: &[u8; 32], iv: &[u8; 16], ct: &[u8]) -> Result<Vec<u8>, String> {
     use cbc::cipher::{BlockModeDecrypt, KeyIvInit, block_padding::Pkcs7};
-    cbc::Decryptor::<aes::Aes256>::new(key.into(), iv.into()).decrypt_padded_vec::<Pkcs7>(ct).map_err(|_| "неверный паддинг".to_string())
+    cbc::Decryptor::<aes::Aes256>::new(key.into(), iv.into()).decrypt_padded_vec::<Pkcs7>(ct).map_err(|_| t!("omemo.bad_padding").to_string())
 }
 
 // ---- minimal protobuf (only what SignalMessage / PreKeySignalMessage use) ----
@@ -202,14 +203,14 @@ fn parse_pb(mut data: &[u8]) -> Result<BTreeMap<u32, PbValue<'_>>, String> {
     fn varint(data: &mut &[u8]) -> Result<u64, String> {
         let mut v = 0u64;
         for shift in (0..64).step_by(7) {
-            let (&b, rest) = data.split_first().ok_or("обрезанный protobuf")?;
+            let (&b, rest) = data.split_first().ok_or(t!("omemo.truncated"))?;
             *data = rest;
             v |= ((b & 0x7F) as u64) << shift;
             if b & 0x80 == 0 {
                 return Ok(v);
             }
         }
-        Err("слишком длинный varint".into())
+        Err(t!("omemo.varint").into())
     }
     let mut map = BTreeMap::new();
     while !data.is_empty() {
@@ -223,13 +224,13 @@ fn parse_pb(mut data: &[u8]) -> Result<BTreeMap<u32, PbValue<'_>>, String> {
             2 => {
                 let len = varint(&mut data)? as usize;
                 if len > data.len() {
-                    return Err("обрезанный protobuf".into());
+                    return Err(t!("omemo.truncated").into());
                 }
                 let (v, rest) = data.split_at(len);
                 data = rest;
                 map.insert(field, PbValue::Bytes(v));
             }
-            _ => return Err("неподдерживаемый тип поля protobuf".into()),
+            _ => return Err(t!("omemo.field_type").into()),
         }
     }
     Ok(map)
@@ -357,7 +358,7 @@ impl Session {
     /// X3DH as initiator against a fetched bundle.
     pub fn initiate(me: &Identity, bundle: &Bundle) -> Result<Self, String> {
         if !xeddsa_verify(&bundle.identity, &serialize_pub(&bundle.signed_prekey), &bundle.signature) {
-            return Err("подпись ключа собеседника неверна".into());
+            return Err(t!("omemo.bad_signature").into());
         }
         let prekey = if bundle.prekeys.is_empty() { None } else { Some(bundle.prekeys[u32::from_le_bytes(random()) as usize % bundle.prekeys.len()]) };
         let base = KeyPair::generate();
@@ -450,13 +451,13 @@ impl Session {
     /// Decrypts a SignalMessage (not the PreKey wrapper).
     fn decrypt_signal(&mut self, me: &Identity, data: &[u8]) -> Result<Vec<u8>, String> {
         if data.len() < 1 + 8 || data[0] >> 4 != 3 {
-            return Err("неподдерживаемая версия сообщения".into());
+            return Err(t!("omemo.bad_version").into());
         }
         let (body, mac) = data.split_at(data.len() - 8);
         let pb = parse_pb(&body[1..])?;
-        let their_ratchet = parse_pub(pb_bytes(&pb, 1).ok_or("нет ключа храповика")?)?;
+        let their_ratchet = parse_pub(pb_bytes(&pb, 1).ok_or(t!("omemo.no_ratchet"))?)?;
         let counter = pb_int(&pb, 2).unwrap_or(0) as u32;
-        let ct = pb_bytes(&pb, 4).ok_or("нет шифротекста")?;
+        let ct = pb_bytes(&pb, 4).ok_or(t!("omemo.no_ciphertext"))?;
 
         // Work on a copy: a forged message must not advance the real state.
         let mut s = self.clone();
@@ -464,7 +465,7 @@ impl Session {
         let keys = message_keys(&chain_key);
         let expect = hmac(&keys.mac, &[&serialize_pub(&s.their_identity), &serialize_pub(&me.identity.public), body]);
         if expect[..8] != *mac {
-            return Err("неверная подпись сообщения (MAC)".into());
+            return Err(t!("omemo.bad_mac").into());
         }
         let pt = aes_cbc_decrypt(&keys.cipher, &keys.iv, ct)?;
         s.pending = None; // the peer answered, so it has our session
@@ -495,10 +496,10 @@ impl Session {
         }
         let chain = self.receivers.iter_mut().find(|c| c.their_ratchet == *their_ratchet).unwrap();
         if counter < chain.index {
-            return Err("повтор или слишком старое сообщение".into());
+            return Err(t!("omemo.replay").into());
         }
         if counter - chain.index > MAX_SKIP {
-            return Err("слишком много пропущенных сообщений".into());
+            return Err(t!("omemo.too_many_skipped").into());
         }
         while chain.index < counter {
             self.skipped.push((chain.their_ratchet, chain.index, chain.chain_key));
@@ -527,21 +528,21 @@ pub struct Decrypted {
 /// Decrypts a `<key>`: SignalMessage with an existing session, or PreKeySignalMessage (new session).
 pub fn decrypt_key(me: &Identity, existing: Option<&Session>, data: &[u8], prekey: bool) -> Result<Decrypted, String> {
     if !prekey {
-        let mut s = existing.cloned().ok_or("нет сессии с этим устройством")?;
+        let mut s = existing.cloned().ok_or(t!("omemo.no_session"))?;
         let plaintext = s.decrypt_signal(me, data)?;
         return Ok(Decrypted { plaintext, session: s, used_prekey: None });
     }
     if data.first().is_none_or(|v| v >> 4 != 3) {
-        return Err("неподдерживаемая версия PreKey-сообщения".into());
+        return Err(t!("omemo.bad_prekey_version").into());
     }
     let pb = parse_pb(&data[1..])?;
-    let base_key = parse_pub(pb_bytes(&pb, 2).ok_or("нет базового ключа")?)?;
-    let their_identity = parse_pub(pb_bytes(&pb, 3).ok_or("нет ключа личности")?)?;
-    let inner = pb_bytes(&pb, 4).ok_or("нет вложенного сообщения")?;
+    let base_key = parse_pub(pb_bytes(&pb, 2).ok_or(t!("omemo.no_base_key"))?)?;
+    let their_identity = parse_pub(pb_bytes(&pb, 3).ok_or(t!("omemo.no_identity"))?)?;
+    let inner = pb_bytes(&pb, 4).ok_or(t!("omemo.no_inner"))?;
     let prekey_id = pb_int(&pb, 1).map(|v| v as u32);
     let spk_id = pb_int(&pb, 6).unwrap_or(0) as u32;
     if spk_id != me.signed_prekey_id {
-        return Err("неизвестный подписанный ключ".into());
+        return Err(t!("omemo.unknown_spk").into());
     }
     // A retransmitted initial message for a session we already built from it.
     if let Some(s) = existing.filter(|s| s.base_key == Some(base_key)) {
@@ -550,7 +551,7 @@ pub fn decrypt_key(me: &Identity, existing: Option<&Session>, data: &[u8], preke
         return Ok(Decrypted { plaintext, session: s, used_prekey: None });
     }
     let opk = match prekey_id {
-        Some(id) => Some(me.prekeys.get(&id).ok_or("одноразовый ключ уже использован")?),
+        Some(id) => Some(me.prekeys.get(&id).ok_or(t!("omemo.prekey_used"))?),
         None => None,
     };
     let mut s = Session::respond(me, their_identity, base_key, opk);
@@ -584,11 +585,11 @@ pub fn decrypt_payload(key_material: &[u8], iv: &[u8], ciphertext: &[u8]) -> Res
     let (key, data) = match key_material.len() {
         32 => (&key_material[..16], [ciphertext, &key_material[16..]].concat()),
         16 => (key_material, ciphertext.to_vec()),
-        _ => return Err("неверная длина ключа".into()),
+        _ => return Err(t!("omemo.bad_key_len").into()),
     };
-    let iv: [u8; 12] = iv.try_into().map_err(|_| "поддерживается только IV длиной 12 байт".to_string())?;
+    let iv: [u8; 12] = iv.try_into().map_err(|_| t!("omemo.iv_len").to_string())?;
     let key: [u8; 16] = key.try_into().unwrap();
-    aes_gcm::Aes128Gcm::new(&key.into()).decrypt(&iv.into(), data.as_slice()).map_err(|_| "сообщение повреждено или подделано".to_string())
+    aes_gcm::Aes128Gcm::new(&key.into()).decrypt(&iv.into(), data.as_slice()).map_err(|_| t!("omemo.tampered").to_string())
 }
 
 /// XEP-0454 file encryption: AES-256-GCM, URL fragment = hex(iv(12) || key(32)).
@@ -605,14 +606,14 @@ pub fn decrypt_file(data: &[u8], fragment: &str) -> Result<Vec<u8>, String> {
     let (iv, key) = match bytes.len() {
         44 => (&bytes[..12], &bytes[12..]),
         48 => (&bytes[..16], &bytes[16..]),
-        _ => return Err("неверный ключ файла".into()),
+        _ => return Err(t!("omemo.bad_file_key").into()),
     };
     if iv.len() != 12 {
-        return Err("поддерживается только IV длиной 12 байт".into());
+        return Err(t!("omemo.iv_len").into());
     }
     let key: [u8; 32] = key.try_into().unwrap();
     let iv: [u8; 12] = iv.try_into().unwrap();
-    aes_gcm::Aes256Gcm::new(&key.into()).decrypt(&iv.into(), data).map_err(|_| "файл повреждён".to_string())
+    aes_gcm::Aes256Gcm::new(&key.into()).decrypt(&iv.into(), data).map_err(|_| t!("omemo.file_corrupt").to_string())
 }
 
 #[cfg(test)]

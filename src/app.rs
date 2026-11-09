@@ -1,4 +1,5 @@
 //! UI state and logic. All persistence happens here; the network thread only reports events.
+use crabber::t;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -128,6 +129,8 @@ pub struct Settings {
     pub autostart: bool,
     /// Autostart opens Crabber in the tray instead of a window.
     pub start_minimized: bool,
+    /// "system" | "ru" | "en" | "zh"
+    pub lang: String,
 }
 
 impl Settings {
@@ -144,7 +147,12 @@ impl Settings {
             ui_scale: s.get("ui_scale").and_then(|v| v.parse().ok()).filter(|v: &f32| (0.5..=2.0).contains(v)).unwrap_or(1.0),
             autostart: desktop::autostart(),
             start_minimized: flag("start_minimized"),
+            lang: s.get("lang").unwrap_or_else(|| "system".into()),
         }
+    }
+    /// Switches the UI texts to the chosen language; "system" follows the OS.
+    fn apply_lang(&self) {
+        crabber::i18n::set(crabber::i18n::Lang::from_code(&self.lang).unwrap_or_else(crabber::i18n::Lang::system));
     }
     fn save(&self, s: &Store) {
         let b = |v: bool| if v { "1" } else { "0" };
@@ -159,6 +167,7 @@ impl Settings {
         s.set("blind_trust", b(self.blind_trust));
         s.set("ui_scale", &self.ui_scale.to_string());
         s.set("start_minimized", b(self.start_minimized));
+        s.set("lang", &self.lang);
     }
 }
 
@@ -494,16 +503,17 @@ impl App {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let app_store = Store::open(&store::data_dir().join("app.db")).expect("cannot open settings database");
         let settings = Settings::load(&app_store);
+        settings.apply_lang();
         let saved_jid = app_store.get("jid").unwrap_or_default();
         let saved_host = app_store.get("host").unwrap_or_default();
         let insecure = app_store.get("insecure").is_some_and(|v| v == "1");
 
         let login_jid = cx.new(|cx| InputState::new(window, cx).placeholder("user@example.com").default_value(saved_jid.clone()));
-        let login_pass = cx.new(|cx| InputState::new(window, cx).placeholder("Пароль").masked(true));
-        let login_host = cx.new(|cx| InputState::new(window, cx).placeholder("Сервер host[:порт] — необязательно").default_value(saved_host));
-        let search = cx.new(|cx| InputState::new(window, cx).placeholder("Поиск"));
+        let login_pass = cx.new(|cx| InputState::new(window, cx).placeholder(t!("login.password")).masked(true));
+        let login_host = cx.new(|cx| InputState::new(window, cx).placeholder(t!("login.host")).default_value(saved_host));
+        let search = cx.new(|cx| InputState::new(window, cx).placeholder(t!("search.placeholder")));
         // Enter sends, Shift+Enter starts a new line (for ``` code blocks).
-        let compose = cx.new(|cx| TextareaState::new(window, cx).placeholder("Написать сообщение…").auto_grow(1, 8).submit_on_enter(true));
+        let compose = cx.new(|cx| TextareaState::new(window, cx).placeholder(t!("compose.placeholder")).auto_grow(1, 8).submit_on_enter(true));
         let field1 = cx.new(|cx| InputState::new(window, cx));
         let field2 = cx.new(|cx| InputState::new(window, cx));
         let field3 = cx.new(|cx| TextareaState::new(window, cx).placeholder("-----BEGIN PGP ... KEY BLOCK-----").rows(8));
@@ -804,12 +814,12 @@ impl App {
         let jid = self.login_jid.read(cx).value().trim().to_string();
         let password = self.login_pass.read(cx).value().to_string();
         if BareJid::from_str(&jid).is_err() || !jid.contains('@') {
-            self.login_error = "Неверный JID, нужен формат user@server".into();
+            self.login_error = t!("login.bad_jid").into();
             cx.notify();
             return;
         }
         if password.is_empty() {
-            self.login_error = "Введите пароль".into();
+            self.login_error = t!("login.no_password").into();
             cx.notify();
             return;
         }
@@ -827,7 +837,7 @@ impl App {
         let store = match Store::open(&dir.join("chat.db")) {
             Ok(s) => s,
             Err(e) => {
-                self.login_error = format!("Не удалось открыть базу: {e}").into();
+                self.login_error = t!("login.db_failed", e = e).into();
                 cx.notify();
                 return;
             }
@@ -857,7 +867,7 @@ impl App {
             dir,
             online: false,
             ever_online: false,
-            status: "Подключение...".into(),
+            status: t!("status.connecting").into(),
             show: None,
             chats,
             presence: HashSet::new(),
@@ -975,8 +985,17 @@ impl App {
 
     /// Changes a preference, persists it and re-applies the theme.
     pub fn update_settings(&mut self, window: &mut Window, cx: &mut Context<Self>, f: impl FnOnce(&mut Settings)) {
+        let lang = self.settings.lang.clone();
         f(&mut self.settings);
         self.settings.save(&self.app_store);
+        if self.settings.lang != lang {
+            self.settings.apply_lang();
+            // Placeholders are set once at startup; the rest of the UI re-reads texts on render.
+            self.login_pass.update(cx, |s, cx| s.set_placeholder(t!("login.password"), window, cx));
+            self.login_host.update(cx, |s, cx| s.set_placeholder(t!("login.host"), window, cx));
+            self.search.update(cx, |s, cx| s.set_placeholder(t!("search.placeholder"), window, cx));
+            self.compose.update(cx, |s, cx| s.set_placeholder(t!("compose.placeholder"), window, cx));
+        }
         self.apply_theme(window, cx);
         cx.notify();
     }
@@ -1188,7 +1207,7 @@ impl App {
                 Ev::Online { .. } => {
                     sess.online = true;
                     sess.ever_online = true;
-                    sess.status = "В сети".into();
+                    sess.status = t!("status.online_title").into();
                     let rooms = sess
                         .chats
                         .iter()
@@ -1208,7 +1227,7 @@ impl App {
                     sess.online = false;
                     sess.presence.clear();
                     sess.members.clear();
-                    sess.status = format!("Нет соединения, переподключение... ({e})").into();
+                    sess.status = t!("status.reconnecting", e = e).into();
                 }
                 Ev::Roster(contacts) => {
                     let jids: HashSet<String> = contacts.iter().map(|c| c.jid.clone()).collect();
@@ -1267,11 +1286,11 @@ impl App {
                     if notify && live && !msg.outgoing && !viewing && !seen {
                         let title = if groupchat { format!("{} — {}", sess.display_name(&peer), msg.sender) } else { sess.display_name(&peer) };
                         let body = match &msg.url {
-                            Some(u) if is_image(u) => "Фото".to_string(),
-                            Some(u) if is_audio(u) => "Голосовое сообщение".to_string(),
-                            Some(_) => "Файл".to_string(),
+                            Some(u) if is_image(u) => t!("media.photo").to_string(),
+                            Some(u) if is_audio(u) => t!("media.voice").to_string(),
+                            Some(_) => t!("media.file").to_string(),
                             None if notify_text => msg.body.clone(),
-                            None => "Новое сообщение".to_string(),
+                            None => t!("notify.new_message").to_string(),
                         };
                         desktop::notify(&peer, &title, &body, Some(&store::avatar_path(&sess.dir, &peer)));
                     }
@@ -1399,7 +1418,7 @@ impl App {
                     sess.ensure_chat(&room, true).name = name;
                     sess.save(&room);
                 }
-                Ev::RoomError { room, error } => notes.push(format!("Группа {room}: {error}")),
+                Ev::RoomError { room, error } => notes.push(t!("note.room_error", room = room, error = error)),
                 Ev::Member { room, occupant, gone } => {
                     let list = sess.members.entry(room).or_default();
                     if gone {
@@ -1430,7 +1449,7 @@ impl App {
                         sess.ensure_chat(&room, true);
                         sess.send(Cmd::Join { room: room.clone(), nick, since: None, create_name: None });
                         sess.publish_bookmark(&room);
-                        notes.push(format!("{from} добавил вас в группу {room}"));
+                        notes.push(t!("note.invited", from = from, room = room));
                     }
                 }
                 Ev::Avatar { jid } => sess.load_avatar(&jid),
@@ -1455,7 +1474,7 @@ impl App {
                             m.status = -1;
                         }
                     });
-                    notes.push(format!("Не отправлено: {error}"));
+                    notes.push(t!("note.send_failed", error = error));
                 }
                 Ev::SentEncrypted { peer, id, enc } => {
                     sess.store.set_enc(&peer, &id, enc);
@@ -1488,7 +1507,7 @@ impl App {
                     if let CallState::Ended(reason) = &state
                         && !reason.is_empty()
                     {
-                        notes.push(format!("Звонок завершён: {reason}"));
+                        notes.push(t!("note.call_ended", reason = reason));
                     }
                     // Ringing in a minimized or tray-hidden window would go unseen: bring the window up.
                     if state == CallState::Incoming && sess.call.is_none() {
@@ -1511,7 +1530,7 @@ impl App {
         if let Some(e) = failed_login {
             self.sess = None;
             self.connecting = false;
-            self.login_error = format!("Не удалось войти: {e}").into();
+            self.login_error = t!("login.failed", e = e).into();
             cx.notify();
             return;
         }
@@ -1845,18 +1864,18 @@ impl App {
         let groupchat = sess.chat(&peer).is_some_and(|c| c.is_room);
         let sender = if groupchat { sess.chat(&peer).map(|c| c.nick.clone()).unwrap_or_default() } else { sess.me.clone() };
         let id = xmpp::new_id();
-        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("файл").to_string();
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or(t!("media.file_fallback")).to_string();
         let Some(sess) = self.sess.as_mut() else { return };
         sess.uploads.insert(id.clone(), path.clone());
         let enc = sess.chat(&peer).map(|c| c.enc.clone()).unwrap_or_default();
         sess.send(Cmd::Upload { to: peer.clone(), id: id.clone(), path, groupchat, enc });
-        self.push_outgoing(&peer, Msg { msg_id: id, sender, outgoing: true, body: format!("Отправка файла {name}..."), url: None, ts: now_ms(), status: 0, enc: 0, edited: false, reply_to: None, retracted: false });
+        self.push_outgoing(&peer, Msg { msg_id: id, sender, outgoing: true, body: t!("upload.sending", name = name), url: None, ts: now_ms(), status: 0, enc: 0, edited: false, reply_to: None, retracted: false });
     }
 
     /// Mic button: starts a voice message.
     pub fn start_recording(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.sess.as_ref().is_some_and(|s| s.call.is_some()) {
-            return window.push_notification("Во время звонка микрофон занят", cx);
+            return window.push_notification(t!("voice.mic_busy"), cx);
         }
         self.player = None; // don't record our own speaker
         match crabber::voice::Recorder::start() {
@@ -1864,7 +1883,7 @@ impl App {
                 self.recording = Some((r, Instant::now()));
                 self.animate(cx);
             }
-            Err(e) => window.push_notification(format!("Не удалось включить микрофон: {e}"), cx),
+            Err(e) => window.push_notification(t!("voice.mic_failed", e = e), cx),
         }
         cx.notify();
     }
@@ -1887,7 +1906,7 @@ impl App {
         }
         // Exact zeros: a hardware mute or a dead input, not a quiet room (that still has noise).
         if pcm.iter().all(|s| *s == 0) {
-            return window.push_notification("Микрофон передаёт только тишину — проверьте кнопку отключения звука на микрофоне и выбранное устройство ввода в настройках звука", cx);
+            return window.push_notification(t!("voice.silence"), cx);
         }
         let task = cx.background_executor().spawn(async move {
             let bytes = crabber::voice::encode(&pcm)?;
@@ -1903,7 +1922,7 @@ impl App {
                     app.send_file(&peer, path);
                     cx.notify();
                 }
-                Err(e) => window.push_notification(format!("Не удалось сохранить запись: {e}"), cx),
+                Err(e) => window.push_notification(t!("voice.save_failed", e = e), cx),
             });
         })
         .detach();
@@ -1933,7 +1952,7 @@ impl App {
                     app.animate(cx);
                     cx.notify();
                 }
-                Err(e) => window.push_notification(format!("Не удалось воспроизвести: {e}"), cx),
+                Err(e) => window.push_notification(t!("play.failed", e = e), cx),
             });
         })
         .detach();
@@ -1988,7 +2007,7 @@ impl App {
     }
 
     pub fn change_avatar(&mut self, cx: &mut Context<Self>) {
-        let paths = cx.prompt_for_paths(PathPromptOptions { files: true, directories: false, multiple: false, prompt: Some("Аватар".into()) });
+        let paths = cx.prompt_for_paths(PathPromptOptions { files: true, directories: false, multiple: false, prompt: Some(t!("avatar.prompt").into()) });
         cx.spawn(async move |this, cx| {
             let Ok(Ok(Some(mut paths))) = paths.await else { return };
             let Some(path) = paths.pop() else { return };
@@ -2090,7 +2109,7 @@ impl App {
                     app.viewer_focus.focus(window, cx);
                     app.video_ticker(ticker, window, cx);
                 }
-                Err(e) => window.push_notification(format!("Не удалось открыть видео: {e}"), cx),
+                Err(e) => window.push_notification(t!("video.open_failed", e = e), cx),
             });
         })
         .detach();
@@ -2110,7 +2129,7 @@ impl App {
                 }
                 *play = Some(p);
             }
-            Err(e) => window.push_notification(format!("Не удалось воспроизвести: {e}"), cx),
+            Err(e) => window.push_notification(t!("play.failed", e = e), cx),
         }
         cx.notify();
     }
@@ -2198,7 +2217,7 @@ impl App {
                 Ok(Ok(Some(dest))) => dest,
                 // Linux without xdg-desktop-portal: no dialog at all, so say why.
                 Ok(Err(e)) => {
-                    let _ = this.update_in(cx, |_, window, cx| window.push_notification(format!("Не удалось открыть диалог сохранения: {e}"), cx));
+                    let _ = this.update_in(cx, |_, window, cx| window.push_notification(t!("save.dialog_failed", e = e), cx));
                     return;
                 }
                 _ => return,
@@ -2206,7 +2225,7 @@ impl App {
             let _ = this.update_in(cx, |app, window, cx| match src {
                 Some(src) => {
                     if let Err(e) = std::fs::copy(&src, &dest) {
-                        window.push_notification(format!("Не удалось сохранить: {e}"), cx);
+                        window.push_notification(t!("save.failed", e = e), cx);
                     }
                 }
                 None => {
@@ -2245,9 +2264,9 @@ impl App {
 
     pub fn open_modal(&mut self, modal: Modal, window: &mut Window, cx: &mut Context<Self>) {
         let (p1, p2) = match &modal {
-            Modal::AddContact => ("Адрес контакта, например bob@example.com", "Имя (необязательно)"),
-            Modal::NewGroup => ("", "Название группы"),
-            Modal::JoinGroup => ("", "Адрес группы, например room@conference.example.com"),
+            Modal::AddContact => (t!("modal.contact_addr"), t!("modal.contact_name")),
+            Modal::NewGroup => ("", t!("modal.group_name")),
+            Modal::JoinGroup => ("", t!("modal.group_addr")),
             _ => ("", ""),
         };
         self.field1.update(cx, |s, cx| {
@@ -2276,7 +2295,7 @@ impl App {
         match self.modal.take() {
             Some(Modal::AddContact) => {
                 if BareJid::from_str(&v1).is_err() || !v1.contains('@') {
-                    window.push_notification("Неверный адрес контакта", cx);
+                    window.push_notification(t!("modal.bad_contact"), cx);
                     self.modal = Some(Modal::AddContact);
                     return;
                 }
@@ -2306,7 +2325,7 @@ impl App {
             }
             Some(Modal::JoinGroup) => {
                 if BareJid::from_str(&v2).is_err() || !v2.contains('@') {
-                    window.push_notification("Неверный адрес группы", cx);
+                    window.push_notification(t!("modal.bad_group"), cx);
                     self.modal = Some(Modal::JoinGroup);
                     return;
                 }
@@ -2325,7 +2344,7 @@ impl App {
     pub fn invite(&mut self, room: String, jid: String, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(sess) = &self.sess {
             sess.send(Cmd::Invite { room, jid: jid.clone() });
-            window.push_notification(format!("Приглашение отправлено: {jid}"), cx);
+            window.push_notification(t!("modal.invite_sent", jid = jid), cx);
         }
         self.close_modal(cx);
     }
@@ -2412,10 +2431,10 @@ impl App {
         let body = match c.started {
             Some(t) => {
                 let s = t.elapsed().as_secs();
-                format!("{} звонок · {:02}:{:02}", if c.outgoing { "Исходящий" } else { "Входящий" }, s / 60, s % 60)
+                format!("{} · {:02}:{:02}", if c.outgoing { t!("call.outgoing_log") } else { t!("call.incoming_log") }, s / 60, s % 60)
             }
-            None if c.outgoing => "Исходящий звонок · без ответа".to_string(),
-            None => "Пропущенный звонок".to_string(),
+            None if c.outgoing => t!("call.no_answer").to_string(),
+            None => t!("call.missed").to_string(),
         };
         let sender = if c.outgoing { me } else { c.peer.clone() };
         let msg = Msg { msg_id: format!("{CALL_ID}{}", xmpp::new_id()), sender, outgoing: c.outgoing, body, url: None, ts: now_ms(), status: 2, enc: 0, edited: false, reply_to: None, retracted: false };
@@ -2462,7 +2481,7 @@ fn read_chat(sess: &mut Session, peer: &str) {
 }
 
 pub fn file_name(url: &str) -> String {
-    url.split(['?', '#']).next().unwrap_or(url).rsplit('/').next().unwrap_or("файл").to_string()
+    url.split(['?', '#']).next().unwrap_or(url).rsplit('/').next().unwrap_or(t!("media.file_fallback")).to_string()
 }
 
 pub fn ext(url: &str) -> String {

@@ -1,4 +1,5 @@
 //! Video playback through the system ffmpeg/ffprobe (not bundled): BGRA frames for the UI, PCM to the speaker.
+use crate::t;
 use std::collections::VecDeque;
 use std::io::Read;
 use std::path::Path;
@@ -45,7 +46,7 @@ pub fn probe(path: &Path) -> Result<Info, String> {
         .output()
         .map_err(|e| e.to_string())?;
     let text = String::from_utf8_lossy(&out.stdout);
-    let duration = text.lines().find_map(|l| l.trim().parse::<f64>().ok()).ok_or("не видео")?;
+    let duration = text.lines().find_map(|l| l.trim().parse::<f64>().ok()).ok_or(t!("video.not_video"))?;
     Ok(Info { duration, has_audio: text.lines().any(|l| l.trim() == "audio") })
 }
 
@@ -58,7 +59,7 @@ pub fn thumbnail(src: &Path, dst: &Path) -> Result<(), String> {
         .arg(dst)
         .status()
         .is_ok_and(|s| s.success());
-    if ok && dst.is_file() { Ok(()) } else { Err("ffmpeg не смог прочитать видео".into()) }
+    if ok && dst.is_file() { Ok(()) } else { Err(t!("video.ffmpeg_failed").into()) }
 }
 
 /// Playback from `from` seconds; dropping it stops both ffmpeg processes.
