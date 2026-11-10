@@ -246,6 +246,10 @@ pub struct CallUi {
     pub muted: bool,
     /// The peer is not played.
     pub deafened: bool,
+    /// What the peer reported: mic off, holding the call, ringing.
+    pub peer_muted: bool,
+    pub peer_held: bool,
+    pub peer_ringing: bool,
     pub started: Option<Instant>,
     pub outgoing: bool,
     /// The call carries video (proposed with it or upgraded).
@@ -260,7 +264,21 @@ pub struct CallUi {
 impl CallUi {
     pub fn new(peer: String, state: CallState) -> Self {
         let outgoing = state == CallState::Outgoing;
-        Self { peer, state, muted: false, deafened: false, started: None, outgoing, video: false, sending: None, remote: None, local: None }
+        Self {
+            peer,
+            state,
+            muted: false,
+            deafened: false,
+            peer_muted: false,
+            peer_held: false,
+            peer_ringing: false,
+            started: None,
+            outgoing,
+            video: false,
+            sending: None,
+            remote: None,
+            local: None,
+        }
     }
 }
 
@@ -1713,6 +1731,11 @@ impl App {
                     }
                 }
                 Ev::Call(CallEv::Notice(text)) => notes.push(text),
+                Ev::Call(CallEv::Peer { muted, held, ringing }) => {
+                    if let Some(c) = sess.call.as_mut() {
+                        (c.peer_muted, c.peer_held, c.peer_ringing) = (muted, held, ringing);
+                    }
+                }
             }
         }
         sess.store.commit();

@@ -504,12 +504,14 @@ fn menu_chevron(
 
 fn call_status(call: &crate::app::CallUi) -> String {
     match &call.state {
+        CallState::Outgoing if call.peer_ringing => t!("call.ringing").to_string(),
         CallState::Outgoing => t!("call.calling").to_string(),
         CallState::Incoming => t!("call.incoming").to_string(),
         CallState::Connecting => t!("call.connecting").to_string(),
         CallState::Active => {
             let secs = call.started.map_or(0, |s| s.elapsed().as_secs());
-            format!("{:02}:{:02}", secs / 60, secs % 60)
+            let time = format!("{:02}:{:02}", secs / 60, secs % 60);
+            if call.peer_held { format!("{} · {time}", t!("call.on_hold")) } else { time }
         }
         CallState::Ended(r) => r.clone(),
     }
@@ -3226,7 +3228,7 @@ impl App {
             .gap_3()
             .items_center()
             .justify_center()
-            .child(tile(call.remote.clone(), &call.peer, name.clone(), false))
+            .child(tile(call.remote.clone(), &call.peer, name.clone(), call.peer_muted))
             .child(tile(call.local.clone(), &sess.me, me, call.muted));
 
         // A round button: `bg` fills it (white = on), else it is see-through; `alert` paints the icon red.

@@ -12,15 +12,17 @@ use futures::StreamExt;
 use futures::channel::mpsc::{UnboundedSender, unbounded};
 use rtc::media::Sample;
 use rtc::media_stream::MediaStreamTrack;
-use rtc::peer_connection::configuration::media_engine::{MIME_TYPE_PCMU, MIME_TYPE_VP8, MediaEngine};
+use rtc::peer_connection::configuration::media_engine::{MIME_TYPE_OPUS, MIME_TYPE_PCMU, MIME_TYPE_VP8, MediaEngine};
 use rtc::rtp::packetizer::Depacketizer;
 use rtc::rtp_transceiver::rtp_sender::{RTCPFeedback, RTCRtpCodec, RTCRtpCodecParameters, RTCRtpCodingParameters, RTCRtpEncodingParameters, RtpCodecKind};
 use tokio_xmpp::IqRequest;
 use tokio_xmpp::jid::{BareJid, Jid};
 use tokio_xmpp::minidom::Element;
+use tokio_xmpp::minidom::rxml::Namespace;
 use tokio_xmpp::parsers::message::{Message, MessageType};
 use tokio_xmpp::parsers::stanza_error::DefinedCondition;
 use webrtc::media_stream::track_local::TrackLocal;
+use webrtc::media_stream::track_local::static_rtp::TrackLocalStaticRTP;
 use webrtc::media_stream::track_local::static_sample::TrackLocalStaticSample;
 use webrtc::media_stream::track_remote::{TrackRemote, TrackRemoteEvent};
 use webrtc::peer_connection::{
@@ -43,9 +45,30 @@ const NS_HDREXT: &str = "urn:xmpp:jingle:apps:rtp:rtp-hdrext:0";
 const NS_SSMA: &str = "urn:xmpp:jingle:apps:rtp:ssma:0";
 const NS_GROUP: &str = "urn:xmpp:jingle:apps:grouping:0";
 const NS_HINTS: &str = "urn:xmpp:hints";
+const NS_RTP_INFO: &str = "urn:xmpp:jingle:apps:rtp:info:1";
+const NS_JINGLE_ERRORS: &str = "urn:xmpp:jingle:errors:1";
 
-/// Our VP8 payload type in offers; answers echo the offerer's (see `vp8_pt`).
+const ACTIONS: [&str; 15] = [
+    "content-accept",
+    "content-add",
+    "content-modify",
+    "content-reject",
+    "content-remove",
+    "description-info",
+    "security-info",
+    "session-accept",
+    "session-info",
+    "session-initiate",
+    "session-terminate",
+    "transport-accept",
+    "transport-info",
+    "transport-reject",
+    "transport-replace",
+];
+
+/// Our payload types in offers; answers echo the offerer's (see `update_formats`).
 const VP8_PT: u8 = 96;
+const OPUS_PT: u8 = 111;
 
 /// Received audio RTP packets across all calls; lets tests and diagnostics see that media flows.
 pub static RTP_RECEIVED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -80,6 +103,68 @@ pub enum CallEv {
     Media { video: bool, sending: Option<Source> },
     /// Something went wrong without ending the call (camera, screen picker, video declined).
     Notice(String),
+    /// What the peer told us (XEP-0167 session-info, XEP-0353 ringing).
+    Peer { muted: bool, held: bool, ringing: bool },
+}
+
+/// Why a Jingle request is refused: the stanza error, with the Jingle condition when there is one (XEP-0166 §10).
+#[derive(Debug, PartialEq)]
+pub struct JingleError {
+    pub condition: DefinedCondition,
+    pub jingle: Option<&'static str>,
+}
+
+impl JingleError {
+    fn new(condition: DefinedCondition, jingle: Option<&'static str>) -> Self {
+        Self { condition, jingle }
+    }
+
+    /// `<error>` content: the Jingle condition in its own namespace.
+    pub fn jingle_element(&self) -> Option<Element> {
+        self.jingle.map(|j| Element::builder(j, NS_JINGLE_ERRORS).build())
+    }
+
+    /// `modify` for requests the sender could fix, `cancel` otherwise.
+    pub fn retry(&self) -> bool {
+        matches!(self.condition, DefinedCondition::BadRequest | DefinedCondition::FeatureNotImplemented)
+    }
+}
+
+/// What incoming Jingle requests are checked against: they are answered in the XMPP loop, before
+/// the actor sees them.
+#[derive(Default)]
+struct Session {
+    sid: Option<String>,
+    initiator: bool,
+    /// Our session-initiate waits for session-accept.
+    awaiting_accept: bool,
+    /// Our content-add waits for content-accept / content-reject.
+    adding: bool,
+}
+
+/// Whether we take a Jingle request (XEP-0166 §10).
+fn check(el: &Element, s: &Session) -> Result<(), JingleError> {
+    let action = el.attr("action").unwrap_or_default();
+    let refuse = |c, j| Err(JingleError::new(c, j));
+    if !ACTIONS.contains(&action) {
+        return refuse(DefinedCondition::BadRequest, None);
+    }
+    if action != "session-initiate" && s.sid.as_deref() != el.attr("sid") {
+        return refuse(DefinedCondition::ItemNotFound, Some("unknown-session"));
+    }
+    match action {
+        "session-accept" if !s.awaiting_accept => refuse(DefinedCondition::UnexpectedRequest, Some("out-of-order")),
+        "content-accept" | "content-reject" if !s.adding => refuse(DefinedCondition::UnexpectedRequest, Some("out-of-order")),
+        // Both added media at once: the initiator's addition wins (§7.2.16).
+        "content-add" if s.adding && s.initiator => refuse(DefinedCondition::Conflict, Some("tie-break")),
+        "session-info" if !known_info(el) => refuse(DefinedCondition::FeatureNotImplemented, Some("unsupported-info")),
+        _ => Ok(()),
+    }
+}
+
+/// session-info payloads we understand; an empty session-info is a ping (XEP-0166 §6.8).
+fn known_info(el: &Element) -> bool {
+    el.children().all(|c| c.ns() == NS_RTP_INFO && matches!(c.name(), "active" | "hold" | "unhold" | "mute" | "unmute" | "ringing"))
 }
 
 enum Msg {
@@ -97,23 +182,22 @@ enum Msg {
 pub struct Calls {
     tx: UnboundedSender<Msg>,
     me: BareJid,
-    /// Current session id, for synchronous IQ validation.
-    sid: Arc<Mutex<Option<String>>>,
+    session: Arc<Mutex<Session>>,
     bound: Arc<Mutex<Option<Jid>>>,
 }
 
 impl Calls {
     pub fn new(net: Net, me: BareJid) -> Self {
         let (tx, mut rx) = unbounded();
-        let sid = Arc::new(Mutex::new(None));
+        let session = Arc::new(Mutex::new(Session::default()));
         let bound = Arc::new(Mutex::new(None));
-        let mut actor = Actor { net, me: me.clone(), tx: tx.clone(), call: None, sid: sid.clone(), bound: bound.clone() };
+        let mut actor = Actor { net, me: me.clone(), tx: tx.clone(), call: None, session: session.clone(), bound: bound.clone() };
         tokio::spawn(async move {
             while let Some(msg) = rx.next().await {
                 actor.handle(msg).await;
             }
         });
-        Self { tx, me, sid, bound }
+        Self { tx, me, session, bound }
     }
 
     pub fn set_bound(&self, jid: Jid) {
@@ -125,13 +209,9 @@ impl Calls {
     }
 
     /// Validates synchronously so the IQ can be answered; the work happens in the actor.
-    pub fn on_jingle(&self, from: Option<Jid>, el: Element) -> Result<(), DefinedCondition> {
-        let from = from.ok_or(DefinedCondition::BadRequest)?;
-        let action = el.attr("action").unwrap_or_default();
-        let sid = el.attr("sid").unwrap_or_default();
-        if action != "session-initiate" && self.sid.lock().unwrap().as_deref() != Some(sid) {
-            return Err(DefinedCondition::ItemNotFound);
-        }
+    pub fn on_jingle(&self, from: Option<Jid>, el: Element) -> Result<(), JingleError> {
+        let from = from.ok_or(JingleError::new(DefinedCondition::BadRequest, None))?;
+        check(&el, &self.session.lock().unwrap())?;
         let _ = self.tx.unbounded_send(Msg::Jingle(from, el));
         Ok(())
     }
@@ -148,6 +228,15 @@ impl Calls {
 
 /// Our video track once added: track, SSRC and the negotiated VP8 payload type.
 type VideoTrack = Arc<Mutex<Option<(Arc<TrackLocalStaticSample>, u32, u8)>>>;
+
+/// What our audio goes out as: Opus unless the peer only has PCMU, under the negotiated payload type.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct AudioFormat {
+    opus: bool,
+    pt: u8,
+}
+
+type AudioOut = Arc<Mutex<AudioFormat>>;
 
 struct Call {
     sid: String,
@@ -169,6 +258,7 @@ struct Call {
     adding: Vec<String>,
     ufrag: String,
     audio: Option<Arc<Audio>>,
+    audio_out: AudioOut,
     /// Ring / ringback while the call is not answered yet.
     tone: Option<audio::Tone>,
     video: bool,
@@ -180,6 +270,10 @@ struct Call {
     sending: Option<Source>,
     muted: bool,
     deafened: bool,
+    /// What the peer reported: mic off, holding us, ringing.
+    peer_muted: bool,
+    peer_held: bool,
+    peer_ringing: bool,
 }
 
 struct Actor {
@@ -187,7 +281,7 @@ struct Actor {
     me: BareJid,
     tx: UnboundedSender<Msg>,
     call: Option<Call>,
-    sid: Arc<Mutex<Option<String>>>,
+    session: Arc<Mutex<Session>>,
     bound: Arc<Mutex<Option<Jid>>>,
 }
 
@@ -237,6 +331,32 @@ fn spawn_video_writer(track: VideoTrack) -> UnboundedSender<Vec<u8>> {
         }
     });
     tx
+}
+
+/// Encodes 20 ms frames in the negotiated codec and sends them as RTP: the codec is known only
+/// after negotiation, so packets are built here rather than by a codec-bound track.
+async fn write_audio(mut frames: futures::channel::mpsc::UnboundedReceiver<Vec<f32>>, track: Arc<TrackLocalStaticRTP>, ssrc: u32, out: AudioOut) {
+    let (mut seq, mut ts): (u16, u32) = (rand::random(), rand::random());
+    let mut opus = None;
+    while let Some(pcm) = frames.next().await {
+        let f = *out.lock().unwrap();
+        let payload = if f.opus {
+            if opus.is_none() {
+                opus = audio::OpusEncoder::new().ok();
+            }
+            match opus.as_mut().and_then(|e| e.encode(&pcm)) {
+                Some(p) => p,
+                None => continue,
+            }
+        } else {
+            audio::ulaw_frame(&pcm)
+        };
+        let header = rtc::rtp::header::Header { version: 2, payload_type: f.pt, sequence_number: seq, timestamp: ts, ssrc, ..Default::default() };
+        seq = seq.wrapping_add(1);
+        ts = ts.wrapping_add(if f.opus { audio::CALL_FRAME as u32 } else { audio::FRAME as u32 });
+        // Errors before the transport is up are expected; frames are just dropped.
+        let _ = track.write_rtp(rtc::rtp::Packet { header, payload: bytes::Bytes::from(payload) }).await;
+    }
 }
 
 /// Reassembles VP8 frames from RTP and decodes them for the UI; asks for a keyframe after loss.
@@ -290,6 +410,12 @@ impl Actor {
         }
     }
 
+    fn emit_peer(&self) {
+        if let Some(c) = &self.call {
+            self.net.emit(Ev::Call(CallEv::Peer { muted: c.peer_muted, held: c.peer_held, ringing: c.peer_ringing }));
+        }
+    }
+
     fn notice(&self, text: String) {
         self.net.emit(Ev::Call(CallEv::Notice(text)));
     }
@@ -313,7 +439,7 @@ impl Actor {
             let _ = pc.close().await;
         }
         FRAMES.clear();
-        *self.sid.lock().unwrap() = None;
+        *self.session.lock().unwrap() = Session::default();
     }
 
     async fn handle(&mut self, msg: Msg) {
@@ -351,12 +477,20 @@ impl Actor {
                         return receive_video(track).await;
                     }
                     let Some(audio) = audio else { return };
+                    // Only Opus and PCMU (static type 0) are negotiated.
+                    let mut opus = None;
                     while let Some(ev) = track.poll().await {
-                        if let TrackRemoteEvent::OnRtpPacket(p) = ev
-                            && p.header.payload_type == 0
-                        {
-                            RTP_RECEIVED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            audio.play_ulaw(&p.payload);
+                        let TrackRemoteEvent::OnRtpPacket(p) = ev else { continue };
+                        RTP_RECEIVED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if p.header.payload_type == 0 {
+                            audio.play(&audio::ulaw_samples(&p.payload), audio::RATE);
+                            continue;
+                        }
+                        if opus.is_none() {
+                            opus = audio::OpusDecoder::new().ok();
+                        }
+                        if let Some(d) = opus.as_mut() {
+                            audio.play(&d.decode(&p.payload), audio::CALL_RATE);
                         }
                     }
                 });
@@ -436,6 +570,8 @@ impl Actor {
                         self.net.send(chat_with(self.me.clone().into(), jmi("reject", &sid)));
                     }
                     (CallState::Incoming, true) => self.terminate("decline").await,
+                    // The initiator gives up before the call is up.
+                    (CallState::Outgoing | CallState::Connecting, true) if c.initiator => self.terminate("cancel").await,
                     _ => self.terminate("success").await,
                 }
                 self.end("").await;
@@ -444,9 +580,8 @@ impl Actor {
             CallCmd::Mute(m) => {
                 let Some(c) = self.call.as_mut() else { return };
                 c.muted = m;
-                if let Some(a) = c.audio.as_ref() {
-                    a.muted.store(m, std::sync::atomic::Ordering::Relaxed);
-                }
+                self.apply_mute();
+                self.mute_info("audio", m);
             }
             CallCmd::Deafen(d) => {
                 let Some(c) = self.call.as_mut() else { return };
@@ -477,9 +612,13 @@ impl Actor {
         let Some(c) = self.call.as_mut() else { return };
         // Stop the old capture first: the camera can't be opened twice.
         c.encoder = None;
-        c.sending = src;
+        let was = std::mem::replace(&mut c.sending, src);
         FRAMES.local.lock().unwrap().frame = None;
+        if was.is_some() != src.is_some() {
+            self.mute_info("video", src.is_none());
+        }
         let Some(src) = src else { return self.emit_media() };
+        let Some(c) = self.call.as_mut() else { return };
         let upgrade = c.pc.is_some() && c.video_track.lock().unwrap().is_none();
         if c.pc.is_none() && !c.video {
             // Ringing audio call: the proposal can't change any more.
@@ -509,7 +648,7 @@ impl Actor {
     }
 
     fn start_call(&mut self, sid: String, peer_bare: BareJid, peer: Option<Jid>, initiator: bool, state: CallState, video: bool) {
-        *self.sid.lock().unwrap() = Some(sid.clone());
+        *self.session.lock().unwrap() = Session { sid: Some(sid.clone()), initiator, ..Default::default() };
         FRAMES.clear();
         let video_track = VideoTrack::default();
         self.call = Some(Call {
@@ -527,6 +666,7 @@ impl Actor {
             adding: vec![],
             ufrag: String::new(),
             audio: None,
+            audio_out: Arc::new(Mutex::new(AudioFormat { opus: true, pt: OPUS_PT })),
             tone: Some(audio::tone(state == CallState::Incoming)),
             video,
             frames: spawn_video_writer(video_track.clone()),
@@ -536,6 +676,9 @@ impl Actor {
             sending: None,
             muted: false,
             deafened: false,
+            peer_muted: false,
+            peer_held: false,
+            peer_ringing: false,
         });
         self.emit(state);
         self.emit_media();
@@ -550,15 +693,33 @@ impl Actor {
                 if !media("audio") {
                     return;
                 }
-                if self.call.is_some() {
-                    if self.call.as_ref().is_some_and(|c| c.sid == sid) {
+                let video = media("video");
+                if let Some(c) = self.call.as_ref() {
+                    if c.sid == sid {
                         return;
                     }
-                    self.net.send(chat_with(from, jmi("reject", &sid)));
+                    // Both called each other at once: the lower session id wins (XEP-0166 §7.2.16).
+                    // Ours lost: withdraw it and take theirs as answered; theirs lost: they yield to ours.
+                    let crossed = c.initiator && c.state == CallState::Outgoing && c.pc.is_none() && c.peer_bare == from.to_bare();
+                    if !crossed {
+                        self.net.send(chat_with(from, jmi("reject", &sid)));
+                    } else if sid.as_bytes() < c.sid.as_bytes() {
+                        let (ours, wanted_video) = (c.sid.clone(), c.video);
+                        self.net.send(chat_with(c.peer_bare.clone().into(), jmi("retract", &ours)));
+                        self.call = None;
+                        self.start_call(sid, from.to_bare(), Some(from), false, CallState::Incoming, video);
+                        self.on_cmd(CallCmd::Accept { video: wanted_video }).await;
+                    }
                     return;
                 }
-                let video = media("video");
+                // Tell the caller we are ringing (XEP-0353 §3.2).
+                self.net.send(chat_with(from.clone(), Element::builder("ringing", NS_JMI).attr(nc("id"), sid.as_str()).build()));
                 self.start_call(sid, from.to_bare(), Some(from), false, CallState::Incoming, video);
+            }
+            "ringing" if !from_self => {
+                let Some(c) = self.call.as_mut().filter(|c| c.sid == sid && c.state == CallState::Outgoing) else { return };
+                c.peer_ringing = true;
+                self.emit_peer();
             }
             "retract" if self.call.as_ref().is_some_and(|c| c.sid == sid) => self.end(t!("call.reason_retracted")).await,
             "reject" if self.call.as_ref().is_some_and(|c| c.sid == sid) => {
@@ -595,24 +756,33 @@ impl Actor {
                     self.start_call(sid.clone(), from.to_bare(), Some(from.clone()), false, CallState::Incoming, video);
                 }
                 let c = self.call.as_mut().unwrap();
-                c.peer = Some(from);
+                c.peer = Some(from.clone());
                 if c.state == CallState::Connecting {
                     self.answer(el).await;
                 } else {
                     c.pending_offer = Some(el);
+                    if !same {
+                        let ringing = Element::builder("ringing", NS_RTP_INFO).build();
+                        self.iq(from, self.jingle("session-info", &sid).append(ringing).build());
+                    }
                 }
             }
             "session-accept" => {
+                self.session.lock().unwrap().awaiting_accept = false;
                 let Some(c) = self.call.as_mut() else { return };
                 let Some(pc) = c.pc.clone() else { return };
                 c.remote = rtp_contents(&el);
                 let sdp = contents_to_sdp(&c.remote, peer_role(c));
-                let ok = match RTCSessionDescription::answer(sdp) {
+                let ok = match RTCSessionDescription::answer(sdp.clone()) {
                     Ok(desc) => pc.set_remote_description(desc).await.is_ok(),
                     Err(_) => false,
                 };
                 match ok {
-                    true => self.flush_candidates(&pc).await,
+                    true => {
+                        self.update_formats(&sdp);
+                        self.flush_candidates(&pc).await;
+                        self.announce_mute();
+                    }
                     false => {
                         self.terminate("failed-application").await;
                         self.end(t!("call.reason_incompatible")).await;
@@ -621,6 +791,7 @@ impl Actor {
             }
             "content-add" => self.on_content_add(from, &el).await,
             "content-accept" => {
+                self.session.lock().unwrap().adding = false;
                 let Some(c) = self.call.as_mut() else { return };
                 let Some(pc) = c.pc.clone() else { return };
                 let adding = std::mem::take(&mut c.adding);
@@ -639,13 +810,13 @@ impl Actor {
                 let Some(c) = self.call.as_mut() else { return };
                 let names: Vec<String> = el.children().filter(|e| e.is("content", NS_JINGLE)).filter_map(|e| e.attr("name")).map(str::to_string).collect();
                 if !names.iter().any(|n| c.adding.contains(n)) {
-                    // Removing established media is not supported: end like Conversations does.
                     if el.attr("action") == Some("content-remove") {
-                        self.terminate("failed-application").await;
-                        self.end(t!("call.reason_dropped")).await;
+                        self.remove_contents(&names).await;
                     }
                     return;
                 }
+                self.session.lock().unwrap().adding = false;
+                let Some(c) = self.call.as_mut() else { return };
                 // Our video offer was declined: undo it so a later attempt starts clean.
                 let adding = std::mem::take(&mut c.adding);
                 c.contents.retain(|n| !adding.contains(n));
@@ -665,6 +836,32 @@ impl Actor {
                 FRAMES.local.lock().unwrap().frame = None;
                 self.notice(t!("call.video_declined").to_string());
                 self.emit_media();
+            }
+            "session-info" => self.on_session_info(&el),
+            // Who sends changes: noted for later offers; our video stops if we may no longer send it.
+            "content-modify" => {
+                let Some(c) = self.call.as_mut() else { return };
+                let me = if c.initiator { "initiator" } else { "responder" };
+                let mut stop_video = false;
+                for m in el.children().filter(|e| e.is("content", NS_JINGLE)) {
+                    if let (Some(name), Some(senders)) = (m.attr("name"), m.attr("senders"))
+                        && let Some(r) = c.remote.iter_mut().find(|r| r.attr("name") == Some(name))
+                    {
+                        r.set_attr(Namespace::NONE, nc("senders"), senders);
+                        stop_video |= media_of(r) == Some("video") && senders != "both" && senders != me;
+                    }
+                }
+                if stop_video && c.sending.is_some() {
+                    self.set_video(None).await;
+                }
+            }
+            // ICE-UDP is the only transport we have (XEP-0166 §7.2.15).
+            "transport-replace" => {
+                let mut reject = self.jingle("transport-reject", &sid);
+                for content in el.children().filter(|e| e.is("content", NS_JINGLE)) {
+                    reject = reject.append(content.clone());
+                }
+                self.iq(from, reject.build());
             }
             "transport-info" => {
                 let Some(c) = self.call.as_mut() else { return };
@@ -699,9 +896,16 @@ impl Actor {
                     .map(|c| c.name().to_string())
                     .unwrap_or_default();
                 let text = match why.as_str() {
+                    "success" | "" => "",
                     "busy" => t!("call.reason_busy"),
                     "decline" => t!("call.reason_declined"),
-                    "success" | "" => "",
+                    "cancel" => t!("call.reason_retracted"),
+                    "timeout" | "expired" => t!("call.reason_no_answer"),
+                    "gone" => t!("call.reason_gone"),
+                    "connectivity-error" | "failed-transport" => t!("call.reason_connect_failed"),
+                    "incompatible-parameters" | "unsupported-applications" | "unsupported-transports" | "failed-application" => t!("call.reason_incompatible"),
+                    "security-error" => t!("call.reason_security"),
+                    "media-error" => t!("call.reason_media"),
                     _ => t!("call.reason_dropped"),
                 };
                 self.end(text).await;
@@ -714,6 +918,16 @@ impl Actor {
     async fn on_content_add(&mut self, from: Jid, el: &Element) {
         let Some(c) = self.call.as_mut() else { return };
         let Some(pc) = c.pc.clone() else { return };
+        // Both added media at once and the initiator's wins (XEP-0166 §7.2.16): withdraw ours, keeping
+        // its track, which then answers their content.
+        if !c.initiator && !c.adding.is_empty() {
+            self.session.lock().unwrap().adding = false;
+            let adding = std::mem::take(&mut c.adding);
+            c.contents.retain(|n| !adding.contains(n));
+            if let Ok(rb) = RTCSessionDescription::rollback(None) {
+                let _ = pc.set_local_description(rb).await;
+            }
+        }
         let added: Vec<Element> = rtp_contents(el).into_iter().filter(|e| e.attr("name").is_some_and(|n| !c.contents.iter().any(|x| x == n))).collect();
         if added.is_empty() {
             return;
@@ -740,7 +954,7 @@ impl Actor {
                 c.remote = remote;
                 c.contents.extend(names.iter().cloned());
                 c.video |= has_video(&added);
-                self.update_vp8_pt(&sdp);
+                self.update_formats(&sdp);
                 self.send_contents("content-accept", &sdp, Some(&names));
                 self.emit_media();
             }
@@ -754,6 +968,25 @@ impl Actor {
                 }
                 self.iq(from, rej.build());
             }
+        }
+    }
+
+    /// The peer removed established contents: their media stops (the m-lines stay, inactive); with
+    /// nothing left the session ends (XEP-0166 §7.2.8).
+    async fn remove_contents(&mut self, names: &[String]) {
+        let Some(c) = self.call.as_mut() else { return };
+        for r in c.remote.iter_mut().filter(|r| r.attr("name").is_some_and(|n| names.iter().any(|x| x == n))) {
+            r.set_attr(Namespace::NONE, nc("senders"), "none");
+        }
+        let live = |m: &str| c.remote.iter().any(|r| media_of(r) == Some(m) && r.attr("senders") != Some("none"));
+        if !live("audio") && !live("video") {
+            self.terminate("success").await;
+            return self.end("").await;
+        }
+        if !live("video") && c.video {
+            c.video = false;
+            *FRAMES.remote.lock().unwrap() = Default::default();
+            self.set_video(None).await;
         }
     }
 
@@ -785,6 +1018,68 @@ impl Actor {
         });
     }
 
+    /// XEP-0167 session-info to the peer, once the session exists.
+    fn session_info(&self, payload: Element) {
+        let Some(c) = self.call.as_ref().filter(|c| c.pc.is_some()) else { return };
+        let Some(peer) = c.peer.clone() else { return };
+        let el = self.jingle("session-info", &c.sid).append(payload).build();
+        self.iq(peer, el);
+    }
+
+    /// Tells the peer we muted or unmuted our `media` content, if the session has it.
+    fn mute_info(&self, media: &str, mute: bool) {
+        let Some(content) = self.call.as_ref().and_then(|c| c.remote.iter().find(|e| media_of(e) == Some(media))) else { return };
+        let el = Element::builder(if mute { "mute" } else { "unmute" }, NS_RTP_INFO)
+            .attr(nc("creator"), content.attr("creator").unwrap_or("initiator"))
+            .attr(nc("name"), content.attr("name").unwrap_or_default())
+            .build();
+        self.session_info(el);
+    }
+
+    /// Our audio goes silent when we muted it, and while the peer holds the call (XEP-0167 §7.2).
+    fn apply_mute(&self) {
+        if let Some(c) = &self.call
+            && let Some(a) = &c.audio
+        {
+            a.muted.store(c.muted || c.peer_held, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// A mute made while still ringing reaches the peer once the session is up.
+    fn announce_mute(&self) {
+        if self.call.as_ref().is_some_and(|c| c.muted) {
+            self.mute_info("audio", true);
+        }
+    }
+
+    /// The peer's session-info: ringing, hold, mute (XEP-0167 §7). An empty one is a ping.
+    fn on_session_info(&mut self, el: &Element) {
+        let Some(c) = self.call.as_mut() else { return };
+        for info in el.children().filter(|e| e.ns() == NS_RTP_INFO) {
+            match info.name() {
+                "ringing" => c.peer_ringing = true,
+                "hold" => c.peer_held = true,
+                "unhold" => c.peer_held = false,
+                "active" => (c.peer_held, c.peer_muted) = (false, false),
+                "mute" | "unmute" => {
+                    let on = info.name() == "mute";
+                    // No name: every content of the session.
+                    let media = info.attr("name").and_then(|n| c.remote.iter().find(|e| e.attr("name") == Some(n))).and_then(media_of);
+                    if media != Some("video") {
+                        c.peer_muted = on;
+                    }
+                    if media != Some("audio") && on {
+                        // Their camera is off: drop the last picture now rather than when frames stop.
+                        *FRAMES.remote.lock().unwrap() = Default::default();
+                    }
+                }
+                _ => {}
+            }
+        }
+        self.apply_mute();
+        self.emit_peer();
+    }
+
     async fn terminate(&mut self, why: &str) {
         let Some(c) = self.call.as_ref() else { return };
         let Some(peer) = c.peer.clone() else { return };
@@ -798,15 +1093,7 @@ impl Actor {
         let (sid, video) = (c.sid.clone(), c.video);
         let ice_servers = ice_servers(&self.net, self.me.domain().as_str()).await;
 
-        let mut media = MediaEngine::default();
-        let pcmu = RTCRtpCodec { mime_type: MIME_TYPE_PCMU.into(), clock_rate: 8000, channels: 1, sdp_fmtp_line: String::new(), rtcp_feedback: vec![] };
-        // shortcut: only PCMU is negotiated; add Opus once a pure-Rust encoder is available.
-        media
-            .register_codec(RTCRtpCodecParameters { rtp_codec: pcmu.clone(), payload_type: 0 }, RtpCodecKind::Audio)
-            .map_err(|e| e.to_string())?;
-        media
-            .register_codec(RTCRtpCodecParameters { rtp_codec: vp8(), payload_type: VP8_PT }, RtpCodecKind::Video)
-            .map_err(|e| e.to_string())?;
+        let mut media = media_engine()?;
         let registry = register_default_interceptors(Registry::new(), &mut media).map_err(|e| e.to_string())?;
         let handler = Arc::new(Handler { sid: sid.clone(), tx: self.tx.clone() });
         let pc = PeerConnectionBuilder::new()
@@ -821,48 +1108,20 @@ impl Actor {
         let pc: Arc<dyn PeerConnection> = Arc::new(pc);
 
         let ssrc = std::hash::BuildHasher::hash_one(&std::collections::hash_map::RandomState::new(), &sid) as u32;
-        let track = Arc::new(
-            TrackLocalStaticSample::new(
-                Instant::now(),
-                MediaStreamTrack::new(
-                    "crabber".into(),
-                    format!("audio-{sid}"),
-                    "audio".into(),
-                    RtpCodecKind::Audio,
-                    vec![RTCRtpEncodingParameters {
-                        rtp_coding_parameters: RTCRtpCodingParameters { ssrc: Some(ssrc), ..Default::default() },
-                        codec: pcmu,
-                        ..Default::default()
-                    }],
-                ),
-            )
-            .map_err(|e| e.to_string())?,
-        );
+        let track = Arc::new(audio_track(&sid, ssrc));
         pc.add_track(track.clone() as Arc<dyn TrackLocal>).await.map_err(|e| e.to_string())?;
         if video {
             self.add_video_track(&pc).await?;
         }
 
-        let (frames_tx, mut frames_rx) = unbounded::<Vec<u8>>();
+        let (frames_tx, frames_rx) = unbounded::<Vec<f32>>();
         let audio = audio::start(move |frame| {
             let _ = frames_tx.unbounded_send(frame);
         })?;
-        tokio::spawn(async move {
-            while let Some(frame) = frames_rx.next().await {
-                let sample = Sample {
-                    data: bytes::Bytes::from(frame),
-                    timestamp: Instant::now(),
-                    duration: Duration::from_millis(20),
-                    packet_timestamp: 0,
-                    prev_dropped_packets: 0,
-                    prev_padding_packets: 0,
-                };
-                // Errors before the transport is up are expected; frames are just dropped.
-                let _ = track.write_sample(ssrc, 0, &sample, &[]).await;
-            }
-        });
+        let out = self.call.as_ref().ok_or(t!("call.err_no_call"))?.audio_out.clone();
+        tokio::spawn(write_audio(frames_rx, track, ssrc, out));
         let c = self.call.as_mut().ok_or(t!("call.err_no_call"))?;
-        audio.muted.store(c.muted, std::sync::atomic::Ordering::Relaxed);
+        audio.muted.store(c.muted || c.peer_held, std::sync::atomic::Ordering::Relaxed);
         audio.deafened.store(c.deafened, std::sync::atomic::Ordering::Relaxed);
         c.audio = Some(Arc::new(audio));
         c.pc = Some(pc.clone());
@@ -898,17 +1157,15 @@ impl Actor {
         Ok(())
     }
 
-    /// Answers echo the offerer's payload types: send VP8 under the one in our final SDP.
-    fn update_vp8_pt(&self, local_sdp: &str) {
+    /// Picks what we send from a negotiated SDP (our answer, or the peer's answer to our offer):
+    /// answers echo the offerer's payload types.
+    fn update_formats(&self, sdp: &str) {
         let Some(c) = self.call.as_ref() else { return };
-        let pt = parse_sdp(local_sdp)
-            .sections
-            .iter()
-            .filter(|s| s.media == "video")
-            .flat_map(|s| s.payloads.iter())
-            .find(|p| p.1.eq_ignore_ascii_case("VP8"))
-            .and_then(|p| p.0.parse::<u8>().ok());
-        if let (Some(pt), Some(t)) = (pt, c.video_track.lock().unwrap().as_mut()) {
+        let (audio, vp8) = formats(sdp);
+        if let Some(a) = audio {
+            *c.audio_out.lock().unwrap() = a;
+        }
+        if let (Some(pt), Some(t)) = (vp8, c.video_track.lock().unwrap().as_mut()) {
             t.2 = pt;
         }
     }
@@ -967,8 +1224,9 @@ impl Actor {
         match res {
             Ok(local) => {
                 self.flush_candidates(&pc).await;
-                self.update_vp8_pt(&local.sdp);
+                self.update_formats(&local.sdp);
                 self.send_contents("session-accept", &local.sdp, None);
+                self.announce_mute();
                 self.emit_media();
             }
             Err(e) => self.fail(&e).await,
@@ -979,6 +1237,11 @@ impl Actor {
     fn send_contents(&mut self, action: &str, sdp: &str, only: Option<&[String]>) {
         let Some(c) = self.call.as_mut() else { return };
         let Some(peer) = c.peer.clone() else { return };
+        // Set before sending: the reply is checked against it as soon as it arrives.
+        let mut session = self.session.lock().unwrap();
+        session.awaiting_accept |= action == "session-initiate";
+        session.adding |= action == "content-add";
+        drop(session);
         let parsed = parse_sdp(sdp);
         if only.is_none() {
             c.contents = parsed.sections.iter().map(|s| s.mid.clone()).collect();
@@ -1006,6 +1269,41 @@ impl Actor {
         self.terminate("failed-application").await;
         self.end(&t!("call.reason_error", error = error)).await;
     }
+}
+
+/// Opus first (preferred), PCMU as the fallback every WebRTC stack has, VP8 for video.
+fn media_engine() -> Result<MediaEngine, String> {
+    let mut media = MediaEngine::default();
+    let codecs = [(opus(), OPUS_PT, RtpCodecKind::Audio), (pcmu(), 0, RtpCodecKind::Audio), (vp8(), VP8_PT, RtpCodecKind::Video)];
+    for (rtp_codec, payload_type, kind) in codecs {
+        media.register_codec(RTCRtpCodecParameters { rtp_codec, payload_type }, kind).map_err(|e| e.to_string())?;
+    }
+    Ok(media)
+}
+
+fn opus() -> RTCRtpCodec {
+    RTCRtpCodec { mime_type: MIME_TYPE_OPUS.into(), clock_rate: 48000, channels: 2, sdp_fmtp_line: "minptime=10;useinbandfec=1".into(), rtcp_feedback: vec![] }
+}
+
+fn pcmu() -> RTCRtpCodec {
+    RTCRtpCodec { mime_type: MIME_TYPE_PCMU.into(), clock_rate: 8000, channels: 1, sdp_fmtp_line: String::new(), rtcp_feedback: vec![] }
+}
+
+/// The audio track carries packets we build (`write_audio`); with no codec of its own it offers
+/// every registered audio codec.
+fn audio_track(sid: &str, ssrc: u32) -> TrackLocalStaticRTP {
+    let enc = RTCRtpEncodingParameters { rtp_coding_parameters: RTCRtpCodingParameters { ssrc: Some(ssrc), ..Default::default() }, ..Default::default() };
+    TrackLocalStaticRTP::new(MediaStreamTrack::new("crabber".into(), format!("audio-{sid}"), "audio".into(), RtpCodecKind::Audio, vec![enc]))
+}
+
+/// The audio format and VP8 payload type a negotiated SDP settles on.
+fn formats(sdp: &str) -> (Option<AudioFormat>, Option<u8>) {
+    let p = parse_sdp(sdp);
+    let find = |media: &str, name: &str| {
+        p.sections.iter().filter(|s| s.media == media).flat_map(|s| s.payloads.iter()).find(|x| x.1.eq_ignore_ascii_case(name)).and_then(|x| x.0.parse::<u8>().ok())
+    };
+    let audio = find("audio", "opus").map(|pt| AudioFormat { opus: true, pt }).or_else(|| find("audio", "PCMU").map(|pt| AudioFormat { opus: false, pt }));
+    (audio, find("video", "VP8"))
 }
 
 fn vp8() -> RTCRtpCodec {
@@ -1448,11 +1746,14 @@ a=rtpmap:96 VP8/90000\r\na=rtcp-fb:96 nack pli\r\na=ssrc:43 cname:abc\r\n";
 
     type Rx<T> = futures::channel::mpsc::UnboundedReceiver<T>;
 
-    async fn test_pc() -> (Arc<dyn PeerConnection>, Rx<RTCIceCandidateInit>, Rx<Arc<dyn TrackRemote>>, Rx<RTCPeerConnectionState>) {
-        let mut media = MediaEngine::default();
-        let pcmu = RTCRtpCodec { mime_type: MIME_TYPE_PCMU.into(), clock_rate: 8000, channels: 1, sdp_fmtp_line: String::new(), rtcp_feedback: vec![] };
-        media.register_codec(RTCRtpCodecParameters { rtp_codec: pcmu.clone(), payload_type: 0 }, RtpCodecKind::Audio).unwrap();
-        media.register_codec(RTCRtpCodecParameters { rtp_codec: vp8(), payload_type: VP8_PT }, RtpCodecKind::Video).unwrap();
+    type TestPc = (Arc<dyn PeerConnection>, Rx<RTCIceCandidateInit>, Rx<Arc<dyn TrackRemote>>, Rx<RTCPeerConnectionState>, Arc<TrackLocalStaticRTP>);
+
+    /// A peer connection set up like a call: our codecs and an audio track we write RTP into.
+    async fn test_pc() -> TestPc {
+        test_pc_with(media_engine().unwrap()).await
+    }
+
+    async fn test_pc_with(mut media: MediaEngine) -> TestPc {
         let registry = register_default_interceptors(Registry::new(), &mut media).unwrap();
         let (c, cr) = unbounded();
         let (t, tr) = unbounded();
@@ -1467,23 +1768,93 @@ a=rtpmap:96 VP8/90000\r\na=rtcp-fb:96 nack pli\r\na=ssrc:43 cname:abc\r\n";
             .await
             .unwrap();
         let pc: Arc<dyn PeerConnection> = Arc::new(pc);
-        let track = |kind, codec, id: &str, ssrc| {
-            Arc::new(
-                TrackLocalStaticSample::new(
-                    Instant::now(),
-                    MediaStreamTrack::new(
-                        "t".into(),
-                        id.into(),
-                        id.into(),
-                        kind,
-                        vec![RTCRtpEncodingParameters { rtp_coding_parameters: RTCRtpCodingParameters { ssrc: Some(ssrc), ..Default::default() }, codec, ..Default::default() }],
-                    ),
-                )
-                .unwrap(),
-            )
-        };
-        pc.add_track(track(RtpCodecKind::Audio, pcmu, "a", rand::random()) as Arc<dyn TrackLocal>).await.unwrap();
-        (pc, cr, tr, sr)
+        let track = Arc::new(audio_track("t", rand::random()));
+        pc.add_track(track.clone() as Arc<dyn TrackLocal>).await.unwrap();
+        (pc, cr, tr, sr, track)
+    }
+
+    /// Offer from `a` (initiator) and answer from `b`, both through our Jingle translation; trickles
+    /// the candidates and waits until `b` connects. Returns the SDP `a` set as the remote answer.
+    async fn connect(a: &mut TestPc, b: &mut TestPc) -> String {
+        a.0.set_local_description(a.0.create_offer(None).await.unwrap()).await.unwrap();
+        let offer = session(&parse_sdp(&local_sdp(&a.0).await), true);
+        b.0.set_remote_description(RTCSessionDescription::offer(contents_to_sdp(&offer, "initiator")).unwrap()).await.unwrap();
+        b.0.set_local_description(b.0.create_answer(None).await.unwrap()).await.unwrap();
+        let answer = contents_to_sdp(&session(&parse_sdp(&local_sdp(&b.0).await), false), "responder");
+        a.0.set_remote_description(RTCSessionDescription::answer(answer.clone()).unwrap()).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        while let Ok(c) = a.1.try_recv() {
+            let _ = b.0.add_ice_candidate(c).await;
+        }
+        while let Ok(c) = b.1.try_recv() {
+            let _ = a.0.add_ice_candidate(c).await;
+        }
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while let Some(s) = b.3.next().await {
+                if s == RTCPeerConnectionState::Connected {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("call connects");
+        answer
+    }
+
+    /// Sends a tone from `a` as the real call path does and returns the first audio packet `b` gets.
+    async fn send_tone(a: &TestPc, b: &mut TestPc, format: AudioFormat) -> rtc::rtp::Packet {
+        let (tx, rx) = unbounded::<Vec<f32>>();
+        let writer = tokio::spawn(write_audio(rx, a.4.clone(), a.4.track().await.ssrcs().next().unwrap(), Arc::new(Mutex::new(format))));
+        let feeder = tokio::spawn(async move {
+            for i in 0.. {
+                let pcm = (0..audio::CALL_FRAME).map(|n| ((i * audio::CALL_FRAME + n) as f32 * 440.0 * std::f32::consts::TAU / 48000.0).sin() * 0.5).collect();
+                if tx.unbounded_send(pcm).is_err() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        });
+        let packet = tokio::time::timeout(Duration::from_secs(10), async {
+            let track = b.2.next().await.expect("audio track");
+            loop {
+                if let Some(TrackRemoteEvent::OnRtpPacket(p)) = track.poll().await {
+                    break p;
+                }
+            }
+        })
+        .await
+        .expect("audio packet");
+        writer.abort();
+        feeder.abort();
+        packet
+    }
+
+    /// Both sides have Opus: it is negotiated and a tone sent as Opus decodes on the far side.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn audio_goes_as_opus() {
+        let (mut a, mut b) = (test_pc().await, test_pc().await);
+        let answer = connect(&mut a, &mut b).await;
+        let format = formats(&answer).0.unwrap();
+        assert_eq!(format, AudioFormat { opus: true, pt: OPUS_PT });
+        let p = send_tone(&a, &mut b, format).await;
+        assert_eq!(p.header.payload_type, OPUS_PT);
+        let pcm = audio::OpusDecoder::new().unwrap().decode(&p.payload);
+        assert_eq!(pcm.len(), audio::CALL_FRAME);
+        let _ = (a.0.close().await, b.0.close().await);
+    }
+
+    /// A peer with PCMU only (older clients): the call falls back to it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn audio_falls_back_to_pcmu() {
+        let mut only_pcmu = MediaEngine::default();
+        only_pcmu.register_codec(RTCRtpCodecParameters { rtp_codec: pcmu(), payload_type: 0 }, RtpCodecKind::Audio).unwrap();
+        let (mut a, mut b) = (test_pc().await, test_pc_with(only_pcmu).await);
+        let answer = connect(&mut a, &mut b).await;
+        let format = formats(&answer).0.unwrap();
+        assert_eq!(format, AudioFormat { opus: false, pt: 0 });
+        let p = send_tone(&a, &mut b, format).await;
+        assert_eq!((p.header.payload_type, p.payload.len()), (0, audio::FRAME));
+        let _ = (a.0.close().await, b.0.close().await);
     }
 
     fn vp8_track(ssrc: u32) -> Arc<TrackLocalStaticSample> {
@@ -1503,8 +1874,8 @@ a=rtpmap:96 VP8/90000\r\na=rtcp-fb:96 nack pli\r\na=ssrc:43 cname:abc\r\n";
             eprintln!("ffmpeg not found, skipping");
             return;
         }
-        let (a, mut a_cands, _a_tracks, _) = test_pc().await;
-        let (b, mut b_cands, mut b_tracks, mut b_state) = test_pc().await;
+        let (a, mut a_cands, _a_tracks, _, _) = test_pc().await;
+        let (b, mut b_cands, mut b_tracks, mut b_state, _) = test_pc().await;
 
         // session-initiate / session-accept: A is the initiator.
         a.set_local_description(a.create_offer(None).await.unwrap()).await.unwrap();
@@ -1602,6 +1973,51 @@ a=rtpmap:96 VP8/90000\r\na=rtcp-fb:96 nack pli\r\na=ssrc:43 cname:abc\r\n";
         let _ = a.close().await;
         let _ = b.close().await;
         got.expect("decoded video frame on the far side");
+    }
+
+    fn jingle_el(action: &str, sid: &str, payload: Option<Element>) -> Element {
+        let mut b = Element::builder("jingle", NS_JINGLE).attr(nc("action"), action).attr(nc("sid"), sid);
+        if let Some(p) = payload {
+            b = b.append(p);
+        }
+        b.build()
+    }
+
+    /// XEP-0166 §10 / XEP-0167 §7: what a request is refused with.
+    #[test]
+    fn jingle_requests_are_checked() {
+        let info = |name: &str, ns: &str| Some(Element::builder(name, ns).build());
+        let session = |initiator, adding, awaiting_accept| Session { sid: Some("s1".into()), initiator, adding, awaiting_accept };
+        let err = |el: Element, tie: bool| check(&el, &session(true, tie, true)).err().map(|e| (e.condition, e.jingle));
+        assert_eq!(err(jingle_el("session-initiate", "new", None), false), None);
+        assert_eq!(err(jingle_el("transport-info", "s1", None), false), None);
+        assert_eq!(err(jingle_el("transport-info", "other", None), false), Some((DefinedCondition::ItemNotFound, Some("unknown-session"))));
+        assert_eq!(err(jingle_el("dance", "s1", None), false), Some((DefinedCondition::BadRequest, None)));
+        // An empty session-info is a ping; RTP info payloads are known, anything else is not.
+        assert_eq!(err(jingle_el("session-info", "s1", None), false), None);
+        assert_eq!(err(jingle_el("session-info", "s1", info("mute", NS_RTP_INFO)), false), None);
+        assert_eq!(err(jingle_el("session-info", "s1", info("ringing", NS_RTP_INFO)), false), None);
+        assert_eq!(err(jingle_el("session-info", "s1", info("transfer", "urn:xmpp:jingle:transfer:0")), false), Some((DefinedCondition::FeatureNotImplemented, Some("unsupported-info"))));
+        // Our own content-add as initiator is pending: theirs loses the tie.
+        assert_eq!(err(jingle_el("content-add", "s1", None), false), None);
+        assert_eq!(err(jingle_el("content-add", "s1", None), true), Some((DefinedCondition::Conflict, Some("tie-break"))));
+        // Answers to requests we did not make (§7.2.16 out-of-order); a responder's own add does not win.
+        let out_of_order = Some((DefinedCondition::UnexpectedRequest, Some("out-of-order")));
+        let got = |el: Element, s: Session| check(&el, &s).err().map(|e| (e.condition, e.jingle));
+        assert_eq!(got(jingle_el("session-accept", "s1", None), session(false, false, false)), out_of_order);
+        assert_eq!(got(jingle_el("content-accept", "s1", None), session(true, false, true)), out_of_order);
+        assert_eq!(got(jingle_el("content-add", "s1", None), session(false, true, false)), None);
+        let e = check(&jingle_el("session-info", "s1", info("x", "y")), &session(true, false, false)).unwrap_err();
+        assert!(e.retry());
+        assert!(e.jingle_element().unwrap().is("unsupported-info", NS_JINGLE_ERRORS));
+    }
+
+    #[test]
+    fn negotiated_formats() {
+        let sdp = "m=audio 9 UDP/TLS/RTP/SAVPF 109 0\r\na=rtpmap:109 opus/48000/2\r\na=rtpmap:0 PCMU/8000\r\nm=video 9 UDP/TLS/RTP/SAVPF 100\r\na=rtpmap:100 VP8/90000\r\n";
+        assert_eq!(formats(sdp), (Some(AudioFormat { opus: true, pt: 109 }), Some(100)));
+        let pcmu_only = "m=audio 9 UDP/TLS/RTP/SAVPF 0\r\na=rtpmap:0 PCMU/8000\r\n";
+        assert_eq!(formats(pcmu_only), (Some(AudioFormat { opus: false, pt: 0 }), None));
     }
 
     #[test]

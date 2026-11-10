@@ -75,8 +75,8 @@ Crabber stands on each.
 | [0115](https://xmpp.org/extensions/xep-0115.html) | Entity Capabilities | ✅ | |
 | [0153](https://xmpp.org/extensions/xep-0153.html) | vCard-Based Avatars | ✅ | |
 | [0163](https://xmpp.org/extensions/xep-0163.html) | Personal Eventing Protocol | 🟡 | OMEMO device lists and bundles only |
-| [0166](https://xmpp.org/extensions/xep-0166.html) | Jingle | 🟡 | Audio and video calls; no file transfer |
-| [0167](https://xmpp.org/extensions/xep-0167.html) | Jingle RTP Sessions | 🟡 | G.711 µ-law audio, VP8 video; video added mid-call via content-add |
+| [0166](https://xmpp.org/extensions/xep-0166.html) | Jingle | ✅ | Calls; Jingle errors, tie-breaking, content add/modify/remove; file transfer is XEP-0234 |
+| [0167](https://xmpp.org/extensions/xep-0167.html) | Jingle RTP Sessions | ✅ | Opus audio (G.711 µ-law fallback), VP8 video, video added mid-call; ringing, mute and hold info |
 | [0172](https://xmpp.org/extensions/xep-0172.html) | User Nickname | ❌ | |
 | [0176](https://xmpp.org/extensions/xep-0176.html) | Jingle ICE-UDP Transport | ✅ | |
 | [0184](https://xmpp.org/extensions/xep-0184.html) | Message Delivery Receipts | ✅ | |

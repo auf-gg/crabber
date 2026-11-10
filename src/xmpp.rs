@@ -380,6 +380,11 @@ fn disco_info(node: Option<String>) -> DiscoInfoResult {
         ns::JINGLE,
         ns::JINGLE_RTP,
         ns::JINGLE_RTP_AUDIO,
+        ns::JINGLE_RTP_VIDEO,
+        ns::JINGLE_RTCP_FB,
+        ns::JINGLE_RTP_HDREXT,
+        ns::JINGLE_SSMA,
+        ns::JINGLE_GROUPING,
         ns::JINGLE_ICE_UDP,
         ns::JINGLE_DTLS,
         ns::JINGLE_MESSAGE,
@@ -969,13 +974,11 @@ impl State {
                 } else if payload.is("jingle", ns::JINGLE) {
                     match self.calls.on_jingle(from.clone(), payload) {
                         Ok(()) => Iq::Result { from: None, to: from, id, payload: None },
-                        Err(cond) => Iq::Error {
-                            from: None,
-                            to: from,
-                            id,
-                            error: StanzaError::new(ErrorType::Cancel, cond, "en", ""),
-                            payload: None,
-                        },
+                        Err(e) => {
+                            let type_ = if e.retry() { ErrorType::Modify } else { ErrorType::Cancel };
+                            let error = StanzaError { other: e.jingle_element(), ..StanzaError::new(type_, e.condition, "en", "") };
+                            Iq::Error { from: None, to: from, id, error, payload: None }
+                        }
                     }
                 } else {
                     iq_error(from, id)

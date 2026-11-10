@@ -8,7 +8,11 @@ use std::sync::{Arc, Mutex};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, Sample as _, SampleFormat, SizedSample, StreamConfig};
 
+/// G.711 µ-law runs at 8 kHz.
 pub const RATE: u32 = 8000;
+/// Calls run at 48 kHz in 20 ms frames: Opus' own rate; µ-law is resampled from it.
+pub const CALL_RATE: u32 = 48000;
+pub const CALL_FRAME: usize = 960;
 
 /// Chosen microphone and speaker as cpal device ids ("pipewire:…", "wasapi:…"); None = system default.
 static INPUT: Mutex<Option<String>> = Mutex::new(None);
@@ -118,6 +122,73 @@ pub fn devices(input: bool) -> Vec<MediaDevice> {
 }
 /// 20 ms at 8 kHz.
 pub const FRAME: usize = 160;
+
+/// A 20 ms call frame (48 kHz) as a µ-law payload: every 6 samples averaged down to 8 kHz.
+pub fn ulaw_frame(pcm: &[f32]) -> Vec<u8> {
+    pcm.chunks(6).map(|c| ulaw_encode(((c.iter().sum::<f32>() / c.len() as f32).clamp(-1.0, 1.0) * 32767.0) as i16)).collect()
+}
+
+/// A µ-law payload as 8 kHz samples.
+pub fn ulaw_samples(payload: &[u8]) -> Vec<f32> {
+    payload.iter().map(|&b| ulaw_decode(b) as f32 / 32768.0).collect()
+}
+
+/// Opus for calls: 48 kHz mono, 20 ms frames, through the pure-Rust libopus port.
+pub struct OpusEncoder(*mut unsafe_libopus::OpusEncoder);
+pub struct OpusDecoder(*mut unsafe_libopus::OpusDecoder);
+
+// SAFETY: the codec state is plain memory owned by the value, with no thread affinity.
+unsafe impl Send for OpusEncoder {}
+unsafe impl Send for OpusDecoder {}
+
+impl OpusEncoder {
+    pub fn new() -> Result<Self, String> {
+        let mut err = 0;
+        let enc = unsafe { unsafe_libopus::opus_encoder_create(CALL_RATE as i32, 1, unsafe_libopus::OPUS_APPLICATION_VOIP, &mut err) };
+        if enc.is_null() || err != unsafe_libopus::OPUS_OK {
+            return Err(t!("audio.opus_error", code = err));
+        }
+        Ok(Self(enc))
+    }
+
+    /// One packet for one 20 ms frame.
+    pub fn encode(&mut self, pcm: &[f32]) -> Option<Vec<u8>> {
+        let mut packet = [0u8; 1500];
+        let n = unsafe { unsafe_libopus::opus_encode_float(self.0, pcm.as_ptr(), pcm.len() as i32, packet.as_mut_ptr(), packet.len() as i32) };
+        (n > 0).then(|| packet[..n as usize].to_vec())
+    }
+}
+
+impl OpusDecoder {
+    pub fn new() -> Result<Self, String> {
+        let mut err = 0;
+        let dec = unsafe { unsafe_libopus::opus_decoder_create(CALL_RATE as i32, 1, &mut err) };
+        if dec.is_null() || err != unsafe_libopus::OPUS_OK {
+            return Err(t!("audio.opus_error", code = err));
+        }
+        Ok(Self(dec))
+    }
+
+    /// 48 kHz mono samples (a stereo stream is mixed down by the decoder).
+    pub fn decode(&mut self, packet: &[u8]) -> Vec<f32> {
+        let mut pcm = vec![0f32; 5760]; // 120 ms, the longest Opus packet
+        let n = unsafe { unsafe_libopus::opus_decode_float(self.0, packet.as_ptr(), packet.len() as i32, pcm.as_mut_ptr(), 5760, 0) };
+        pcm.truncate(n.max(0) as usize);
+        pcm
+    }
+}
+
+impl Drop for OpusEncoder {
+    fn drop(&mut self) {
+        unsafe { unsafe_libopus::opus_encoder_destroy(self.0) };
+    }
+}
+
+impl Drop for OpusDecoder {
+    fn drop(&mut self) {
+        unsafe { unsafe_libopus::opus_decoder_destroy(self.0) };
+    }
+}
 
 pub fn ulaw_encode(sample: i16) -> u8 {
     const BIAS: i32 = 0x84;
@@ -238,7 +309,9 @@ impl Mic {
 struct Playback {
     buf: VecDeque<f32>,
     up: Up,
+    /// Device rate, and the rate of what is fed in (8 kHz µ-law or 48 kHz Opus).
     rate: u32,
+    src: u32,
 }
 
 pub struct Audio {
@@ -248,20 +321,24 @@ pub struct Audio {
     playback: Arc<Mutex<Playback>>,
     /// Dropping it stops the streams' thread.
     stop: Mutex<std::sync::mpsc::Sender<()>>,
-    on_frame: Arc<dyn Fn(Vec<u8>) + Send + Sync>,
+    on_frame: Arc<dyn Fn(Vec<f32>) + Send + Sync>,
 }
 
 impl Audio {
-    /// Feeds one received µ-law RTP payload to the speaker.
-    pub fn play_ulaw(&self, payload: &[u8]) {
+    /// Feeds received samples at `src_rate` to the speaker.
+    pub fn play(&self, samples: &[f32], src_rate: u32) {
         if self.deafened.load(Ordering::Relaxed) {
             return;
         }
         let g = gain(&OUT_GAIN);
         let mut p = self.playback.lock().unwrap();
-        let Playback { buf, up, rate } = &mut *p;
-        for &b in payload {
-            up.push((ulaw_decode(b) as f32 / 32768.0 * g).clamp(-1.0, 1.0), buf);
+        let Playback { buf, up, rate, src } = &mut *p;
+        if *src != src_rate {
+            *src = src_rate;
+            up.step = src_rate as f64 / *rate as f64;
+        }
+        for &x in samples {
+            up.push((x * g).clamp(-1.0, 1.0), buf);
         }
         // Keep latency bounded if the network delivers faster than we play.
         let max = *rate as usize * 3 / 10;
@@ -272,11 +349,12 @@ impl Audio {
     }
 }
 
-/// Opens the chosen (or default) microphone and speaker. `on_frame` receives 160-byte µ-law frames.
-pub fn start(on_frame: impl Fn(Vec<u8>) + Send + Sync + 'static) -> Result<Audio, String> {
-    let playback = Arc::new(Mutex::new(Playback { buf: VecDeque::new(), up: Up { step: 1.0, frac: 0.0, last: 0.0 }, rate: RATE }));
+/// Opens the chosen (or default) microphone and speaker. `on_frame` receives 20 ms frames of
+/// 48 kHz mono samples, already muted or scaled by the microphone volume.
+pub fn start(on_frame: impl Fn(Vec<f32>) + Send + Sync + 'static) -> Result<Audio, String> {
+    let playback = Arc::new(Mutex::new(Playback { buf: VecDeque::new(), up: Up { step: 1.0, frac: 0.0, last: 0.0 }, rate: CALL_RATE, src: CALL_RATE }));
     let muted = Arc::new(AtomicBool::new(false));
-    let on_frame: Arc<dyn Fn(Vec<u8>) + Send + Sync> = Arc::new(on_frame);
+    let on_frame: Arc<dyn Fn(Vec<f32>) + Send + Sync> = Arc::new(on_frame);
     let stop = open(&playback, &muted, &on_frame)?;
     Ok(Audio { muted, deafened: AtomicBool::new(false), playback, stop: Mutex::new(stop), on_frame })
 }
@@ -294,7 +372,7 @@ impl Audio {
 
 /// Starts the streams; cpal streams are not Send, so they live on their own thread until the
 /// returned sender is dropped.
-fn open(playback: &Arc<Mutex<Playback>>, muted: &Arc<AtomicBool>, on_frame: &Arc<dyn Fn(Vec<u8>) + Send + Sync>) -> Result<std::sync::mpsc::Sender<()>, String> {
+fn open(playback: &Arc<Mutex<Playback>>, muted: &Arc<AtomicBool>, on_frame: &Arc<dyn Fn(Vec<f32>) + Send + Sync>) -> Result<std::sync::mpsc::Sender<()>, String> {
     let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
     let (init_tx, init_rx) = std::sync::mpsc::channel::<Result<(), String>>();
     let (playback, m, on_frame) = (playback.clone(), muted.clone(), on_frame.clone());
@@ -303,7 +381,7 @@ fn open(playback: &Arc<Mutex<Playback>>, muted: &Arc<AtomicBool>, on_frame: &Arc
             let out_stream = with_device(false, |output| {
                 let out_cfg = output.default_output_config().map_err(|e| e.to_string())?;
                 let out_rate = out_cfg.sample_rate();
-                *playback.lock().unwrap() = Playback { buf: VecDeque::new(), up: Up { step: RATE as f64 / out_rate as f64, frac: 0.0, last: 0.0 }, rate: out_rate };
+                *playback.lock().unwrap() = Playback { buf: VecDeque::new(), up: Up { step: CALL_RATE as f64 / out_rate as f64, frac: 0.0, last: 0.0 }, rate: out_rate, src: CALL_RATE };
                 let stream = match out_cfg.sample_format() {
                     SampleFormat::I16 => build_output::<i16>(output, out_cfg.config(), playback.clone()),
                     SampleFormat::U16 => build_output::<u16>(output, out_cfg.config(), playback.clone()),
@@ -413,14 +491,14 @@ where
         .map_err(|e| e.to_string())
 }
 
-fn build_input<T>(device: &cpal::Device, config: StreamConfig, muted: Arc<AtomicBool>, on_frame: impl Fn(Vec<u8>) + Send + 'static) -> Result<cpal::Stream, String>
+fn build_input<T>(device: &cpal::Device, config: StreamConfig, muted: Arc<AtomicBool>, on_frame: impl Fn(Vec<f32>) + Send + 'static) -> Result<cpal::Stream, String>
 where
     T: SizedSample,
     f32: FromSample<T>,
 {
     let channels = config.channels as usize;
-    let mut mic = Mic::new(config.sample_rate, RATE);
-    let mut pcm: Vec<f32> = Vec::with_capacity(FRAME * 2);
+    let mut mic = Mic::new(config.sample_rate, CALL_RATE);
+    let mut pcm: Vec<f32> = Vec::with_capacity(CALL_FRAME * 2);
     device
         .build_input_stream(
             config,
@@ -429,14 +507,9 @@ where
                     let mono = frame.iter().map(|&s| f32::from_sample(s)).sum::<f32>() / channels as f32;
                     mic.push(mono, &mut pcm);
                 }
-                while pcm.len() >= FRAME {
-                    let silent = muted.load(Ordering::Relaxed);
-                    let g = gain(&MIC_GAIN);
-                    let frame: Vec<u8> = pcm
-                        .drain(..FRAME)
-                        .map(|x| ulaw_encode(if silent { 0 } else { ((x * g).clamp(-1.0, 1.0) * 32767.0) as i16 }))
-                        .collect();
-                    on_frame(frame);
+                while pcm.len() >= CALL_FRAME {
+                    let g = if muted.load(Ordering::Relaxed) { 0.0 } else { gain(&MIC_GAIN) };
+                    on_frame(pcm.drain(..CALL_FRAME).map(|x| (x * g).clamp(-1.0, 1.0)).collect());
                 }
             },
             |e| eprintln!("audio input error: {e}"),
