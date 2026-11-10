@@ -39,7 +39,11 @@ jobs:
       image: archlinux:base-devel  # makepkg is required to generate .SRCINFO
     steps:
       - name: Install git and openssh
-        run: pacman -Sy --noconfirm archlinux-keyring git openssh
+        # Keyring first, then a full upgrade: a partial one (-Sy + install) breaks when the
+        # repositories move past the image (e.g. the openssl 3 -> 4 soname bump).
+        run: |
+          pacman -Sy --noconfirm --needed archlinux-keyring
+          pacman -Su --noconfirm --needed git openssh
 
       - name: Checkout
         uses: actions/checkout@v4
@@ -112,7 +116,11 @@ jobs:
       image: archlinux:base-devel
     steps:
       - name: Install git and openssh
-        run: pacman -Sy --noconfirm archlinux-keyring git openssh
+        # Keyring first, then a full upgrade: a partial one (-Sy + install) breaks when the
+        # repositories move past the image (e.g. the openssl 3 -> 4 soname bump).
+        run: |
+          pacman -Sy --noconfirm --needed archlinux-keyring
+          pacman -Su --noconfirm --needed git openssh
 
       - name: Checkout
         uses: actions/checkout@v4
