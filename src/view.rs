@@ -3270,6 +3270,7 @@ impl App {
                 false => (call.local.clone(), sess.me.as_str(), me.clone(), call.muted),
             };
             let speaking = call.speaking[peer as usize];
+            let shows = pic.is_some();
             div()
                 .id(if peer { "tile-peer" } else { "tile-me" })
                 .relative()
@@ -3282,7 +3283,7 @@ impl App {
                 .flex()
                 .items_center()
                 .justify_center()
-                .cursor_pointer()
+                .when(shows, |d| d.cursor_pointer())
                 .child(match pic {
                     Some(pic) => img(pic).size_full().object_fit(ObjectFit::Contain).into_any_element(),
                     None => avatar(sess, jid, &label, 72.),
@@ -3304,13 +3305,17 @@ impl App {
                         .when(muted, |d| d.child(Icon::new(IconName::MicOff).size(dp(12.)).text_color(p.danger))),
                 )
         };
+        // Only a picture is worth enlarging: a tile without one isn't clickable, and one that lost
+        // its picture goes back into the grid.
+        let shows = |peer: bool| if peer { call.remote.is_some() } else { call.local.is_some() };
+        let focused = self.call_focus.filter(|&f| shows(f));
         // An expanded panel hides its bars after a while without the mouse moving.
         let idle = self.call_expanded && self.call_menu.is_none() && self.call_mouse.elapsed().as_secs() >= 3;
         // Expanded with one tile in focus, the picture takes the whole window, edge to edge.
-        let edge = self.call_expanded && self.call_focus.is_some();
+        let edge = self.call_expanded && focused.is_some();
         let gap = 12.;
         let stage_size = self.call_stage.get();
-        let content = match self.call_focus {
+        let content = match focused {
             None => {
                 let (w, h) = tile_size((f32::from(stage_size.width), f32::from(stage_size.height)), 2, gap);
                 h_flex()
@@ -3321,10 +3326,12 @@ impl App {
                     .items_center()
                     .content_center()
                     .children([true, false].map(|peer| {
-                        tile(peer).w(px(w)).h(px(h)).on_click(cx.listener(move |this, _, _, cx| {
-                            this.call_focus = Some(peer);
-                            cx.notify();
-                        }))
+                        tile(peer).w(px(w)).h(px(h)).when(shows(peer), |d| {
+                            d.on_click(cx.listener(move |this, _, _, cx| {
+                                this.call_focus = Some(peer);
+                                cx.notify();
+                            }))
+                        })
                     }))
                     .into_any_element()
             }
@@ -3349,10 +3356,12 @@ impl App {
                         .w(dp(192.))
                         .h(dp(108.))
                         .shadow_lg()
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.call_focus = Some(!focus);
-                            cx.notify();
-                        })),
+                        .when(shows(!focus), |d| {
+                            d.on_click(cx.listener(move |this, _, _, cx| {
+                                this.call_focus = Some(!focus);
+                                cx.notify();
+                            }))
+                        }),
                     )
                 })
                 .into_any_element(),
@@ -3464,10 +3473,17 @@ impl App {
                     }
                 }
                 let this2 = this.clone();
+                // Only what the shared screen allows: no 2K of a Full HD one; the original is the largest.
+                let height = crabber::videocall::capture_size().filter(|_| sharing).map(|(_, h)| h);
                 menu = menu.separator().submenu(t!("call.share_quality"), window, cx, move |mut m, _, _| {
-                    for q in crabber::videocall::Quality::ALL {
+                    use crabber::videocall::Quality;
+                    for q in Quality::offered(height) {
                         let this = this2.clone();
-                        m = m.item(PopupMenuItem::new(quality_label(q)).checked(q == quality).on_click(move |_, w, cx| {
+                        let label = match (q, height) {
+                            (Quality::Source, Some(h)) => format!("{} · {h}p", quality_label(q)),
+                            _ => quality_label(q).to_string(),
+                        };
+                        m = m.item(PopupMenuItem::new(label).checked(q == quality.effective(height)).on_click(move |_, w, cx| {
                             let _ = this.update(cx, |app, cx| app.update_settings(w, cx, |st| st.share_quality = q));
                         }));
                     }
@@ -3532,7 +3548,7 @@ impl App {
                 share_menu.into_any_element(),
                 false,
             ))
-            .when(self.call_focus.is_some(), |d| {
+            .when(focused.is_some(), |d| {
                 let hidden = self.call_hide_others;
                 d.child(
                     round("call-others", if hidden { IconName::UserX } else { IconName::Users }, card, false)
@@ -3572,8 +3588,9 @@ impl App {
             .pt_3()
             .gap_2()
             .items_center()
+            .when(edge, |d| d.text_color(white()))
             .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).child(name))
-            .child(div().text_sm().text_color(p.muted).child(call_status(call)));
+            .child(div().text_sm().text_color(if edge { white().opacity(0.75) } else { p.muted }).child(call_status(call)));
         let panel = v_flex()
             .id("call-panel")
             .size_full()
@@ -3584,16 +3601,40 @@ impl App {
                 if idle {
                     cx.notify();
                 }
+            }))
+            // A click is activity too: on hidden bars it only brings them back (they then take the
+            // click's release, so the picture underneath doesn't get it).
+            .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| {
+                this.call_mouse = std::time::Instant::now();
+                if idle {
+                    cx.notify();
+                }
             }));
         // Expanded, the bars float over the stage, so hiding them leaves the tiles where they are.
         Some(if expanded {
-            let bar = |d: Div| d.absolute().left_0().right_0().when(idle, |d| d.invisible());
+            // Over the picture a shade keeps the bars readable; they fade in and out, and catch
+            // their own clicks (a click on a button used to reach the tile underneath too).
+            let shade = |angle: f32, depth: f32| linear_gradient(angle, linear_color_stop(black().opacity(depth), 0.), linear_color_stop(transparent_black(), 1.));
+            let bar = |name: &'static str, d: Div| {
+                d.absolute()
+                    .left_0()
+                    .right_0()
+                    .with_animation((name, idle as u64), Animation::new(std::time::Duration::from_millis(if idle { 400 } else { 150 })).with_easing(ease_in_out), move |d, t| {
+                        if !idle {
+                            d.opacity(t).occlude()
+                        } else if t < 1. {
+                            d.opacity(1. - t).occlude()
+                        } else {
+                            d.invisible()
+                        }
+                    })
+            };
             panel
                 .relative()
                 .when(!edge, |d| d.pt(dp(36.)).pb(dp(56.)))
                 .child(stage)
-                .child(bar(div()).top_0().child(header))
-                .child(bar(div()).bottom_0().child(controls))
+                .child(bar("call-top-bar", div().top_0().when(edge, |d| d.pb(dp(24.)).bg(shade(180., 0.45))).child(header)))
+                .child(bar("call-bottom-bar", div().bottom_0().when(edge, |d| d.pt(dp(48.)).bg(shade(0., 0.6))).child(controls)))
                 .into_any_element()
         } else {
             panel.child(header).child(stage).child(controls).into_any_element()

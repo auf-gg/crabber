@@ -94,8 +94,10 @@ fn run(fd: OwnedFd, node: u32, stop: pw::channel::Receiver<()>, ready: mpsc::Sen
     let _core_listener = core.add_listener_local().error({
         let mainloop = mainloop.clone();
         let ready = ready.clone();
-        move |_, _, _, _| {
-            let _ = ready.send(Err("PipeWire connection failed".into()));
+        move |id, _, _, message| {
+            // Errors about single objects are not fatal; only a broken connection is.
+            if id != pw::core::PW_ID_CORE { return; }
+            let _ = ready.send(Err(format!("PipeWire connection failed: {message}")));
             mainloop.quit();
         }
     }).register();
@@ -117,8 +119,12 @@ fn run(fd: OwnedFd, node: u32, stop: pw::channel::Receiver<()>, ready: mpsc::Sen
             let ready = ready.clone();
             move |_, _, _, state| match state {
                 pw::stream::StreamState::Streaming => { let _ = ready.send(Ok(())); }
-                pw::stream::StreamState::Error(_) | pw::stream::StreamState::Unconnected => {
-                    let _ = ready.send(Err("PipeWire stream failed".into()));
+                pw::stream::StreamState::Error(error) => {
+                    let _ = ready.send(Err(format!("PipeWire stream failed: {error}")));
+                    mainloop.quit();
+                }
+                pw::stream::StreamState::Unconnected => {
+                    let _ = ready.send(Err("PipeWire stream ended".into()));
                     mainloop.quit();
                 }
                 _ => {}

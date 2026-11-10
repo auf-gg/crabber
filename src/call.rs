@@ -10,7 +10,11 @@ use std::time::{Duration, Instant};
 
 use futures::{FutureExt as _, StreamExt};
 use futures::channel::mpsc::{UnboundedSender, unbounded};
+use rtc::interceptor::{Attribute, Interceptor, Packet, Slot, StreamInfo, TaggedPacket};
 use rtc::media::Sample;
+use rtc::rtcp::payload_feedbacks::full_intra_request::FullIntraRequest;
+use rtc::rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication;
+use rtc::sansio::Protocol;
 use rtc::media_stream::MediaStreamTrack;
 use rtc::peer_connection::configuration::media_engine::{MIME_TYPE_OPUS, MIME_TYPE_PCMU, MIME_TYPE_VP8, MediaEngine};
 use rtc::rtp::packetizer::Depacketizer;
@@ -187,6 +191,8 @@ enum Msg {
     Track(String, Arc<dyn TrackRemote>),
     Timeout(String),
     Encoder(String, Source, Result<Encoder, String>),
+    /// The peer asked for a keyframe of our video.
+    Keyframe(String),
 }
 
 /// Front end owned by the XMPP loop; the call itself runs in its own task.
@@ -556,6 +562,13 @@ impl Actor {
                         self.emit_media();
                     }
                 }
+                // System audio follows a share that really started (and stops with a failed one).
+                self.update_system_audio();
+            }
+            Msg::Keyframe(sid) => {
+                if let Some(e) = self.call.as_ref().filter(|c| c.sid == sid).and_then(|c| c.encoder.as_ref()) {
+                    e.keyframe();
+                }
             }
         }
     }
@@ -648,7 +661,9 @@ impl Actor {
                 }
             }
             CallCmd::ScreenQuality => {
-                let Some(c) = self.call.as_ref().filter(|c| c.sending == Some(Source::Screen)) else { return };
+                // Still starting (the portal picker may be open): it picks up the setting itself;
+                // a second capture now would open a second picker.
+                let Some(c) = self.call.as_ref().filter(|c| c.sending == Some(Source::Screen) && c.encoder.is_some()) else { return };
                 // Wayland keeps its portal session; elsewhere the capture restarts on the same target.
                 if !c.encoder.as_ref().is_some_and(|e| e.restart()) {
                     self.set_video(Some(Source::Screen)).await;
@@ -666,7 +681,8 @@ impl Actor {
     /// System audio runs only while the screen is shared and the user asked for it.
     fn update_system_audio(&mut self) {
         let Some(c) = self.call.as_mut() else { return };
-        let want = c.share_audio && c.sending == Some(Source::Screen);
+        // Only once the capture runs: starting it must not hold up the screen picker.
+        let want = c.share_audio && c.sending == Some(Source::Screen) && c.encoder.is_some();
         if !want {
             c.system_audio = None;
             c.system_buf.lock().unwrap().clear();
@@ -1184,7 +1200,7 @@ impl Actor {
         let ice_servers = ice_servers(&self.net, self.me.domain().as_str()).await;
 
         let mut media = media_engine()?;
-        let registry = register_default_interceptors(Registry::new(), &mut media).map_err(|e| e.to_string())?;
+        let registry = interceptors(&mut media).map_err(|e| e.to_string())?;
         let handler = Arc::new(Handler { sid: sid.clone(), tx: self.tx.clone() });
         let pc = PeerConnectionBuilder::new()
             .with_configuration(RTCConfigurationBuilder::new().with_ice_servers(ice_servers).build())
@@ -1241,6 +1257,13 @@ impl Actor {
             .map_err(|e| e.to_string())?,
         );
         let sender = pc.add_track(track.clone() as Arc<dyn TrackLocal>).await.map_err(|e| e.to_string())?;
+        // Keyframe requests (the interceptor passes only those); ends with the peer connection.
+        let (polled, tx) = (track.clone(), self.tx.clone());
+        tokio::spawn(async move {
+            while polled.poll().await.is_some() {
+                let _ = tx.unbounded_send(Msg::Keyframe(sid.clone()));
+            }
+        });
         let c = self.call.as_mut().ok_or(t!("call.err_no_call"))?;
         *c.video_track.lock().unwrap() = Some((track, ssrc, VP8_PT));
         c.video_sender = Some(sender);
@@ -1394,6 +1417,60 @@ fn formats(sdp: &str) -> (Option<AudioFormat>, Option<u8>) {
     };
     let audio = find("audio", "opus").map(|pt| AudioFormat { opus: true, pt }).or_else(|| find("audio", "PCMU").map(|pt| AudioFormat { opus: false, pt }));
     (audio, find("video", "VP8"))
+}
+
+/// The default interceptors plus [`KeyframeRequests`], last so the others see all RTCP first.
+fn interceptors(media: &mut MediaEngine) -> Result<Registry, webrtc::error::Error> {
+    Ok(register_default_interceptors(Registry::new(), media)?.with(Slot::from(14_000), KeyframeRequests::default()))
+}
+
+/// Inbound RTCP stops at the interceptors; this one marks the peer's keyframe requests (PLI, FIR)
+/// for the application and drops the rest, which the others have already handled.
+#[derive(Default)]
+struct KeyframeRequests {
+    read: VecDeque<TaggedPacket>,
+    write: VecDeque<TaggedPacket>,
+}
+
+impl Protocol<TaggedPacket, TaggedPacket, ()> for KeyframeRequests {
+    type Rout = TaggedPacket;
+    type Wout = TaggedPacket;
+    type Eout = ();
+    type Error = rtc::shared::error::Error;
+    type Time = Instant;
+
+    fn handle_read(&mut self, mut msg: TaggedPacket) -> Result<(), Self::Error> {
+        if let Packet::Rtcp(packets) = &msg.message.packet {
+            let wanted: Vec<_> = packets.iter().filter(|p| p.as_any().is::<PictureLossIndication>() || p.as_any().is::<FullIntraRequest>()).cloned().collect();
+            if wanted.is_empty() {
+                return Ok(());
+            }
+            msg.message.packet = Packet::Rtcp(wanted);
+            msg.message.add(Attribute::DeliverToApplication);
+        }
+        self.read.push_back(msg);
+        Ok(())
+    }
+
+    fn poll_read(&mut self) -> Option<TaggedPacket> {
+        self.read.pop_front()
+    }
+
+    fn handle_write(&mut self, msg: TaggedPacket) -> Result<(), Self::Error> {
+        self.write.push_back(msg);
+        Ok(())
+    }
+
+    fn poll_write(&mut self) -> Option<TaggedPacket> {
+        self.write.pop_front()
+    }
+}
+
+impl Interceptor for KeyframeRequests {
+    fn bind_local_stream(&mut self, _: &StreamInfo) {}
+    fn unbind_local_stream(&mut self, _: &StreamInfo) {}
+    fn bind_remote_stream(&mut self, _: &StreamInfo) {}
+    fn unbind_remote_stream(&mut self, _: &StreamInfo) {}
 }
 
 fn vp8() -> RTCRtpCodec {
@@ -1844,7 +1921,7 @@ a=rtpmap:96 VP8/90000\r\na=rtcp-fb:96 nack pli\r\na=ssrc:43 cname:abc\r\n";
     }
 
     async fn test_pc_with(mut media: MediaEngine) -> TestPc {
-        let registry = register_default_interceptors(Registry::new(), &mut media).unwrap();
+        let registry = interceptors(&mut media).unwrap();
         let (c, cr) = unbounded();
         let (t, tr) = unbounded();
         let (s, sr) = unbounded();
@@ -2023,11 +2100,12 @@ a=rtpmap:96 VP8/90000\r\na=rtcp-fb:96 nack pli\r\na=ssrc:43 cname:abc\r\n";
         // A streams a test pattern encoded by ffmpeg; B decodes it.
         let (frames_tx, mut frames_rx) = unbounded::<Vec<u8>>();
         let mut input: Vec<String> = ["-re", "-f", "lavfi", "-i", "testsrc=size=640x360:rate=30"].iter().map(|s| s.to_string()).collect();
-        input.extend(crate::videocall::encode_args(Source::Camera));
+        input.extend(crate::videocall::encode_args(Source::Camera, None));
         let mut enc = crate::videocall::spawn_encoder(&input, Arc::new(Mutex::new(Box::new(move |f| {
             let _ = frames_tx.unbounded_send(f);
         }))))
         .unwrap();
+        let sent = track.clone();
         let writer = tokio::spawn(async move {
             while let Some(f) = frames_rx.next().await {
                 let sample = Sample {
@@ -2042,13 +2120,13 @@ a=rtpmap:96 VP8/90000\r\na=rtcp-fb:96 nack pli\r\na=ssrc:43 cname:abc\r\n";
             }
         });
         let got = tokio::time::timeout(Duration::from_secs(15), async {
-            loop {
+            let remote = loop {
                 let t = b_tracks.next().await.expect("track");
                 if t.kind().await == RtpCodecKind::Video {
-                    tokio::spawn(receive_video(t));
-                    break;
+                    tokio::spawn(receive_video(t.clone()));
+                    break t;
                 }
-            }
+            };
             loop {
                 let done = {
                     let slot = FRAMES.remote.lock().unwrap();
@@ -2059,14 +2137,23 @@ a=rtpmap:96 VP8/90000\r\na=rtcp-fb:96 nack pli\r\na=ssrc:43 cname:abc\r\n";
                 }
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
+            remote
         })
         .await;
+        let remote = got.expect("decoded video frame on the far side");
+
+        // B asks for a keyframe: it must reach the application on A's side (a still screen would
+        // otherwise make B wait for the next regular keyframe).
+        let pli = rtc::rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication { sender_ssrc: 0, media_ssrc: ssrc };
+        remote.write_rtcp(vec![Box::new(pli)]).await.unwrap();
+        let request = tokio::time::timeout(Duration::from_secs(5), sent.poll()).await;
         let _ = enc.kill();
         let _ = enc.wait();
         writer.abort();
         let _ = a.close().await;
         let _ = b.close().await;
-        got.expect("decoded video frame on the far side");
+        let Ok(Some(webrtc::media_stream::track_local::TrackLocalEvent::OnRtcpPacket(packets))) = request else { panic!("no keyframe request reached the sender: {request:?}") };
+        assert!(packets.iter().any(|p| p.as_any().is::<PictureLossIndication>()), "{packets:?}");
     }
 
     fn jingle_el(action: &str, sid: &str, payload: Option<Element>) -> Element {

@@ -105,7 +105,8 @@ impl Quality {
         Self::ALL.into_iter().find(|q| q.id() == id)
     }
 
-    fn height(self) -> Option<u32> {
+    /// Height it scales down to; None for the original.
+    pub fn height(self) -> Option<u32> {
         match self {
             Self::Source => None,
             Self::P1440 => Some(1440),
@@ -114,14 +115,39 @@ impl Quality {
         }
     }
 
-    fn bitrate(self) -> &'static str {
-        match self {
-            Self::Source => "6000k",
-            Self::P1440 => "4000k",
-            Self::P1080 => "2500k",
-            Self::P720 => "1500k",
+    /// What a capture `height` px tall offers (None: not known yet): the original, which is the
+    /// largest, and the presets below it.
+    pub fn offered(height: Option<u32>) -> Vec<Self> {
+        Self::ALL.into_iter().filter(|q| q.height().is_none_or(|h| height.is_none_or(|c| h < c))).collect()
+    }
+
+    /// The setting as it applies to a capture `height` px tall: a preset that doesn't scale it
+    /// down is the original.
+    pub fn effective(self, height: Option<u32>) -> Self {
+        match (self.height(), height) {
+            (Some(h), Some(c)) if h >= c => Self::Source,
+            _ => self,
         }
     }
+}
+
+/// Bitrate for the height actually sent.
+fn bitrate(height: Option<u32>) -> &'static str {
+    match height {
+        Some(..=720) => "1500k",
+        Some(..=1080) => "2500k",
+        Some(..=1440) => "4000k",
+        _ => "6000k",
+    }
+}
+
+/// Size of the screen being captured, while we capture it ourselves.
+static CAPTURE_SIZE: Mutex<Option<(u32, u32)>> = Mutex::new(None);
+
+/// Width and height of the shared screen or window; None when not known (not sharing, or ffmpeg
+/// captures it itself).
+pub fn capture_size() -> Option<(u32, u32)> {
+    *CAPTURE_SIZE.lock().unwrap()
 }
 
 static QUALITY: Mutex<Quality> = Mutex::new(Quality::P1080);
@@ -164,15 +190,22 @@ pub struct Encoder {
     /// Our own capture (portal session, Windows capture) for fed frames.
     capture: Option<Box<dyn Send>>,
     _feed: Option<SyncSender<()>>,
+    /// When the last keyframe was forced for the peer.
+    keyed: Mutex<Option<Instant>>,
 }
 
-pub(crate) fn encode_args(src: Source) -> Vec<String> {
+/// `capture_height`: the input's height when known, for the bitrate of what is really sent.
+pub(crate) fn encode_args(src: Source, capture_height: Option<u32>) -> Vec<String> {
     let quality = *QUALITY.lock().unwrap();
+    let sent = match (quality.height(), capture_height) {
+        (Some(q), Some(c)) => Some(q.min(c)),
+        (q, c) => q.or(c),
+    };
     // Even sizes for yuv420p.
     let (scale, rate) = match (src, quality.height()) {
         (Source::Camera, _) => ("scale='min(1280,iw)':-2".to_string(), "1200k"),
-        (Source::Screen, Some(h)) => (format!("scale=-2:'min({h},ih)'"), quality.bitrate()),
-        (Source::Screen, None) => ("scale=trunc(iw/2)*2:trunc(ih/2)*2".to_string(), quality.bitrate()),
+        (Source::Screen, Some(h)) => (format!("scale=-2:'min({h},ih)'"), bitrate(sent)),
+        (Source::Screen, None) => ("scale=trunc(iw/2)*2:trunc(ih/2)*2".to_string(), bitrate(sent)),
     };
     #[rustfmt::skip]
     let args = [
@@ -278,9 +311,9 @@ impl Encoder {
         let sink: Sink = Arc::new(Mutex::new(Box::new(on_frame)));
         match capture(src)? {
             Capture::Ffmpeg(mut input) => {
-                input.extend(encode_args(src));
+                input.extend(encode_args(src, None));
                 let child = spawn_encoder(&input, sink)?;
-                Ok(Self { child: Arc::new(Mutex::new(Some(child))), capture: None, _feed: None })
+                Ok(Self { child: Arc::new(Mutex::new(Some(child))), capture: None, _feed: None, keyed: Mutex::new(None) })
             }
             Capture::Fed(frames, capture) => Ok(Self::start_fed(frames, capture, sink)),
         }
@@ -298,6 +331,19 @@ impl Encoder {
             let _ = c.wait();
         }
         true
+    }
+
+    /// Answers the peer's keyframe request (it missed the start or lost packets): a new ffmpeg
+    /// begins with a keyframe. Fed captures only, at most once a second; a still screen would
+    /// otherwise wait seconds for the next regular one.
+    pub fn keyframe(&self) {
+        let mut keyed = self.keyed.lock().unwrap();
+        if keyed.is_some_and(|t| t.elapsed() < Duration::from_secs(1)) {
+            return;
+        }
+        if self.restart() {
+            *keyed = Some(Instant::now());
+        }
     }
 
     /// Our frames piped into ffmpeg as raw BGRA, at most `FEED_FPS`; ffmpeg restarts when the size
@@ -325,6 +371,8 @@ impl Encoder {
                     continue;
                 }
                 let Some(f) = last.as_ref() else { continue };
+                // Every frame: a stale encoder dropped meanwhile clears it.
+                *CAPTURE_SIZE.lock().unwrap() = Some((f.width, f.height));
                 let mut slot = held.lock().unwrap();
                 if size != (f.width, f.height) || slot.is_none() {
                     if let Some(mut old) = slot.take() {
@@ -335,7 +383,7 @@ impl Encoder {
                     let fps = FEED_FPS.to_string();
                     let mut input: Vec<String> =
                         ["-f", "rawvideo", "-pix_fmt", "bgra", "-s", &format!("{}x{}", f.width, f.height), "-r", &fps, "-i", "-"].iter().map(|s| s.to_string()).collect();
-                    input.extend(encode_args(Source::Screen));
+                    input.extend(encode_args(Source::Screen, Some(f.height)));
                     match spawn_encoder(&input, sink.clone()) {
                         Ok(c) => *slot = Some(c),
                         Err(_) => break,
@@ -348,12 +396,15 @@ impl Encoder {
                 sent = Some(Instant::now());
             }
         });
-        Self { child, capture: Some(capture), _feed: Some(stop) }
+        Self { child, capture: Some(capture), _feed: Some(stop), keyed: Mutex::new(None) }
     }
 }
 
 impl Drop for Encoder {
     fn drop(&mut self) {
+        if self.capture.is_some() {
+            *CAPTURE_SIZE.lock().unwrap() = None;
+        }
         if let Some(mut c) = self.child.lock().unwrap().take() {
             let _ = c.kill();
             let _ = c.wait();
@@ -459,6 +510,67 @@ pub fn keyframe_size(frame: &[u8]) -> Option<(u32, u32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quality_offers_follow_the_capture() {
+        use Quality::{P720, P1080, P1440};
+        assert_eq!(Quality::offered(Some(1080)), [Quality::Source, P720]);
+        assert_eq!(Quality::offered(Some(1440)), [Quality::Source, P1080, P720]);
+        assert_eq!(Quality::offered(Some(2160)), Quality::ALL);
+        assert_eq!(Quality::offered(None), Quality::ALL);
+        assert_eq!(P1440.effective(Some(1080)), Quality::Source);
+        assert_eq!(P1080.effective(Some(1080)), Quality::Source);
+        assert_eq!(P720.effective(Some(1080)), P720);
+        assert_eq!(P1080.effective(None), P1080);
+        // The bitrate follows what is sent, so "Full HD" of a 1080p screen is the original.
+        set_screen_quality(P1080);
+        let rate = |h| encode_args(Source::Screen, h).iter().skip_while(|a| *a != "-b:v").nth(1).cloned().unwrap();
+        assert_eq!(rate(Some(1080)), "2500k");
+        assert_eq!(rate(Some(720)), "1500k");
+        set_screen_quality(Quality::Source);
+        assert_eq!(rate(Some(1080)), "2500k");
+        assert_eq!(rate(Some(2160)), "6000k");
+        assert_eq!(rate(None), "6000k");
+        set_screen_quality(P1080);
+    }
+
+    /// A still screen gets a keyframe within moments of the peer asking, not at the next regular one.
+    #[test]
+    fn keyframe_on_request_for_fed_frames() {
+        if !crate::video::available() {
+            eprintln!("ffmpeg not found, skipping");
+            return;
+        }
+        let keys = Arc::new(Mutex::new(Vec::<Instant>::new()));
+        let seen = keys.clone();
+        let sink: Sink = Arc::new(Mutex::new(Box::new(move |f: Vec<u8>| {
+            if is_keyframe(&f) {
+                seen.lock().unwrap().push(Instant::now());
+            }
+        })));
+        let (tx, rx) = sync_channel(2);
+        tx.send(RawFrame { width: 320, height: 240, data: vec![90; 320 * 240 * 4] }).unwrap();
+        let enc = Encoder::start_fed(rx, Box::new(()), sink);
+        let wait = |n: usize, within: Duration| {
+            let end = Instant::now() + within;
+            while keys.lock().unwrap().len() < n && Instant::now() < end {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            keys.lock().unwrap().len()
+        };
+        assert_eq!(wait(1, Duration::from_secs(5)), 1, "first keyframe");
+        std::thread::sleep(Duration::from_millis(1500));
+        assert_eq!(keys.lock().unwrap().len(), 1, "a still screen has no regular keyframe this soon");
+        let asked = Instant::now();
+        enc.keyframe();
+        assert_eq!(wait(2, Duration::from_secs(3)), 2, "keyframe after the request");
+        println!("keyframe {:?} after the request", keys.lock().unwrap()[1] - asked);
+        // A second request right away is ignored (at most one a second).
+        enc.keyframe();
+        std::thread::sleep(Duration::from_millis(800));
+        assert_eq!(keys.lock().unwrap().len(), 2);
+        drop(tx);
+    }
 
     #[test]
     fn keyframe_sizes() {

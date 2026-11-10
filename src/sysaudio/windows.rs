@@ -70,14 +70,16 @@ mod imp {
                         },
                     },
                 };
-                let mut variant = PROPVARIANT::default();
+                // Never dropped: PROPVARIANT's Drop runs PropVariantClear, which would CoTaskMemFree
+                // the blob, and the blob points at `params` on this stack (that crashed the client).
+                let mut variant = std::mem::ManuallyDrop::new(PROPVARIANT::default());
                 (*variant.Anonymous.Anonymous).vt = VT_BLOB;
                 (*variant.Anonymous.Anonymous).Anonymous.blob = BLOB {
                     cbSize: std::mem::size_of_val(&params) as u32,
                     pBlobData: (&mut params as *mut AUDIOCLIENT_ACTIVATION_PARAMS).cast(),
                 };
                 let unsupported = || "system audio requires Windows process loopback support (build 20348 or newer)".to_string();
-                let operation = ActivateAudioInterfaceAsync(VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK, &IAudioClient::IID, Some(&variant), &handler)
+                let operation = ActivateAudioInterfaceAsync(VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK, &IAudioClient::IID, Some(&*variant), &handler)
                     .map_err(|_| unsupported())?;
                 completed.recv_timeout(Duration::from_secs(5)).map_err(|_| "system audio activation timed out".to_string())?;
                 let mut result = HRESULT(0);

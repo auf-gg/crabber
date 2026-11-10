@@ -25,7 +25,7 @@ mod imp {
     use std::thread::{self, JoinHandle};
     use std::time::{Duration, Instant};
     use windows::core::{Interface, factory};
-    use windows::Graphics::Capture::{Direct3D11CaptureFrame, Direct3D11CaptureFramePool, GraphicsCaptureItem, GraphicsCaptureSession};
+    use windows::Graphics::Capture::{Direct3D11CaptureFrame, Direct3D11CaptureFramePool, GraphicsCaptureAccess, GraphicsCaptureAccessKind, GraphicsCaptureItem, GraphicsCaptureSession};
     use windows::Graphics::DirectX::Direct3D11::IDirect3DDevice;
     use windows::Graphics::DirectX::DirectXPixelFormat;
     use windows::Graphics::SizeInt32;
@@ -130,6 +130,9 @@ mod imp {
             };
             let capture = Self { device, context, winrt_device, pool, session, size, staging: None };
             let _ = capture.session.SetIsCursorCaptureEnabled(true);
+            // Windows 11 drops the yellow border only once borderless capture is granted (desktop
+            // apps get it without a prompt); Windows 10 has neither call and always draws it.
+            let _ = GraphicsCaptureAccess::RequestAccessAsync(GraphicsCaptureAccessKind::Borderless).and_then(|op| op.join());
             let _ = capture.session.SetIsBorderRequired(false);
             capture.session.StartCapture().map_err(|_| "could not start screen capture".to_string())?;
             Ok(capture)
