@@ -13,6 +13,8 @@ use gpui_kit::component::{
     Theme, ThemeMode, WindowExt as _,
     color_picker::{ColorPickerEvent, ColorPickerState},
     input::{InputEvent, InputState, TextareaState},
+    resizable::ResizableState,
+    slider::{SliderEvent, SliderState},
 };
 use gpui_kit::*;
 use crabber::call::{CallCmd, CallEv, CallState};
@@ -139,6 +141,9 @@ pub struct Settings {
     pub camera: Option<MediaDevice>,
     /// RNNoise noise suppression on the microphone.
     pub denoise: bool,
+    /// Call volumes, 1.0 = 100 %.
+    pub mic_volume: f32,
+    pub speaker_volume: f32,
 }
 
 impl Settings {
@@ -160,6 +165,8 @@ impl Settings {
             speaker: load_device(s, "speaker"),
             camera: load_device(s, "camera"),
             denoise: s.get("denoise").is_some_and(|v| v == "1"),
+            mic_volume: volume(s, "mic_volume"),
+            speaker_volume: volume(s, "speaker_volume"),
         }
     }
     /// Hands the chosen devices to the audio and video code; open streams pick them up on `CallCmd::Devices`.
@@ -168,6 +175,7 @@ impl Settings {
         crabber::audio::set_devices(id(&self.mic), id(&self.speaker));
         crabber::videocall::set_camera(id(&self.camera));
         crabber::audio::set_denoise(self.denoise);
+        crabber::audio::set_volumes(self.mic_volume, self.speaker_volume);
     }
     /// Switches the UI texts to the chosen language; "system" follows the OS.
     fn apply_lang(&self) {
@@ -188,6 +196,8 @@ impl Settings {
         s.set("start_minimized", b(self.start_minimized));
         s.set("lang", &self.lang);
         s.set("denoise", b(self.denoise));
+        s.set("mic_volume", &self.mic_volume.to_string());
+        s.set("speaker_volume", &self.speaker_volume.to_string());
         for (k, d) in [("mic", &self.mic), ("speaker", &self.speaker), ("camera", &self.camera)] {
             s.set(k, d.as_ref().map_or("", |d| d.id.as_str()));
             s.set(&format!("{k}_name"), d.as_ref().map_or("", |d| d.name.as_str()));
@@ -221,6 +231,10 @@ impl DeviceKind {
     }
 }
 
+fn volume(s: &Store, key: &str) -> f32 {
+    s.get(key).and_then(|v| v.parse().ok()).filter(|v: &f32| (0.0..=2.0).contains(v)).unwrap_or(1.0)
+}
+
 fn load_device(s: &Store, key: &str) -> Option<MediaDevice> {
     let id = s.get(key).filter(|v| !v.is_empty())?;
     Some(MediaDevice { id, name: s.get(&format!("{key}_name")).unwrap_or_default() })
@@ -230,6 +244,8 @@ pub struct CallUi {
     pub peer: String,
     pub state: CallState,
     pub muted: bool,
+    /// The peer is not played.
+    pub deafened: bool,
     pub started: Option<Instant>,
     pub outgoing: bool,
     /// The call carries video (proposed with it or upgraded).
@@ -244,7 +260,7 @@ pub struct CallUi {
 impl CallUi {
     pub fn new(peer: String, state: CallState) -> Self {
         let outgoing = state == CallState::Outgoing;
-        Self { peer, state, muted: false, started: None, outgoing, video: false, sending: None, remote: None, local: None }
+        Self { peer, state, muted: false, deafened: false, started: None, outgoing, video: false, sending: None, remote: None, local: None }
     }
 }
 
@@ -524,6 +540,12 @@ pub struct App {
     pub update_progress: Arc<std::sync::atomic::AtomicU32>,
     pub updating: bool,
     pub update_error: Option<String>,
+    /// Call panel: chat hidden under it, the split between them, volume sliders, the open device menu.
+    pub call_chat_hidden: bool,
+    pub call_split: Entity<ResizableState>,
+    pub mic_volume: Entity<SliderState>,
+    pub speaker_volume: Entity<SliderState>,
+    pub call_menu: Option<&'static str>,
     app_store: Store,
     _subs: Vec<Subscription>,
 }
@@ -599,6 +621,11 @@ impl App {
                 color_pickers.push(cx.new(|cx| ColorPickerState::new(window, cx).default_value(rgb(v))));
             }
         }
+
+        let percent = |v: f32| SliderState::new().min(0.).max(200.).step(1.).default_value(v * 100.);
+        let mic_volume = cx.new(|_| percent(settings.mic_volume));
+        let speaker_volume = cx.new(|_| percent(settings.speaker_volume));
+        let call_split = cx.new(|_| ResizableState::default());
 
         let (tray, desktop_tx, mut desktop_events) = desktop::init(&store::data_dir());
         cx.spawn(async move |this, cx| {
@@ -699,6 +726,11 @@ impl App {
             update_progress: Arc::default(),
             updating: false,
             update_error: None,
+            call_chat_hidden: false,
+            call_split,
+            mic_volume,
+            speaker_volume,
+            call_menu: None,
             app_store,
             _subs: vec![],
         };
@@ -854,6 +886,17 @@ impl App {
                 }
             })
         }));
+        // Call volumes apply while dragging and are saved on release.
+        for (state, mic) in [(self.mic_volume.clone(), true), (self.speaker_volume.clone(), false)] {
+            subs.push(cx.subscribe_in(&state, window, move |this, _, ev: &SliderEvent, _, cx| {
+                let (v, save) = match ev {
+                    SliderEvent::Change(v) => (v.start(), false),
+                    SliderEvent::Release(v) => (v.start(), true),
+                };
+                this.set_call_volume(mic, v / 100., save);
+                cx.notify();
+            }));
+        }
         self._subs = subs;
         // Closing the window keeps the app in the tray while logged in.
         let weak = cx.weak_entity();
@@ -1128,6 +1171,15 @@ impl App {
         }
         self.apply_theme(window, cx);
         cx.notify();
+    }
+
+    pub fn set_call_volume(&mut self, mic: bool, v: f32, save: bool) {
+        let slot = if mic { &mut self.settings.mic_volume } else { &mut self.settings.speaker_volume };
+        *slot = v.clamp(0., 2.);
+        crabber::audio::set_volumes(self.settings.mic_volume, self.settings.speaker_volume);
+        if save {
+            self.settings.save(&self.app_store);
+        }
     }
 
     /// One of the scheme editor pickers changed (`ix` indexes `color_pickers`).
@@ -1673,6 +1725,7 @@ impl App {
         }
         sess.sort_chats();
         for c in call_log {
+            self.call_menu = None;
             self.log_call(c);
         }
         self.connecting = false;
@@ -2561,10 +2614,16 @@ impl App {
                     c.state = CallState::Connecting;
                 }
             }
+            CallCmd::Deafen(d) => {
+                if let Some(c) = sess.call.as_mut() {
+                    c.deafened = *d;
+                }
+            }
             CallCmd::Devices => {}
         }
         sess.send(Cmd::Call(cmd));
         if let Some(c) = ended {
+            self.call_menu = None;
             self.log_call(c);
         }
         cx.notify();

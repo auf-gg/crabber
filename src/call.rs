@@ -56,6 +56,8 @@ pub enum CallCmd {
     Accept { video: bool },
     Hangup,
     Mute(bool),
+    /// Stop playing the peer (our sound off).
+    Deafen(bool),
     /// What we send as video; turning it on in an audio call adds video to the session.
     Video(Option<Source>),
     /// The chosen microphone, speaker or camera changed: reopen what the call is using.
@@ -176,6 +178,8 @@ struct Call {
     frames: UnboundedSender<Vec<u8>>,
     encoder: Option<Encoder>,
     sending: Option<Source>,
+    muted: bool,
+    deafened: bool,
 }
 
 struct Actor {
@@ -436,9 +440,19 @@ impl Actor {
                 }
                 self.end("").await;
             }
+            // Kept on the call too: the audio may not exist yet (still ringing).
             CallCmd::Mute(m) => {
-                if let Some(a) = self.call.as_ref().and_then(|c| c.audio.as_ref()) {
+                let Some(c) = self.call.as_mut() else { return };
+                c.muted = m;
+                if let Some(a) = c.audio.as_ref() {
                     a.muted.store(m, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+            CallCmd::Deafen(d) => {
+                let Some(c) = self.call.as_mut() else { return };
+                c.deafened = d;
+                if let Some(a) = c.audio.as_ref() {
+                    a.deafened.store(d, std::sync::atomic::Ordering::Relaxed);
                 }
             }
             CallCmd::Video(src) => self.set_video(src).await,
@@ -520,6 +534,8 @@ impl Actor {
             video_sender: None,
             encoder: None,
             sending: None,
+            muted: false,
+            deafened: false,
         });
         self.emit(state);
         self.emit_media();
@@ -846,6 +862,8 @@ impl Actor {
             }
         });
         let c = self.call.as_mut().ok_or(t!("call.err_no_call"))?;
+        audio.muted.store(c.muted, std::sync::atomic::Ordering::Relaxed);
+        audio.deafened.store(c.deafened, std::sync::atomic::Ordering::Relaxed);
         c.audio = Some(Arc::new(audio));
         c.pc = Some(pc.clone());
         Ok(pc)

@@ -2,7 +2,7 @@
 //! G.711 needs no native codec library and every WebRTC stack (Conversations, Dino) offers it.
 use crate::t;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -19,6 +19,19 @@ static DENOISE: AtomicBool = AtomicBool::new(false);
 
 pub fn set_denoise(on: bool) {
     DENOISE.store(on, Ordering::Relaxed);
+}
+
+/// Call volumes (1.0 = unchanged), applied live: what we send and what we hear.
+static MIC_GAIN: AtomicU32 = AtomicU32::new(0x3F80_0000);
+static OUT_GAIN: AtomicU32 = AtomicU32::new(0x3F80_0000);
+
+pub fn set_volumes(mic: f32, out: f32) {
+    MIC_GAIN.store(mic.to_bits(), Ordering::Relaxed);
+    OUT_GAIN.store(out.to_bits(), Ordering::Relaxed);
+}
+
+fn gain(g: &AtomicU32) -> f32 {
+    f32::from_bits(g.load(Ordering::Relaxed))
 }
 
 pub fn set_devices(input: Option<String>, output: Option<String>) {
@@ -79,7 +92,13 @@ pub struct MediaDevice {
 pub fn devices(input: bool) -> Vec<MediaDevice> {
     let list = |host: &cpal::Host, input: bool| -> Vec<MediaDevice> {
         let devs = if input { host.input_devices().map(|d| d.collect::<Vec<_>>()) } else { host.output_devices().map(|d| d.collect()) };
-        devs.unwrap_or_default().into_iter().filter_map(|d| Some(MediaDevice { id: d.id().ok()?.to_string(), name: d.to_string() })).collect()
+        let pipewire = host.id() != system_host().id();
+        devs.unwrap_or_default()
+            .into_iter()
+            // PipeWire also lists other apps' streams; only nodes made by a driver (factory) are devices.
+            .filter(|d| !pipewire || d.description().is_ok_and(|x| x.driver().is_some()))
+            .filter_map(|d| Some(MediaDevice { id: d.id().ok()?.to_string(), name: d.to_string() }))
+            .collect()
     };
     #[cfg(target_os = "linux")]
     {
@@ -224,6 +243,8 @@ struct Playback {
 
 pub struct Audio {
     pub muted: Arc<AtomicBool>,
+    /// The peer is not played (our sound is off).
+    pub deafened: AtomicBool,
     playback: Arc<Mutex<Playback>>,
     /// Dropping it stops the streams' thread.
     stop: Mutex<std::sync::mpsc::Sender<()>>,
@@ -233,10 +254,14 @@ pub struct Audio {
 impl Audio {
     /// Feeds one received µ-law RTP payload to the speaker.
     pub fn play_ulaw(&self, payload: &[u8]) {
+        if self.deafened.load(Ordering::Relaxed) {
+            return;
+        }
+        let g = gain(&OUT_GAIN);
         let mut p = self.playback.lock().unwrap();
         let Playback { buf, up, rate } = &mut *p;
         for &b in payload {
-            up.push(ulaw_decode(b) as f32 / 32768.0, buf);
+            up.push((ulaw_decode(b) as f32 / 32768.0 * g).clamp(-1.0, 1.0), buf);
         }
         // Keep latency bounded if the network delivers faster than we play.
         let max = *rate as usize * 3 / 10;
@@ -253,7 +278,7 @@ pub fn start(on_frame: impl Fn(Vec<u8>) + Send + Sync + 'static) -> Result<Audio
     let muted = Arc::new(AtomicBool::new(false));
     let on_frame: Arc<dyn Fn(Vec<u8>) + Send + Sync> = Arc::new(on_frame);
     let stop = open(&playback, &muted, &on_frame)?;
-    Ok(Audio { muted, playback, stop: Mutex::new(stop), on_frame })
+    Ok(Audio { muted, deafened: AtomicBool::new(false), playback, stop: Mutex::new(stop), on_frame })
 }
 
 impl Audio {
@@ -406,9 +431,10 @@ where
                 }
                 while pcm.len() >= FRAME {
                     let silent = muted.load(Ordering::Relaxed);
+                    let g = gain(&MIC_GAIN);
                     let frame: Vec<u8> = pcm
                         .drain(..FRAME)
-                        .map(|x| ulaw_encode(if silent { 0 } else { (x.clamp(-1.0, 1.0) * 32767.0) as i16 }))
+                        .map(|x| ulaw_encode(if silent { 0 } else { ((x * g).clamp(-1.0, 1.0) * 32767.0) as i16 }))
                         .collect();
                     on_frame(frame);
                 }

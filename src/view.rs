@@ -8,10 +8,12 @@ use chrono::{Datelike, Local, TimeZone};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, Icon, Sizable as _, h_flex,
-    button::{Button, ButtonVariants as _},
+    button::{Button, ButtonCustomVariant, ButtonVariants as _},
     checkbox::Checkbox,
     color_picker::ColorSelect,
-    menu::{DropdownMenu as _, PopupMenuItem},
+    menu::{DropdownMenu as _, PopupMenu, PopupMenuItem},
+    resizable::{resizable_panel, v_resizable},
+    slider::{Slider, SliderState},
     switch::Switch,
     tooltip::Tooltip,
     input::{Input, Paste, Textarea, TextareaState},
@@ -432,6 +434,87 @@ fn doodles(color: Hsla) -> impl IntoElement {
 }
 
 /// White icon button for the dark viewer overlay (theme buttons would be dark-on-dark).
+/// Device choice: the list is read when the menu opens, so newly plugged devices show up.
+fn device_items(menu: PopupMenu, kind: DeviceKind, current: Option<MediaDevice>, this: WeakEntity<App>) -> PopupMenu {
+    let item = |name: SharedString, d: Option<MediaDevice>| {
+        let this = this.clone();
+        let checked = d.as_ref().map(|d| &d.id) == current.as_ref().map(|d| &d.id);
+        PopupMenuItem::new(name).checked(checked).on_click(move |_, w, cx| {
+            let d = d.clone();
+            let _ = this.update(cx, |app, cx| app.update_settings(w, cx, |st| *kind.slot(st) = d));
+        })
+    };
+    let mut menu = menu.max_h(px(360.)).scrollable(true).item(item(t!("settings.device_default").into(), None));
+    for d in kind.list() {
+        menu = menu.item(item(d.name.clone().into(), Some(d)));
+    }
+    menu
+}
+
+/// A menu row with a checkbox on the right, visible also when off.
+fn check_item(label: &'static str, on: bool) -> PopupMenuItem {
+    PopupMenuItem::element(move |_, cx| {
+        let t = cx.theme();
+        let (accent, border) = (t.primary, t.border);
+        h_flex().w_full().gap_4().justify_between().items_center().child(label).child(
+            div()
+                .size(px(16.))
+                .flex_none()
+                .rounded(px(4.))
+                .border_1()
+                .flex()
+                .items_center()
+                .justify_center()
+                .map(|d| if on { d.bg(accent).border_color(accent).child(Icon::new(IconName::Check).size(px(12.)).text_color(white())) } else { d.border_color(border) }),
+        )
+    })
+}
+
+/// A volume slider row inside a menu; disabled so clicking it doesn't close the menu.
+fn volume_item(label: &'static str, state: Entity<SliderState>) -> PopupMenuItem {
+    PopupMenuItem::element(move |_, cx| {
+        let v = state.read(cx).value().start();
+        v_flex().w(px(240.)).gap_1().py_1().child(h_flex().justify_between().text_sm().child(label).child(format!("{v:.0}%"))).child(Slider::new(&state))
+    })
+    .disabled(true)
+}
+
+/// The arrow next to a call button: its menu, opening upwards; arrow up while open.
+fn menu_chevron(
+    id: &'static str,
+    this: WeakEntity<App>,
+    open: bool,
+    (fg, soft): (Hsla, Hsla),
+    cx: &gpui_kit::App,
+    builder: impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static,
+) -> impl IntoElement {
+    Button::new(id)
+        .custom(ButtonCustomVariant::new(cx).foreground(fg).hover(soft).active(soft))
+        .xsmall()
+        .rounded_full()
+        .icon(if open { IconName::ChevronUp } else { IconName::ChevronDown })
+        .dropdown_menu_with_anchor(Anchor::BottomLeft, builder)
+        .on_open_change(move |open, _, cx| {
+            let _ = this.update(cx, |app, cx| {
+                app.call_menu = open.then_some(id);
+                cx.notify();
+            });
+        })
+}
+
+fn call_status(call: &crate::app::CallUi) -> String {
+    match &call.state {
+        CallState::Outgoing => t!("call.calling").to_string(),
+        CallState::Incoming => t!("call.incoming").to_string(),
+        CallState::Connecting => t!("call.connecting").to_string(),
+        CallState::Active => {
+            let secs = call.started.map_or(0, |s| s.elapsed().as_secs());
+            format!("{:02}:{:02}", secs / 60, secs % 60)
+        }
+        CallState::Ended(r) => r.clone(),
+    }
+}
+
 fn overlay_icon(id: &'static str, icon: IconName) -> Stateful<Div> {
     div().id(id).p_2().rounded_md().cursor_pointer().text_color(white()).hover(|d| d.bg(hsla(0., 0., 1., 0.15))).child(Icon::new(icon))
 }
@@ -675,10 +758,12 @@ impl App {
     }
 
     fn render_main(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let strip = self.render_call_strip(cx);
+        let conversation = self.render_conversation(window, cx).into_any_element();
         h_flex()
             .size_full()
             .child(self.render_sidebar(cx))
-            .child(self.render_conversation(window, cx))
+            .child(v_flex().flex_1().h_full().min_w_0().children(strip).child(h_flex().flex_1().min_h_0().child(conversation)))
     }
 
     fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1236,12 +1321,9 @@ impl App {
                 .into_any_element()
         };
 
-        v_flex()
-            .flex_1()
-            .h_full()
-            .min_w_0()
-            .child(header)
-            .when(!sess.online, |d| d.child(div().px_4().py_1().text_xs().bg(p.danger.opacity(0.12)).text_color(p.danger).child(sess.status.clone())))
+        let chat_area = v_flex()
+            .size_full()
+            .min_h_0()
             .child(div().flex_1().min_h_0().relative().bg(wallpaper).child(doodles(pattern)).child(messages).when(below_bottom(&self.messages), |d| {
                 d.child(
                     div()
@@ -1272,7 +1354,24 @@ impl App {
             .children(pending)
             .children(editing)
             .children(blocked_bar)
-            .when(!blocked, |d| d.child(composer))
+            .when(!blocked, |d| d.child(composer));
+        let panel = sess.call.as_ref().filter(|c| c.peer == peer).and_then(|_| self.render_call_panel(cx));
+        let body = match panel {
+            Some(panel) if self.call_chat_hidden => panel,
+            Some(panel) => v_resizable("call-split")
+                .with_state(&self.call_split)
+                .child(resizable_panel().size(px(360.)).size_range(px(200.)..px(4000.)).child(panel))
+                .child(resizable_panel().size_range(px(160.)..px(4000.)).child(chat_area))
+                .into_any_element(),
+            None => chat_area.into_any_element(),
+        };
+        v_flex()
+            .flex_1()
+            .h_full()
+            .min_w_0()
+            .child(header)
+            .when(!sess.online, |d| d.child(div().px_4().py_1().text_xs().bg(p.danger.opacity(0.12)).text_color(p.danger).child(sess.status.clone())))
+            .child(div().flex_1().min_h_0().flex().child(body))
             .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| this.add_pending(paths.0.iter().cloned(), cx)))
             .drag_over::<ExternalPaths>(move |s, _, _, _| s.opacity(0.85))
             .into_any_element()
@@ -1672,28 +1771,13 @@ impl App {
                 .when(s.lang != value, |b| b.outline())
                 .on_click(cx.listener(move |this, _, w, cx| this.update_settings(w, cx, |st| st.lang = value.into())))
         };
-        // A device picker: the list is read when the menu opens, so newly plugged devices show up.
         let this = cx.entity().downgrade();
         let device_row = |id: &'static str, title: &'static str, kind: DeviceKind| {
             let current = kind.slot(&mut s.clone()).clone();
             let label: SharedString = current.as_ref().map_or_else(|| t!("settings.device_default").into(), |d| d.name.clone().into());
             let this = this.clone();
             h_flex().gap_3().py_1().items_center().child(div().flex_1().min_w_0().text_sm().child(title)).child(
-                Button::new(id).small().outline().max_w(dp(280.)).label(label).dropdown_menu(move |menu, _, _| {
-                    let item = |name: SharedString, d: Option<MediaDevice>| {
-                        let this = this.clone();
-                        let checked = d.as_ref().map(|d| &d.id) == current.as_ref().map(|d| &d.id);
-                        PopupMenuItem::new(name).checked(checked).on_click(move |_, w, cx| {
-                            let d = d.clone();
-                            let _ = this.update(cx, |app, cx| app.update_settings(w, cx, |st| *kind.slot(st) = d));
-                        })
-                    };
-                    let mut menu = menu.max_h(px(360.)).scrollable(true).item(item(t!("settings.device_default").into(), None));
-                    for d in kind.list() {
-                        menu = menu.item(item(d.name.clone().into(), Some(d)));
-                    }
-                    menu
-                }),
+                Button::new(id).small().outline().max_w(dp(280.)).label(label).dropdown_menu(move |menu, _, _| device_items(menu, kind, current.clone(), this.clone())),
             )
         };
         let me = sess.localpart();
@@ -3007,94 +3091,270 @@ impl App {
         )
     }
 
+    /// Incoming call: a card over the window, since its chat may not be open.
     fn render_call(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let sess = self.sess.as_ref()?;
-        let call = sess.call.as_ref()?;
+        let call = sess.call.as_ref().filter(|c| c.state == CallState::Incoming)?;
         let p = style::palette(cx);
         let name = sess.display_name(&call.peer);
-        let status = match &call.state {
-            CallState::Outgoing => t!("call.calling").to_string(),
-            CallState::Incoming => t!("call.incoming").to_string(),
-            CallState::Connecting => t!("call.connecting").to_string(),
-            CallState::Active => {
-                let secs = call.started.map_or(0, |s| s.elapsed().as_secs());
-                format!("{:02}:{:02}", secs / 60, secs % 60)
-            }
-            CallState::Ended(r) => r.clone(),
+        let round = |id: &'static str, icon: IconName, bg: Hsla| {
+            div().id(id).size(dp(52.)).rounded_full().bg(bg).cursor_pointer().flex().items_center().justify_center().child(Icon::new(icon).size(dp(22.)).text_color(white()))
         };
-        let incoming = call.state == CallState::Incoming;
-        let muted = call.muted;
-        let round = |id: &'static str, icon: IconName, bg: Hsla, fg: Hsla| {
-            div().id(id).size(dp(52.)).rounded_full().bg(bg).cursor_pointer().flex().items_center().justify_center().child(Icon::new(icon).size(dp(22.)).text_color(fg))
+        // Answering opens the caller's chat, where the call panel lives.
+        let accept = |video: bool| {
+            let peer = call.peer.clone();
+            cx.listener(move |this: &mut App, _: &ClickEvent, w: &mut Window, cx: &mut Context<App>| {
+                this.call(CallCmd::Accept { video }, cx);
+                if this.sess.as_ref().is_some_and(|s| s.selected.as_ref() != Some(&peer)) {
+                    this.select(peer.clone(), w, cx);
+                }
+            })
         };
-        // White when on, translucent when off, like the mute button.
-        let toggle = |id: &'static str, on: bool, icon: IconName| {
-            round(id, icon, if on { white() } else { hsla(0., 0., 1., 0.15) }, if on { rgb(0x17212B).into() } else { white() })
-        };
-        // Video can be turned on once the call is up, or while ringing out a video call.
-        let can_video = call.video || matches!(call.state, CallState::Connecting | CallState::Active);
-        let sending = call.sending;
-        let toggle_src = move |src: Source| if sending == Some(src) { None } else { Some(src) };
         let buttons = h_flex()
             .pt_2()
             .gap_6()
-            .when(incoming, |d| d.child(round("call-accept", IconName::Phone, p.online, white()).on_click(cx.listener(|this, _, _, cx| this.call(CallCmd::Accept { video: false }, cx)))))
-            .when(incoming && call.video, |d| {
-                d.child(round("call-accept-video", IconName::Video, p.online, white()).on_click(cx.listener(|this, _, _, cx| this.call(CallCmd::Accept { video: true }, cx))))
-            })
-            .when(!incoming, |d| {
-                d.child(toggle("call-mute", muted, if muted { IconName::MicOff } else { IconName::Mic }).on_click(cx.listener(move |this, _, _, cx| this.call(CallCmd::Mute(!muted), cx))))
-            })
-            .when(!incoming && can_video, |d| {
-                let cam = sending == Some(Source::Camera);
-                let screen = sending == Some(Source::Screen);
-                d.child(
-                    toggle("call-camera", cam, if cam { IconName::Video } else { IconName::VideoOff })
-                        .tooltip(move |w, cx| Tooltip::new(t!("call.camera")).build(w, cx))
-                        .on_click(cx.listener(move |this, _, _, cx| this.call(CallCmd::Video(toggle_src(Source::Camera)), cx))),
-                )
-                .child(
-                    toggle("call-screen", screen, if screen { IconName::ScreenShare } else { IconName::ScreenShareOff })
-                        .tooltip(move |w, cx| Tooltip::new(t!("call.screen")).build(w, cx))
-                        .on_click(cx.listener(move |this, _, _, cx| this.call(CallCmd::Video(toggle_src(Source::Screen)), cx))),
-                )
-            })
-            .child(round("call-hangup", IconName::PhoneOff, p.danger, white()).on_click(cx.listener(|this, _, _, cx| this.call(CallCmd::Hangup, cx))));
+            .child(round("call-accept", IconName::Phone, p.online).on_click(accept(false)))
+            .when(call.video, |d| d.child(round("call-accept-video", IconName::Video, p.online).on_click(accept(true))))
+            .child(round("call-hangup", IconName::PhoneOff, p.danger).on_click(cx.listener(|this, _, _, cx| this.call(CallCmd::Hangup, cx))));
         let card_bg = linear_gradient(170., linear_color_stop(rgb(0x2B5278), 0.), linear_color_stop(rgb(0x17212B), 1.));
-        let video_view = !incoming && (call.remote.is_some() || call.local.is_some());
-        let card = v_flex().occlude().p_5().gap_3().items_center().rounded(dp(20.)).shadow_2xl().bg(card_bg).text_color(white());
-        let card = if video_view {
-            // The peer's picture (or their avatar while it has none) with our preview in the corner.
-            let stage = div()
+        let status = if call.video { t!("call.incoming_video") } else { t!("call.incoming") };
+        let card = v_flex()
+            .occlude()
+            .w(dp(300.))
+            .p_5()
+            .gap_3()
+            .items_center()
+            .rounded(dp(20.))
+            .shadow_2xl()
+            .bg(card_bg)
+            .text_color(white())
+            .child(avatar(sess, &call.peer, &name, 84.))
+            .child(div().text_lg().font_weight(FontWeight::SEMIBOLD).child(name))
+            .child(div().text_sm().opacity(0.75).child(status))
+            .child(buttons);
+        // Only the card occludes: the rest of the window stays clickable during a call.
+        Some(div().absolute().inset_0().flex().items_center().justify_center().child(card).into_any_element())
+    }
+
+    /// While another chat (or none) is open: a strip that leads back to the call.
+    fn render_call_strip(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let sess = self.sess.as_ref()?;
+        let call = sess.call.as_ref().filter(|c| c.state != CallState::Incoming && sess.selected.as_ref() != Some(&c.peer))?;
+        let p = style::palette(cx);
+        let peer = call.peer.clone();
+        Some(
+            h_flex()
+                .id("call-strip")
+                .flex_shrink_0()
+                .h(dp(36.))
+                .px_4()
+                .gap_2()
+                .items_center()
+                .cursor_pointer()
+                .bg(p.online)
+                .text_color(white())
+                .text_sm()
+                .child(Icon::new(IconName::Phone).size(dp(16.)))
+                .child(div().flex_1().min_w_0().truncate().child(format!("{} · {}", sess.display_name(&call.peer), call_status(call))))
+                .child(
+                    div()
+                        .id("call-strip-hangup")
+                        .size(dp(28.))
+                        .rounded_full()
+                        .bg(p.danger)
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(Icon::new(IconName::PhoneOff).size(dp(14.)))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.call(CallCmd::Hangup, cx);
+                        })),
+                )
+                .on_click(cx.listener(move |this, _, w, cx| this.select(peer.clone(), w, cx)))
+                .into_any_element(),
+        )
+    }
+
+    /// Discord-like call stage over the chat: both sides as tiles, the controls under them.
+    fn render_call_panel(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let sess = self.sess.as_ref()?;
+        let call = sess.call.as_ref().filter(|c| c.state != CallState::Incoming)?;
+        let p = style::palette(cx);
+        let name = sess.display_name(&call.peer);
+        let me = sess.localpart();
+        let fg: Hsla = white();
+        let soft = hsla(0., 0., 1., 0.12);
+
+        let tile = |pic: Option<Arc<RenderImage>>, jid: &str, label: String, muted: bool| {
+            div()
+                .flex_1()
+                .h_full()
+                .min_w_0()
+                .max_w(dp(760.))
                 .relative()
-                .w(dp(640.))
-                .h(dp(360.))
-                .rounded(dp(14.))
+                .rounded(dp(12.))
                 .overflow_hidden()
-                .bg(black())
+                .bg(hsla(0., 0., 1., 0.06))
                 .flex()
                 .items_center()
                 .justify_center()
-                .child(match call.remote.clone() {
+                .child(match pic {
                     Some(pic) => img(pic).size_full().object_fit(ObjectFit::Contain).into_any_element(),
-                    None => avatar(sess, &call.peer, &name, 84.),
+                    None => avatar(sess, jid, &label, 80.),
                 })
-                .when_some(call.local.clone(), |d, pic| {
-                    d.child(img(pic).absolute().right(dp(12.)).bottom(dp(12.)).w(dp(160.)).h(dp(90.)).rounded(dp(8.)).border_1().border_color(hsla(0., 0., 1., 0.3)))
-                });
-            card.child(h_flex().w_full().gap_2().items_baseline().child(div().text_lg().font_weight(FontWeight::SEMIBOLD).child(name)).child(div().text_sm().opacity(0.75).child(status)))
-                .child(stage)
-                .child(buttons)
-        } else {
-            let status = if incoming && call.video { t!("call.incoming_video").to_string() } else { status };
-            card.w(dp(300.))
-                .child(avatar(sess, &call.peer, &name, 84.))
-                .child(div().text_lg().font_weight(FontWeight::SEMIBOLD).child(name))
-                .child(div().text_sm().opacity(0.75).child(status))
-                .child(buttons)
+                .child(
+                    h_flex()
+                        .absolute()
+                        .left(dp(8.))
+                        .bottom(dp(8.))
+                        .gap_1()
+                        .items_center()
+                        .px_2()
+                        .py(dp(2.))
+                        .rounded_md()
+                        .bg(hsla(0., 0., 0., 0.55))
+                        .text_xs()
+                        .child(label)
+                        .when(muted, |d| d.child(Icon::new(IconName::MicOff).size(dp(12.)).text_color(p.danger))),
+                )
         };
-        // Only the card occludes: the rest of the window stays clickable during a call.
-        Some(div().absolute().inset_0().flex().items_center().justify_center().child(card).into_any_element())
+        let tiles = h_flex()
+            .flex_1()
+            .min_h_0()
+            .p_3()
+            .gap_3()
+            .items_center()
+            .justify_center()
+            .child(tile(call.remote.clone(), &call.peer, name.clone(), false))
+            .child(tile(call.local.clone(), &sess.me, me, call.muted));
+
+        // A round button: `bg` fills it (white = on), else it is see-through; `alert` paints the icon red.
+        let round = |id: &'static str, icon: IconName, bg: Option<Hsla>, alert: bool| {
+            let dark = bg == Some(fg);
+            div()
+                .id(id)
+                .size(dp(40.))
+                .rounded_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .cursor_pointer()
+                .map(|d| match bg {
+                    Some(bg) => d.bg(bg).hover(|d| d.opacity(0.85)),
+                    None => d.hover(move |d| d.bg(soft)),
+                })
+                .child(Icon::new(icon).size(dp(20.)).text_color(if dark { rgb(0x17212B).into() } else if alert { p.danger } else { fg }))
+        };
+        let this = cx.entity().downgrade();
+        let colors = (fg, soft);
+        let open = |id: &'static str| self.call_menu == Some(id);
+        // A button and its arrow on one pill.
+        let pill = |main: Stateful<Div>, menu: AnyElement, alert: bool| {
+            h_flex().items_center().p(dp(3.)).gap(dp(2.)).rounded_full().bg(if alert { p.danger.opacity(0.22) } else { soft }).child(main).child(menu)
+        };
+
+        let (muted, deafened, sending) = (call.muted, call.deafened, call.sending);
+        // Video can be turned on once the call is up, or while ringing out a video call.
+        let can_video = call.video || matches!(call.state, CallState::Connecting | CallState::Active);
+        let toggle_src = move |src: Source| if sending == Some(src) { None } else { Some(src) };
+
+        let mic_menu = {
+            let (this, current, denoise, vol) = (this.clone(), self.settings.mic.clone(), self.settings.denoise, self.mic_volume.clone());
+            menu_chevron("call-mic-menu", this.clone(), open("call-mic-menu"), colors, cx, move |menu, window, cx| {
+                let (this2, this3, current) = (this.clone(), this.clone(), current.clone());
+                menu.submenu(t!("call.input_device"), window, cx, move |m, _, _| device_items(m, DeviceKind::Mic, current.clone(), this2.clone()))
+                    .item(check_item(t!("settings.denoise"), denoise).on_click(move |_, w, cx| {
+                        let _ = this3.update(cx, |app, cx| app.update_settings(w, cx, |st| st.denoise = !denoise));
+                    }))
+                    .separator()
+                    .item(volume_item(t!("call.mic_volume"), vol.clone()))
+            })
+        };
+        let sound_menu = {
+            let (this, current, vol) = (this.clone(), self.settings.speaker.clone(), self.speaker_volume.clone());
+            menu_chevron("call-sound-menu", this.clone(), open("call-sound-menu"), colors, cx, move |menu, window, cx| {
+                let (this, current) = (this.clone(), current.clone());
+                menu.submenu(t!("call.output_device"), window, cx, move |m, _, _| device_items(m, DeviceKind::Speaker, current.clone(), this.clone()))
+                    .separator()
+                    .item(volume_item(t!("call.speaker_volume"), vol.clone()))
+            })
+        };
+        let camera_menu = {
+            let (this, current) = (this.clone(), self.settings.camera.clone());
+            menu_chevron("call-camera-menu", this.clone(), open("call-camera-menu"), colors, cx, move |menu, _, _| device_items(menu, DeviceKind::Camera, current.clone(), this.clone()))
+        };
+
+        let cam = sending == Some(Source::Camera);
+        let screen = sending == Some(Source::Screen);
+        let tip = |label: &'static str| move |w: &mut Window, cx: &mut gpui_kit::App| Tooltip::new(label).build(w, cx);
+        let controls = h_flex()
+            .flex_shrink_0()
+            .pb_3()
+            .gap_3()
+            .items_center()
+            .justify_center()
+            .child(pill(
+                round("call-mute", if muted { IconName::MicOff } else { IconName::Mic }, None, muted)
+                    .tooltip(tip(t!("call.mic")))
+                    .on_click(cx.listener(move |this, _, _, cx| this.call(CallCmd::Mute(!muted), cx))),
+                mic_menu.into_any_element(),
+                muted,
+            ))
+            .child(pill(
+                round("call-deafen", if deafened { IconName::HeadphoneOff } else { IconName::Headphones }, None, deafened)
+                    .tooltip(tip(t!("call.sound")))
+                    .on_click(cx.listener(move |this, _, _, cx| this.call(CallCmd::Deafen(!deafened), cx))),
+                sound_menu.into_any_element(),
+                deafened,
+            ))
+            .child(pill(
+                round("call-camera", if cam { IconName::Video } else { IconName::VideoOff }, cam.then_some(fg), false)
+                    .tooltip(tip(t!("call.camera")))
+                    .when(!can_video, |d| d.opacity(0.4).cursor_default())
+                    .when(can_video, |d| d.on_click(cx.listener(move |this, _, _, cx| this.call(CallCmd::Video(toggle_src(Source::Camera)), cx)))),
+                camera_menu.into_any_element(),
+                false,
+            ))
+            .child(
+                round("call-screen", if screen { IconName::ScreenShare } else { IconName::ScreenShareOff }, Some(if screen { fg } else { soft }), false)
+                    .tooltip(tip(t!("call.screen")))
+                    .when(!can_video, |d| d.opacity(0.4).cursor_default())
+                    .when(can_video, |d| d.on_click(cx.listener(move |this, _, _, cx| this.call(CallCmd::Video(toggle_src(Source::Screen)), cx)))),
+            )
+            .child(
+                round("call-chat", if self.call_chat_hidden { IconName::MessageSquareOff } else { IconName::MessageSquare }, Some(soft), false)
+                    .tooltip(tip(t!("call.chat")))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.call_chat_hidden = !this.call_chat_hidden;
+                        cx.notify();
+                    })),
+            )
+            .child(
+                round("call-hangup", IconName::PhoneOff, Some(p.danger), false)
+                    .tooltip(tip(t!("call.hangup")))
+                    .on_click(cx.listener(|this, _, _, cx| this.call(CallCmd::Hangup, cx))),
+            );
+
+        Some(
+            v_flex()
+                .size_full()
+                .bg(rgb(0x111A23))
+                .text_color(fg)
+                .child(
+                    h_flex()
+                        .flex_shrink_0()
+                        .px_4()
+                        .pt_3()
+                        .gap_2()
+                        .items_center()
+                        .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).child(name))
+                        .child(div().text_sm().opacity(0.7).child(call_status(call))),
+                )
+                .child(tiles)
+                .child(controls)
+                .into_any_element(),
+        )
     }
 }
 
