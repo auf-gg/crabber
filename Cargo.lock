@@ -1826,7 +1826,7 @@ dependencies = [
 
 [[package]]
 name = "crabber"
-version = "0.7.3"
+version = "0.7.4"
 dependencies = [
  "aes 0.9.3",
  "aes-gcm 0.11.1",
