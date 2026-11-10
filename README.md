@@ -163,6 +163,9 @@ Grab them from [GitHub Releases](https://github.com/auf-gg/crabber/releases):
 - **Linux** — `tar.gz` archive (x86_64 and aarch64) with an `install.sh` script
   that installs the app to `~/.local` for the current user
 
+On Linux, emoji are drawn with Noto Color Emoji when it is installed (`noto-fonts-emoji` on Arch,
+`fonts-noto-color-emoji` on Debian/Ubuntu); the AUR packages depend on it.
+
 ## Building from source
 
 Requires Rust as pinned in [`rust-toolchain.toml`](rust-toolchain.toml) (1.97+).
@@ -176,6 +179,7 @@ sudo apt install pkg-config clang libxkbcommon-dev libxkbcommon-x11-dev libwayla
 ```
 
 Colour emojis need the Noto Color Emoji font (`fonts-noto-color-emoji` on Debian/Ubuntu).
+gpui's Linux text rendering is patched for it, see [`vendor/README.md`](vendor/README.md).
 
 On Windows install the Visual Studio Build Tools (MSVC), then on either platform:
 

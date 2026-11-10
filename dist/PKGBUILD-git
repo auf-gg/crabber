@@ -31,7 +31,7 @@ depends=(
   'pipewire'           # screen capture
   'vulkan-icd-loader'  # gpui/blade
   'dbus'               # ksni, notify-rust
-  'noto-fonts-emoji'   # colour emojis (reactions, picker)
+  'noto-fonts-emoji'   # colour emoji
 )
 provides=('crabber')
 conflicts=('crabber' 'crabber-bin')

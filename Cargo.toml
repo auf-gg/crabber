@@ -85,3 +85,6 @@ opt-level = 2
 [dev-dependencies]
 # TestAppContext for UI tests (gpui-kit re-exports this crate as its gpui).
 gpui-pre = { version = "0.3.11", features = ["test-support"] }
+
+[patch.crates-io]
+gpui-pre-wgpu = { path = "vendor/gpui-pre-wgpu" }
