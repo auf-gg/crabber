@@ -34,6 +34,20 @@ pub fn set_volumes(mic: f32, out: f32) {
     OUT_GAIN.store(out.to_bits(), Ordering::Relaxed);
 }
 
+/// Loudness (RMS) of call audio: ours as sent, the peer's as received. The UI takes the loudest
+/// frame since its last look, so silence reads as 0 once frames stop.
+static LEVELS: [AtomicU32; 2] = [AtomicU32::new(0), AtomicU32::new(0)];
+
+pub fn note_level(peer: bool, samples: &[f32]) {
+    let rms = (samples.iter().map(|x| x * x).sum::<f32>() / samples.len().max(1) as f32).sqrt();
+    // Non-negative floats order like their bits.
+    LEVELS[peer as usize].fetch_max(rms.to_bits(), Ordering::Relaxed);
+}
+
+pub fn take_level(peer: bool) -> f32 {
+    f32::from_bits(LEVELS[peer as usize].swap(0, Ordering::Relaxed))
+}
+
 fn gain(g: &AtomicU32) -> f32 {
     f32::from_bits(g.load(Ordering::Relaxed))
 }
@@ -509,7 +523,9 @@ where
                 }
                 while pcm.len() >= CALL_FRAME {
                     let g = if muted.load(Ordering::Relaxed) { 0.0 } else { gain(&MIC_GAIN) };
-                    on_frame(pcm.drain(..CALL_FRAME).map(|x| (x * g).clamp(-1.0, 1.0)).collect());
+                    let frame: Vec<f32> = pcm.drain(..CALL_FRAME).map(|x| (x * g).clamp(-1.0, 1.0)).collect();
+                    note_level(false, &frame);
+                    on_frame(frame);
                 }
             },
             |e| eprintln!("audio input error: {e}"),

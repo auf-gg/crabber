@@ -11,7 +11,7 @@ use gpui_kit::*;
 // Component defaults plus the Lucide icons this app uses.
 gpui_kit::assets::icon_assets!(
     AppAssets,
-    [Phone, PhoneOff, Pencil, Plus, FaceSlightlySmiling, Play, Pause, Reply, Ban, TriangleAlert, Paperclip, Mic, MicOff, UserPlus, UserMinus, Users, LogOut, SendHorizontal, Check, CheckCheck, File, Download, Hash, DoorOpen, FileImage, FileArchive, FileMusic, FileVideoCamera, Volume2, VolumeX, FileText, FileCode, Copy, X, FolderOpen, Settings, Image, ChevronLeft, ChevronRight, ChevronDown, Link, Lock, LockOpen, Shield, ShieldCheck, Key, Search, Shell, Fish, Anchor, Sailboat, Shrimp, Snail, Turtle, Video, VideoOff, ScreenShare, ScreenShareOff, ChevronUp, Headphones, HeadphoneOff, MessageSquare, MessageSquareOff]
+    [Phone, PhoneOff, Pencil, Plus, FaceSlightlySmiling, Play, Pause, Reply, Ban, TriangleAlert, Paperclip, Mic, MicOff, UserPlus, UserMinus, Users, LogOut, SendHorizontal, Check, CheckCheck, File, Download, Hash, DoorOpen, FileImage, FileArchive, FileMusic, FileVideoCamera, Volume2, VolumeX, FileText, FileCode, Copy, X, FolderOpen, Settings, Image, ChevronLeft, ChevronRight, ChevronDown, Link, Lock, LockOpen, Shield, ShieldCheck, Key, Search, Shell, Fish, Anchor, Sailboat, Shrimp, Snail, Turtle, Video, VideoOff, ScreenShare, ScreenShareOff, ChevronUp, Headphones, HeadphoneOff, MessageSquare, MessageSquareOff, Maximize, Minimize, Monitor, AppWindow]
 );
 
 fn main() {

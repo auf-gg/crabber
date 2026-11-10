@@ -92,6 +92,8 @@ pub enum Modal {
     ConfirmRetract { msg: Msg, moderate: bool },
     /// Contact / group card opened from the chat header.
     Profile { peer: String },
+    /// What to share: monitors and windows (Windows has no system picker).
+    ScreenPicker { targets: Vec<crabber::screens::ScreenTarget> },
 }
 
 /// Full-window preview of an attachment.
@@ -259,6 +261,9 @@ pub struct CallUi {
     /// Latest decoded frames: the peer's picture and our preview.
     pub remote: Option<Arc<RenderImage>>,
     pub local: Option<Arc<RenderImage>>,
+    /// Who is talking, and when each side was last loud: [us, peer].
+    pub speaking: [bool; 2],
+    pub loud: [Option<Instant>; 2],
 }
 
 impl CallUi {
@@ -278,6 +283,8 @@ impl CallUi {
             sending: None,
             remote: None,
             local: None,
+            speaking: [false; 2],
+            loud: [None; 2],
         }
     }
 }
@@ -564,6 +571,11 @@ pub struct App {
     pub mic_volume: Entity<SliderState>,
     pub speaker_volume: Entity<SliderState>,
     pub call_menu: Option<&'static str>,
+    /// The tile shown over the whole call panel (true: the peer's), and the panel over the whole screen.
+    pub call_focus: Option<bool>,
+    pub call_fullscreen: bool,
+    /// Size of the area the tiles share, measured while drawing.
+    pub call_stage: Rc<std::cell::Cell<Size<Pixels>>>,
     app_store: Store,
     _subs: Vec<Subscription>,
 }
@@ -749,6 +761,9 @@ impl App {
             mic_volume,
             speaker_volume,
             call_menu: None,
+            call_focus: None,
+            call_fullscreen: false,
+            call_stage: Rc::default(),
             app_store,
             _subs: vec![],
         };
@@ -1097,6 +1112,18 @@ impl App {
                             changed = true;
                         }
                     }
+                    // Who is talking: louder than the threshold, held a moment so words don't flicker.
+                    let levels = [crabber::audio::take_level(false), crabber::audio::take_level(true)];
+                    if let Some(c) = s.call.as_mut() {
+                        for (i, level) in levels.into_iter().enumerate() {
+                            if level > 0.02 {
+                                c.loud[i] = Some(Instant::now());
+                            }
+                            let speaking = c.loud[i].is_some_and(|t| t.elapsed().as_millis() < 300);
+                            changed |= speaking != c.speaking[i];
+                            c.speaking[i] = speaking;
+                        }
+                    }
                     if changed {
                         cx.notify();
                     }
@@ -1191,6 +1218,33 @@ impl App {
         cx.notify();
     }
 
+    /// Starts or stops sharing the screen. On Windows the user first picks a monitor or a window;
+    /// elsewhere the system decides (the portal picker on Wayland, the whole desktop on X11).
+    pub fn share_screen(&mut self, on: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if on && cfg!(windows) {
+            let targets = crabber::screens::list();
+            if !targets.is_empty() {
+                return self.open_modal(Modal::ScreenPicker { targets }, window, cx);
+            }
+        }
+        self.call(CallCmd::Video(on.then_some(Source::Screen)), cx);
+    }
+
+    pub fn share_target(&mut self, target: crabber::screens::ScreenTarget, cx: &mut Context<Self>) {
+        self.modal = None;
+        crabber::videocall::set_screen(Some(target));
+        self.call(CallCmd::Video(Some(Source::Screen)), cx);
+    }
+
+    /// The call panel over the whole window, and the window over the whole screen.
+    pub fn set_call_fullscreen(&mut self, on: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.call_fullscreen = on;
+        if window.is_fullscreen() != on {
+            window.toggle_fullscreen();
+        }
+        cx.notify();
+    }
+
     pub fn set_call_volume(&mut self, mic: bool, v: f32, save: bool) {
         let slot = if mic { &mut self.settings.mic_volume } else { &mut self.settings.speaker_volume };
         *slot = v.clamp(0., 2.);
@@ -1246,6 +1300,10 @@ impl App {
 
     /// Esc, innermost first: viewer, dialog, search, open chat. Returns whether it did anything.
     pub fn handle_escape(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.call_fullscreen {
+            self.set_call_fullscreen(false, window, cx);
+            return true;
+        }
         if self.update_popup {
             self.show_update(false, cx);
             return true;
@@ -1748,7 +1806,7 @@ impl App {
         }
         sess.sort_chats();
         for c in call_log {
-            self.call_menu = None;
+            (self.call_menu, self.call_focus) = (None, None);
             self.log_call(c);
         }
         self.connecting = false;
@@ -2646,7 +2704,7 @@ impl App {
         }
         sess.send(Cmd::Call(cmd));
         if let Some(c) = ended {
-            self.call_menu = None;
+            (self.call_menu, self.call_focus) = (None, None);
             self.log_call(c);
         }
         cx.notify();

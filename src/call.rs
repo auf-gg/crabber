@@ -482,16 +482,17 @@ impl Actor {
                     while let Some(ev) = track.poll().await {
                         let TrackRemoteEvent::OnRtpPacket(p) = ev else { continue };
                         RTP_RECEIVED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        if p.header.payload_type == 0 {
-                            audio.play(&audio::ulaw_samples(&p.payload), audio::RATE);
-                            continue;
-                        }
-                        if opus.is_none() {
-                            opus = audio::OpusDecoder::new().ok();
-                        }
-                        if let Some(d) = opus.as_mut() {
-                            audio.play(&d.decode(&p.payload), audio::CALL_RATE);
-                        }
+                        let (pcm, rate) = if p.header.payload_type == 0 {
+                            (audio::ulaw_samples(&p.payload), audio::RATE)
+                        } else {
+                            if opus.is_none() {
+                                opus = audio::OpusDecoder::new().ok();
+                            }
+                            let Some(d) = opus.as_mut() else { continue };
+                            (d.decode(&p.payload), audio::CALL_RATE)
+                        };
+                        audio::note_level(true, &pcm);
+                        audio.play(&pcm, rate);
                     }
                 });
             }

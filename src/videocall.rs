@@ -51,6 +51,14 @@ pub fn cameras() -> Vec<crate::audio::MediaDevice> {
     }
 }
 
+/// What a Windows screen share captures, picked in our own dialog (there is no system picker);
+/// None: the whole desktop.
+static SCREEN: Mutex<Option<crate::screens::ScreenTarget>> = Mutex::new(None);
+
+pub fn set_screen(target: Option<crate::screens::ScreenTarget>) {
+    *SCREEN.lock().unwrap() = target;
+}
+
 fn camera() -> Option<String> {
     let all = cameras();
     let chosen = CAMERA.lock().unwrap().clone();
@@ -129,7 +137,10 @@ fn capture_args(src: Source) -> Result<Option<Vec<String>>, String> {
             v(&["-f", "dshow", "-i", &format!("video={name}")])
         }
         #[cfg(windows)]
-        Source::Screen => v(&["-f", "gdigrab", "-framerate", "15", "-i", "desktop"]),
+        Source::Screen => match SCREEN.lock().unwrap().clone() {
+            Some(target) => Ok(Some(crate::screens::gdigrab_input(&target))),
+            None => v(&["-f", "gdigrab", "-framerate", "15", "-i", "desktop"]),
+        },
         #[cfg(not(any(target_os = "linux", windows)))]
         _ => Err(crate::t!("call.no_camera").into()),
     }

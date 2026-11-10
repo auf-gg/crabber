@@ -759,13 +759,26 @@ impl App {
         )
     }
 
-    fn render_main(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_main(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        if self.call_fullscreen {
+            match self.render_call_panel(cx) {
+                Some(panel) => return panel,
+                // The call ended while over the whole screen.
+                None => {
+                    self.call_fullscreen = false;
+                    if window.is_fullscreen() {
+                        window.toggle_fullscreen();
+                    }
+                }
+            }
+        }
         let strip = self.render_call_strip(cx);
         let conversation = self.render_conversation(window, cx).into_any_element();
         h_flex()
             .size_full()
             .child(self.render_sidebar(cx))
             .child(v_flex().flex_1().h_full().min_w_0().children(strip).child(h_flex().flex_1().min_h_0().child(conversation)))
+            .into_any_element()
     }
 
     fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -3034,6 +3047,43 @@ impl App {
                 });
                 (t!("modal.invite"), v_flex().id("invite-list").max_h(dp(320.)).overflow_y_scroll().children(contacts).into_any_element())
             }
+            Modal::ScreenPicker { targets } => {
+                use crabber::screens::ScreenTarget;
+                let section = |title: &'static str| div().pt_2().pb_1().text_xs().font_weight(FontWeight::SEMIBOLD).text_color(t.muted_foreground).child(title);
+                let row = |ix: usize, target: &ScreenTarget, monitor_no: usize| {
+                    let (icon, label, detail) = match target {
+                        ScreenTarget::Monitor { width, height, primary, .. } => (
+                            IconName::Monitor,
+                            t!("call.monitor", n = monitor_no),
+                            format!("{width}×{height}{}", if *primary { format!(" · {}", t!("call.primary")) } else { String::new() }),
+                        ),
+                        ScreenTarget::Window { title } => (IconName::AppWindow, title.clone(), String::new()),
+                    };
+                    let target = target.clone();
+                    h_flex()
+                        .id(("share", ix))
+                        .gap_2()
+                        .p_2()
+                        .rounded_md()
+                        .items_center()
+                        .cursor_pointer()
+                        .hover(|d| d.bg(t.accent))
+                        .child(Icon::new(icon).text_color(t.muted_foreground))
+                        .child(div().flex_1().min_w_0().truncate().child(label))
+                        .child(div().text_xs().text_color(t.muted_foreground).child(detail))
+                        .on_click(cx.listener(move |this, _, _, cx| this.share_target(target.clone(), cx)))
+                };
+                let monitors = targets.iter().filter(|x| matches!(x, ScreenTarget::Monitor { .. })).count();
+                let list = v_flex()
+                    .id("share-list")
+                    .max_h(dp(420.))
+                    .overflow_y_scroll()
+                    .child(section(t!("call.screens")))
+                    .children(targets.iter().enumerate().take(monitors).map(|(ix, x)| row(ix, x, ix + 1)))
+                    .when(targets.len() > monitors, |d| d.child(section(t!("call.windows"))))
+                    .children(targets.iter().enumerate().skip(monitors).map(|(ix, x)| row(ix, x, 0)));
+                (t!("call.share_title"), list.into_any_element())
+            }
             Modal::ConfirmRetract { moderate, .. } => {
                 let text = if *moderate { t!("modal.retract_mod_text") } else { t!("modal.retract_text") };
                 (t!("menu.retract"), div().child(text).into_any_element())
@@ -3046,7 +3096,7 @@ impl App {
             Modal::Settings | Modal::Media { .. } | Modal::Encryption { .. } | Modal::PgpImport { .. } | Modal::Profile { .. } => return None,
         };
         let confirm = match modal {
-            Modal::Invite { .. } => None,
+            Modal::Invite { .. } | Modal::ScreenPicker { .. } => None,
             Modal::ConfirmRetract { msg, moderate } => {
                 let (msg, moderate) = (msg.clone(), *moderate);
                 Some(Button::new("modal-ok").danger().label(t!("modal.delete")).on_click(cx.listener(move |this, _, _, cx| this.retract(&msg, moderate, cx))))
@@ -3178,32 +3228,40 @@ impl App {
         )
     }
 
-    /// Discord-like call stage over the chat: both sides as tiles, the controls under them.
+    /// Discord-like call stage over the chat: both sides as 16:9 tiles, the controls under them.
+    /// A clicked tile fills the stage (the other one stays in the corner); the panel can also go
+    /// over the whole screen.
     fn render_call_panel(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let sess = self.sess.as_ref()?;
         let call = sess.call.as_ref().filter(|c| c.state != CallState::Incoming)?;
         let p = style::palette(cx);
         let name = sess.display_name(&call.peer);
         let me = sess.localpart();
-        let fg: Hsla = white();
-        let soft = hsla(0., 0., 1., 0.12);
+        let (fg, soft) = (p.text, p.hover);
 
-        let tile = |pic: Option<Arc<RenderImage>>, jid: &str, label: String, muted: bool| {
+        // `peer`: the other side's tile, else ours.
+        let tile = |peer: bool| {
+            let (pic, jid, label, muted) = match peer {
+                true => (call.remote.clone(), call.peer.as_str(), name.clone(), call.peer_muted),
+                false => (call.local.clone(), sess.me.as_str(), me.clone(), call.muted),
+            };
+            let speaking = call.speaking[peer as usize];
             div()
-                .flex_1()
-                .h_full()
-                .min_w_0()
-                .max_w(dp(760.))
+                .id(if peer { "tile-peer" } else { "tile-me" })
                 .relative()
+                .flex_none()
                 .rounded(dp(12.))
                 .overflow_hidden()
-                .bg(hsla(0., 0., 1., 0.06))
+                .bg(p.panel)
+                .border_2()
+                .border_color(if speaking { p.online } else { transparent_black() })
                 .flex()
                 .items_center()
                 .justify_center()
+                .cursor_pointer()
                 .child(match pic {
                     Some(pic) => img(pic).size_full().object_fit(ObjectFit::Contain).into_any_element(),
-                    None => avatar(sess, jid, &label, 80.),
+                    None => avatar(sess, jid, &label, 72.),
                 })
                 .child(
                     h_flex()
@@ -3215,25 +3273,81 @@ impl App {
                         .px_2()
                         .py(dp(2.))
                         .rounded_md()
-                        .bg(hsla(0., 0., 0., 0.55))
+                        .bg(p.chip)
+                        .text_color(p.chip_text)
                         .text_xs()
                         .child(label)
                         .when(muted, |d| d.child(Icon::new(IconName::MicOff).size(dp(12.)).text_color(p.danger))),
                 )
         };
-        let tiles = h_flex()
-            .flex_1()
-            .min_h_0()
-            .p_3()
-            .gap_3()
-            .items_center()
-            .justify_center()
-            .child(tile(call.remote.clone(), &call.peer, name.clone(), call.peer_muted))
-            .child(tile(call.local.clone(), &sess.me, me, call.muted));
+        let gap = 12.;
+        let stage_size = self.call_stage.get();
+        let content = match self.call_focus {
+            None => {
+                let (w, h) = tile_size((f32::from(stage_size.width), f32::from(stage_size.height)), 2, gap);
+                h_flex()
+                    .size_full()
+                    .flex_wrap()
+                    .gap(px(gap))
+                    .justify_center()
+                    .items_center()
+                    .content_center()
+                    .children([true, false].map(|peer| {
+                        tile(peer).w(px(w)).h(px(h)).on_click(cx.listener(move |this, _, _, cx| {
+                            this.call_focus = Some(peer);
+                            cx.notify();
+                        }))
+                    }))
+                    .into_any_element()
+            }
+            Some(focus) => div()
+                .size_full()
+                .relative()
+                .child(tile(focus).size_full().on_click(cx.listener(|this, _, _, cx| {
+                    this.call_focus = None;
+                    cx.notify();
+                })))
+                .child(
+                    tile(!focus)
+                        .absolute()
+                        .right(dp(12.))
+                        .bottom(dp(12.))
+                        .w(dp(192.))
+                        .h(dp(108.))
+                        .shadow_lg()
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.call_focus = Some(!focus);
+                            cx.notify();
+                        })),
+                )
+                .into_any_element(),
+        };
+        // The tiles are sized from the stage, measured while drawing (a frame late on resize).
+        let measured = self.call_stage.clone();
+        let stage = div().flex_1().min_h_0().p_3().child(
+            div()
+                .size_full()
+                .relative()
+                .child(
+                    canvas(
+                        move |bounds, window, _| {
+                            if measured.get() != bounds.size {
+                                measured.set(bounds.size);
+                                window.refresh();
+                            }
+                        },
+                        |_, _, _, _| {},
+                    )
+                    .absolute()
+                    .size_full(),
+                )
+                .child(content),
+        );
 
-        // A round button: `bg` fills it (white = on), else it is see-through; `alert` paints the icon red.
-        let round = |id: &'static str, icon: IconName, bg: Option<Hsla>, alert: bool| {
-            let dark = bg == Some(fg);
+        // A round button: `fill` gives it a background and icon colour, else it is see-through;
+        // `alert` paints the icon red.
+        let round = |id: &'static str, icon: IconName, fill: Option<(Hsla, Hsla)>, alert: bool| {
+            let icon_color = fill.map_or(if alert { p.danger } else { fg }, |(_, c)| c);
             div()
                 .id(id)
                 .size(dp(40.))
@@ -3242,18 +3356,20 @@ impl App {
                 .items_center()
                 .justify_center()
                 .cursor_pointer()
-                .map(|d| match bg {
-                    Some(bg) => d.bg(bg).hover(|d| d.opacity(0.85)),
+                .map(|d| match fill {
+                    Some((bg, _)) => d.bg(bg).hover(|d| d.opacity(0.85)),
                     None => d.hover(move |d| d.bg(soft)),
                 })
-                .child(Icon::new(icon).size(dp(20.)).text_color(if dark { rgb(0x17212B).into() } else if alert { p.danger } else { fg }))
+                .child(Icon::new(icon).size(dp(20.)).text_color(icon_color))
         };
+        let on = Some((p.accent, white()));
+        let card = Some((p.panel, fg));
         let this = cx.entity().downgrade();
         let colors = (fg, soft);
         let open = |id: &'static str| self.call_menu == Some(id);
         // A button and its arrow on one pill.
         let pill = |main: Stateful<Div>, menu: AnyElement, alert: bool| {
-            h_flex().items_center().p(dp(3.)).gap(dp(2.)).rounded_full().bg(if alert { p.danger.opacity(0.22) } else { soft }).child(main).child(menu)
+            h_flex().items_center().p(dp(3.)).gap(dp(2.)).rounded_full().bg(if alert { p.danger.opacity(0.18) } else { p.panel }).child(main).child(menu)
         };
 
         let (muted, deafened, sending) = (call.muted, call.deafened, call.sending);
@@ -3289,6 +3405,7 @@ impl App {
 
         let cam = sending == Some(Source::Camera);
         let screen = sending == Some(Source::Screen);
+        let fullscreen = self.call_fullscreen;
         let tip = |label: &'static str| move |w: &mut Window, cx: &mut gpui_kit::App| Tooltip::new(label).build(w, cx);
         let controls = h_flex()
             .flex_shrink_0()
@@ -3311,7 +3428,7 @@ impl App {
                 deafened,
             ))
             .child(pill(
-                round("call-camera", if cam { IconName::Video } else { IconName::VideoOff }, cam.then_some(fg), false)
+                round("call-camera", if cam { IconName::Video } else { IconName::VideoOff }, if cam { on } else { None }, false)
                     .tooltip(tip(t!("call.camera")))
                     .when(!can_video, |d| d.opacity(0.4).cursor_default())
                     .when(can_video, |d| d.on_click(cx.listener(move |this, _, _, cx| this.call(CallCmd::Video(toggle_src(Source::Camera)), cx)))),
@@ -3319,21 +3436,28 @@ impl App {
                 false,
             ))
             .child(
-                round("call-screen", if screen { IconName::ScreenShare } else { IconName::ScreenShareOff }, Some(if screen { fg } else { soft }), false)
+                round("call-screen", if screen { IconName::ScreenShare } else { IconName::ScreenShareOff }, if screen { on } else { card }, false)
                     .tooltip(tip(t!("call.screen")))
                     .when(!can_video, |d| d.opacity(0.4).cursor_default())
-                    .when(can_video, |d| d.on_click(cx.listener(move |this, _, _, cx| this.call(CallCmd::Video(toggle_src(Source::Screen)), cx)))),
+                    .when(can_video, |d| d.on_click(cx.listener(move |this, _, w, cx| this.share_screen(!screen, w, cx)))),
+            )
+            .when(!fullscreen, |d| {
+                d.child(
+                    round("call-chat", if self.call_chat_hidden { IconName::MessageSquareOff } else { IconName::MessageSquare }, card, false)
+                        .tooltip(tip(t!("call.chat")))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.call_chat_hidden = !this.call_chat_hidden;
+                            cx.notify();
+                        })),
+                )
+            })
+            .child(
+                round("call-fullscreen", if fullscreen { IconName::Minimize } else { IconName::Maximize }, card, false)
+                    .tooltip(tip(if fullscreen { t!("call.exit_fullscreen") } else { t!("call.fullscreen") }))
+                    .on_click(cx.listener(move |this, _, w, cx| this.set_call_fullscreen(!fullscreen, w, cx))),
             )
             .child(
-                round("call-chat", if self.call_chat_hidden { IconName::MessageSquareOff } else { IconName::MessageSquare }, Some(soft), false)
-                    .tooltip(tip(t!("call.chat")))
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.call_chat_hidden = !this.call_chat_hidden;
-                        cx.notify();
-                    })),
-            )
-            .child(
-                round("call-hangup", IconName::PhoneOff, Some(p.danger), false)
+                round("call-hangup", IconName::PhoneOff, Some((p.danger, white())), false)
                     .tooltip(tip(t!("call.hangup")))
                     .on_click(cx.listener(|this, _, _, cx| this.call(CallCmd::Hangup, cx))),
             );
@@ -3341,7 +3465,7 @@ impl App {
         Some(
             v_flex()
                 .size_full()
-                .bg(rgb(0x111A23))
+                .bg(p.chat_top)
                 .text_color(fg)
                 .child(
                     h_flex()
@@ -3351,13 +3475,27 @@ impl App {
                         .gap_2()
                         .items_center()
                         .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).child(name))
-                        .child(div().text_sm().opacity(0.7).child(call_status(call))),
+                        .child(div().text_sm().text_color(p.muted).child(call_status(call))),
                 )
-                .child(tiles)
+                .child(stage)
                 .child(controls)
                 .into_any_element(),
         )
     }
+}
+
+/// The largest 16:9 tile for `n` tiles laid out in a grid within `area`, `gap` apart: one row
+/// on a wide stage, stacked on a tall one.
+fn tile_size((width, height): (f32, f32), n: usize, gap: f32) -> (f32, f32) {
+    let w = (1..=n)
+        .map(|rows| {
+            let cols = n.div_ceil(rows) as f32;
+            let rows = rows as f32;
+            ((width - gap * (cols - 1.)) / cols).min((height - gap * (rows - 1.)) / rows * 16. / 9.)
+        })
+        .fold(0f32, f32::max)
+        .max(16.);
+    (w, w * 9. / 16.)
 }
 
 #[cfg(test)]
@@ -3376,6 +3514,16 @@ mod tests {
         assert_eq!(initials("bitcoin_casino"), "BC");
         assert_eq!(initials("Bob"), "B");
         assert_eq!(initials("иван петров"), "ИП");
+    }
+
+    #[test]
+    fn call_tiles_fit_the_stage() {
+        // Wide stage: side by side, limited by the height.
+        assert_eq!(super::tile_size((1000., 200.), 2, 10.), (200. * 16. / 9., 200.));
+        // Tall stage: stacked, limited by the width.
+        let (w, h) = super::tile_size((400., 900.), 2, 10.);
+        assert_eq!(w, 400.);
+        assert!(h * 2. + 10. <= 900.);
     }
 
     #[test]
