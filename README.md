@@ -14,7 +14,7 @@ Cross-platform XMPP messenger with a GPU-accelerated [GPUI](https://github.com/z
 - XMPP instant messaging with STARTTLS/TLS (rustls)
 - OMEMO end-to-end encryption (libsignal-compatible) and PGP support
 - Encrypted file transfer
-- Voice and video calls over WebRTC, screen sharing of a chosen monitor or window (video needs ffmpeg on PATH; on Wayland the desktop portal and PipeWire pick and capture it)
+- Voice and video calls over WebRTC; screen sharing of a chosen monitor or window, up to its full resolution, with system audio (other apps only, never the call itself); the computer stays awake during a call. Video needs ffmpeg on PATH; capture goes through the desktop portal and PipeWire on Wayland and Windows.Graphics.Capture on Windows
 - Voice messages (Ogg Opus, compatible with Conversations)
 - Microphone, speaker and camera chosen in settings, switched on the fly during a call
 - Noise suppression for the microphone ([nnnoiseless](https://github.com/jneem/nnnoiseless), RNNoise in Rust)

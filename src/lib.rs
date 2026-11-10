@@ -1,4 +1,5 @@
 pub mod audio;
+pub mod awake;
 pub mod call;
 pub mod omemo;
 pub mod pgp;
@@ -9,8 +10,11 @@ pub mod i18n;
 pub mod screencast;
 pub mod screens;
 pub mod store;
+pub mod sysaudio;
 pub mod update;
 pub mod video;
 pub mod videocall;
 pub mod voice;
+#[cfg(windows)]
+pub mod wgc;
 pub mod xmpp;

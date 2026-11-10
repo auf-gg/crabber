@@ -502,6 +502,16 @@ fn menu_chevron(
         })
 }
 
+fn quality_label(q: crabber::videocall::Quality) -> &'static str {
+    use crabber::videocall::Quality;
+    match q {
+        Quality::Source => t!("call.quality_source"),
+        Quality::P1440 => t!("call.quality_1440"),
+        Quality::P1080 => t!("call.quality_1080"),
+        Quality::P720 => t!("call.quality_720"),
+    }
+}
+
 fn call_status(call: &crate::app::CallUi) -> String {
     match &call.state {
         CallState::Outgoing if call.peer_ringing => t!("call.ringing").to_string(),
@@ -625,7 +635,7 @@ impl Render for App {
             }))
             .bg(p.panel)
             .text_color(p.text)
-            .when(cfg!(windows), |d| d.child(self.render_titlebar(window, cx)))
+            .when(cfg!(windows) && !self.call_fullscreen, |d| d.child(self.render_titlebar(window, cx)))
             .child(content)
             .when_some(self.render_msg_menu(window, cx), |d, m| d.child(m))
             .when_some(self.render_emoji_picker(window, cx), |d, m| d.child(m))
@@ -760,12 +770,12 @@ impl App {
     }
 
     fn render_main(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        if self.call_fullscreen {
+        if self.call_expanded {
             match self.render_call_panel(cx) {
                 Some(panel) => return panel,
-                // The call ended while over the whole screen.
+                // The call ended while expanded.
                 None => {
-                    self.call_fullscreen = false;
+                    (self.call_expanded, self.call_fullscreen) = (false, false);
                     if window.is_fullscreen() {
                         window.toggle_fullscreen();
                     }
@@ -3049,39 +3059,53 @@ impl App {
             }
             Modal::ScreenPicker { targets } => {
                 use crabber::screens::ScreenTarget;
-                let section = |title: &'static str| div().pt_2().pb_1().text_xs().font_weight(FontWeight::SEMIBOLD).text_color(t.muted_foreground).child(title);
-                let row = |ix: usize, target: &ScreenTarget, monitor_no: usize| {
+                let section = |title: &'static str| div().w_full().pt_2().pb_1().text_xs().font_weight(FontWeight::SEMIBOLD).text_color(t.muted_foreground).child(title);
+                // A preview card: the picture once captured, an icon until then.
+                let card = |ix: usize, target: &ScreenTarget, monitor_no: usize| {
                     let (icon, label, detail) = match target {
                         ScreenTarget::Monitor { width, height, primary, .. } => (
                             IconName::Monitor,
                             t!("call.monitor", n = monitor_no),
                             format!("{width}×{height}{}", if *primary { format!(" · {}", t!("call.primary")) } else { String::new() }),
                         ),
-                        ScreenTarget::Window { title } => (IconName::AppWindow, title.clone(), String::new()),
+                        ScreenTarget::Window { title, .. } => (IconName::AppWindow, title.clone(), String::new()),
                     };
                     let target = target.clone();
-                    h_flex()
+                    v_flex()
                         .id(("share", ix))
-                        .gap_2()
-                        .p_2()
+                        .w(dp(204.))
+                        .gap_1()
+                        .p_1()
                         .rounded_md()
-                        .items_center()
                         .cursor_pointer()
                         .hover(|d| d.bg(t.accent))
-                        .child(Icon::new(icon).text_color(t.muted_foreground))
-                        .child(div().flex_1().min_w_0().truncate().child(label))
-                        .child(div().text_xs().text_color(t.muted_foreground).child(detail))
+                        .child(
+                            div()
+                                .w_full()
+                                .h(dp(112.))
+                                .rounded_md()
+                                .overflow_hidden()
+                                .bg(t.muted)
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .child(match self.share_thumbs.get(&ix) {
+                                    Some(pic) => img(pic.clone()).size_full().object_fit(ObjectFit::Contain).into_any_element(),
+                                    None => Icon::new(icon).size(dp(28.)).text_color(t.muted_foreground).into_any_element(),
+                                }),
+                        )
+                        .child(h_flex().gap_1().text_sm().child(div().flex_1().min_w_0().truncate().child(label)).child(div().text_xs().text_color(t.muted_foreground).child(detail)))
                         .on_click(cx.listener(move |this, _, _, cx| this.share_target(target.clone(), cx)))
                 };
                 let monitors = targets.iter().filter(|x| matches!(x, ScreenTarget::Monitor { .. })).count();
                 let list = v_flex()
                     .id("share-list")
-                    .max_h(dp(420.))
+                    .max_h(dp(480.))
                     .overflow_y_scroll()
                     .child(section(t!("call.screens")))
-                    .children(targets.iter().enumerate().take(monitors).map(|(ix, x)| row(ix, x, ix + 1)))
+                    .child(h_flex().flex_wrap().gap_1().children(targets.iter().enumerate().take(monitors).map(|(ix, x)| card(ix, x, ix + 1))))
                     .when(targets.len() > monitors, |d| d.child(section(t!("call.windows"))))
-                    .children(targets.iter().enumerate().skip(monitors).map(|(ix, x)| row(ix, x, 0)));
+                    .child(h_flex().flex_wrap().gap_1().children(targets.iter().enumerate().skip(monitors).map(|(ix, x)| card(ix, x, 0))));
                 (t!("call.share_title"), list.into_any_element())
             }
             Modal::ConfirmRetract { moderate, .. } => {
@@ -3121,7 +3145,7 @@ impl App {
                 .child(
                     v_flex()
                         .id("modal")
-                        .w(dp(420.))
+                        .w(dp(if matches!(modal, Modal::ScreenPicker { .. }) { 700. } else { 420. }))
                         .p_5()
                         .gap_4()
                         .rounded_lg()
@@ -3280,6 +3304,10 @@ impl App {
                         .when(muted, |d| d.child(Icon::new(IconName::MicOff).size(dp(12.)).text_color(p.danger))),
                 )
         };
+        // An expanded panel hides its bars after a while without the mouse moving.
+        let idle = self.call_expanded && self.call_menu.is_none() && self.call_mouse.elapsed().as_secs() >= 3;
+        // Expanded with one tile in focus, the picture takes the whole window, edge to edge.
+        let edge = self.call_expanded && self.call_focus.is_some();
         let gap = 12.;
         let stage_size = self.call_stage.get();
         let content = match self.call_focus {
@@ -3303,11 +3331,17 @@ impl App {
             Some(focus) => div()
                 .size_full()
                 .relative()
-                .child(tile(focus).size_full().on_click(cx.listener(|this, _, _, cx| {
-                    this.call_focus = None;
-                    cx.notify();
-                })))
                 .child(
+                    tile(focus)
+                        .size_full()
+                        .when(edge, |d| d.rounded_none().border_0().bg(black()))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.call_focus = None;
+                            cx.notify();
+                        })),
+                )
+                .when(!self.call_hide_others, |d| {
+                    d.child(
                     tile(!focus)
                         .absolute()
                         .right(dp(12.))
@@ -3319,12 +3353,13 @@ impl App {
                             this.call_focus = Some(!focus);
                             cx.notify();
                         })),
-                )
+                    )
+                })
                 .into_any_element(),
         };
         // The tiles are sized from the stage, measured while drawing (a frame late on resize).
         let measured = self.call_stage.clone();
-        let stage = div().flex_1().min_h_0().p_3().child(
+        let stage = div().flex_1().min_h_0().when(!edge, |d| d.p_3()).child(
             div()
                 .size_full()
                 .relative()
@@ -3403,9 +3438,63 @@ impl App {
             menu_chevron("call-camera-menu", this.clone(), open("call-camera-menu"), colors, cx, move |menu, _, _| device_items(menu, DeviceKind::Camera, current.clone(), this.clone()))
         };
 
+        // Screen share: another source, a monitor straight away (Windows), quality, system audio.
+        let share_menu = {
+            let (this, quality, audio) = (this.clone(), self.settings.share_quality, self.settings.share_audio);
+            let sharing = sending == Some(Source::Screen);
+            menu_chevron("call-share-menu", this.clone(), open("call-share-menu"), colors, cx, move |menu, window, cx| {
+                let mut menu = menu;
+                if sharing && crate::app::can_pick_screen() {
+                    let this = this.clone();
+                    menu = menu.item(PopupMenuItem::new(t!("call.share_change")).on_click(move |_, w, cx| {
+                        let _ = this.update(cx, |app, cx| app.change_screen(w, cx));
+                    }));
+                }
+                if cfg!(windows) {
+                    let current = crabber::videocall::screen();
+                    let monitors = crabber::screens::list().into_iter().filter(|x| matches!(x, crabber::screens::ScreenTarget::Monitor { .. }));
+                    for (i, m) in monitors.enumerate() {
+                        let crabber::screens::ScreenTarget::Monitor { width, height, .. } = &m else { continue };
+                        let label = format!("{} · {width}×{height}", t!("call.monitor", n = i + 1));
+                        let (this, checked) = (this.clone(), sharing && current.as_ref() == Some(&m));
+                        menu = menu.item(PopupMenuItem::new(label).checked(checked).on_click(move |_, _, cx| {
+                            let m = m.clone();
+                            let _ = this.update(cx, |app, cx| app.share_target(m, cx));
+                        }));
+                    }
+                }
+                let this2 = this.clone();
+                menu = menu.separator().submenu(t!("call.share_quality"), window, cx, move |mut m, _, _| {
+                    for q in crabber::videocall::Quality::ALL {
+                        let this = this2.clone();
+                        m = m.item(PopupMenuItem::new(quality_label(q)).checked(q == quality).on_click(move |_, w, cx| {
+                            let _ = this.update(cx, |app, cx| app.update_settings(w, cx, |st| st.share_quality = q));
+                        }));
+                    }
+                    m
+                });
+                if cfg!(any(target_os = "linux", windows)) {
+                    let this = this.clone();
+                    menu = menu.item(check_item(t!("call.share_audio"), audio).on_click(move |_, w, cx| {
+                        let _ = this.update(cx, |app, cx| app.update_settings(w, cx, |st| st.share_audio = !audio));
+                    }));
+                }
+                menu
+            })
+        };
+        let expand_menu = {
+            let (this, fullscreen) = (this.clone(), self.call_fullscreen);
+            menu_chevron("call-expand-menu", this.clone(), open("call-expand-menu"), colors, cx, move |menu, _, _| {
+                let this = this.clone();
+                menu.item(check_item(t!("call.fullscreen"), fullscreen).on_click(move |_, w, cx| {
+                    let _ = this.update(cx, |app, cx| app.set_call_fullscreen(!fullscreen, w, cx));
+                }))
+            })
+        };
+
         let cam = sending == Some(Source::Camera);
         let screen = sending == Some(Source::Screen);
-        let fullscreen = self.call_fullscreen;
+        let expanded = self.call_expanded;
         let tip = |label: &'static str| move |w: &mut Window, cx: &mut gpui_kit::App| Tooltip::new(label).build(w, cx);
         let controls = h_flex()
             .flex_shrink_0()
@@ -3435,13 +3524,26 @@ impl App {
                 camera_menu.into_any_element(),
                 false,
             ))
-            .child(
-                round("call-screen", if screen { IconName::ScreenShare } else { IconName::ScreenShareOff }, if screen { on } else { card }, false)
+            .child(pill(
+                round("call-screen", if screen { IconName::ScreenShare } else { IconName::ScreenShareOff }, if screen { on } else { None }, false)
                     .tooltip(tip(t!("call.screen")))
                     .when(!can_video, |d| d.opacity(0.4).cursor_default())
                     .when(can_video, |d| d.on_click(cx.listener(move |this, _, w, cx| this.share_screen(!screen, w, cx)))),
-            )
-            .when(!fullscreen, |d| {
+                share_menu.into_any_element(),
+                false,
+            ))
+            .when(self.call_focus.is_some(), |d| {
+                let hidden = self.call_hide_others;
+                d.child(
+                    round("call-others", if hidden { IconName::UserX } else { IconName::Users }, card, false)
+                        .tooltip(tip(if hidden { t!("call.show_others") } else { t!("call.hide_others") }))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.call_hide_others = !hidden;
+                            cx.notify();
+                        })),
+                )
+            })
+            .when(!expanded, |d| {
                 d.child(
                     round("call-chat", if self.call_chat_hidden { IconName::MessageSquareOff } else { IconName::MessageSquare }, card, false)
                         .tooltip(tip(t!("call.chat")))
@@ -3451,36 +3553,51 @@ impl App {
                         })),
                 )
             })
-            .child(
-                round("call-fullscreen", if fullscreen { IconName::Minimize } else { IconName::Maximize }, card, false)
-                    .tooltip(tip(if fullscreen { t!("call.exit_fullscreen") } else { t!("call.fullscreen") }))
-                    .on_click(cx.listener(move |this, _, w, cx| this.set_call_fullscreen(!fullscreen, w, cx))),
-            )
+            .child(pill(
+                round("call-expand", if expanded { IconName::Minimize } else { IconName::Maximize }, None, false)
+                    .tooltip(tip(if expanded { t!("call.collapse") } else { t!("call.expand") }))
+                    .on_click(cx.listener(move |this, _, w, cx| this.set_call_expanded(!expanded, w, cx))),
+                expand_menu.into_any_element(),
+                false,
+            ))
             .child(
                 round("call-hangup", IconName::PhoneOff, Some((p.danger, white())), false)
                     .tooltip(tip(t!("call.hangup")))
                     .on_click(cx.listener(|this, _, _, cx| this.call(CallCmd::Hangup, cx))),
             );
 
-        Some(
-            v_flex()
-                .size_full()
-                .bg(p.chat_top)
-                .text_color(fg)
-                .child(
-                    h_flex()
-                        .flex_shrink_0()
-                        .px_4()
-                        .pt_3()
-                        .gap_2()
-                        .items_center()
-                        .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).child(name))
-                        .child(div().text_sm().text_color(p.muted).child(call_status(call))),
-                )
+        let header = h_flex()
+            .flex_shrink_0()
+            .px_4()
+            .pt_3()
+            .gap_2()
+            .items_center()
+            .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).child(name))
+            .child(div().text_sm().text_color(p.muted).child(call_status(call)));
+        let panel = v_flex()
+            .id("call-panel")
+            .size_full()
+            .bg(p.chat_top)
+            .text_color(fg)
+            .on_mouse_move(cx.listener(move |this, _, _, cx| {
+                this.call_mouse = std::time::Instant::now();
+                if idle {
+                    cx.notify();
+                }
+            }));
+        // Expanded, the bars float over the stage, so hiding them leaves the tiles where they are.
+        Some(if expanded {
+            let bar = |d: Div| d.absolute().left_0().right_0().when(idle, |d| d.invisible());
+            panel
+                .relative()
+                .when(!edge, |d| d.pt(dp(36.)).pb(dp(56.)))
                 .child(stage)
-                .child(controls)
-                .into_any_element(),
-        )
+                .child(bar(div()).top_0().child(header))
+                .child(bar(div()).bottom_0().child(controls))
+                .into_any_element()
+        } else {
+            panel.child(header).child(stage).child(controls).into_any_element()
+        })
     }
 }
 

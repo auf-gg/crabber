@@ -59,20 +59,83 @@ pub fn set_screen(target: Option<crate::screens::ScreenTarget>) {
     *SCREEN.lock().unwrap() = target;
 }
 
+pub fn screen() -> Option<crate::screens::ScreenTarget> {
+    SCREEN.lock().unwrap().clone()
+}
+
 fn camera() -> Option<String> {
     let all = cameras();
     let chosen = CAMERA.lock().unwrap().clone();
     chosen.filter(|c| all.iter().any(|d| &d.id == c)).or_else(|| all.into_iter().next().map(|d| d.id))
 }
 
-/// Size of the decoded remote picture (letterboxed) and of the local preview.
-pub const REMOTE: (u32, u32) = (1280, 720);
-pub const PREVIEW: (u32, u32) = (320, 180);
+/// A captured picture fed to the encoder: tightly packed BGRA (stride == width * 4).
+pub struct RawFrame {
+    pub width: u32,
+    pub height: u32,
+    pub data: Vec<u8>,
+}
 
-/// Newest decoded frame of one side (taken by the UI) and when the last one arrived.
+/// Size of the local preview; the remote picture is decoded at its own size, up to `REMOTE_MAX`.
+pub const PREVIEW: (u32, u32) = (320, 180);
+pub const REMOTE_MAX: (u32, u32) = (2560, 1440);
+
+/// Resolution a screen share is sent at: the screen's own, or capped to a height.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Quality {
+    Source,
+    P1440,
+    P1080,
+    P720,
+}
+
+impl Quality {
+    pub const ALL: [Self; 4] = [Self::Source, Self::P1440, Self::P1080, Self::P720];
+
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::Source => "source",
+            Self::P1440 => "1440",
+            Self::P1080 => "1080",
+            Self::P720 => "720",
+        }
+    }
+
+    pub fn from_id(id: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|q| q.id() == id)
+    }
+
+    fn height(self) -> Option<u32> {
+        match self {
+            Self::Source => None,
+            Self::P1440 => Some(1440),
+            Self::P1080 => Some(1080),
+            Self::P720 => Some(720),
+        }
+    }
+
+    fn bitrate(self) -> &'static str {
+        match self {
+            Self::Source => "6000k",
+            Self::P1440 => "4000k",
+            Self::P1080 => "2500k",
+            Self::P720 => "1500k",
+        }
+    }
+}
+
+static QUALITY: Mutex<Quality> = Mutex::new(Quality::P1080);
+
+/// Read whenever a screen encoder starts.
+pub fn set_screen_quality(q: Quality) {
+    *QUALITY.lock().unwrap() = q;
+}
+
+/// Newest decoded frame of one side (taken by the UI), its size, and when the last one arrived.
 #[derive(Default)]
 pub struct Slot {
     pub frame: Option<Vec<u8>>,
+    pub size: (u32, u32),
     pub at: Option<Instant>,
 }
 
@@ -98,19 +161,22 @@ pub(crate) type Sink = Arc<Mutex<Box<dyn FnMut(Vec<u8>) + Send>>>;
 /// Running capture + encoder; dropping it stops ffmpeg (and the screencast).
 pub struct Encoder {
     child: Arc<Mutex<Option<Child>>>,
-    #[cfg(target_os = "linux")]
-    _cast: Option<crate::screencast::Screencast>,
+    /// Our own capture (portal session, Windows capture) for fed frames.
+    capture: Option<Box<dyn Send>>,
     _feed: Option<SyncSender<()>>,
 }
 
 pub(crate) fn encode_args(src: Source) -> Vec<String> {
-    let (width, rate) = match src {
-        Source::Camera => (1280, "1200k"),
-        Source::Screen => (1920, "2000k"),
+    let quality = *QUALITY.lock().unwrap();
+    // Even sizes for yuv420p.
+    let (scale, rate) = match (src, quality.height()) {
+        (Source::Camera, _) => ("scale='min(1280,iw)':-2".to_string(), "1200k"),
+        (Source::Screen, Some(h)) => (format!("scale=-2:'min({h},ih)'"), quality.bitrate()),
+        (Source::Screen, None) => ("scale=trunc(iw/2)*2:trunc(ih/2)*2".to_string(), quality.bitrate()),
     };
     #[rustfmt::skip]
     let args = [
-        "-an", "-vf", &format!("scale='min({width},iw)':-2,format=yuv420p"),
+        "-an", "-vf", &format!("{scale},format=yuv420p"),
         "-c:v", "libvpx", "-deadline", "realtime", "-cpu-used", "8", "-lag-in-frames", "0", "-auto-alt-ref", "0",
         "-error-resilient", "1", "-g", "60", "-b:v", rate, "-maxrate", rate, "-bufsize", rate, "-threads", "4",
         "-f", "ivf", "-",
@@ -118,29 +184,52 @@ pub(crate) fn encode_args(src: Source) -> Vec<String> {
     args.iter().map(|s| s.to_string()).collect()
 }
 
-/// ffmpeg input options capturing `src` directly; None when frames must be fed through stdin (Wayland).
-fn capture_args(src: Source) -> Result<Option<Vec<String>>, String> {
-    let v = |a: &[&str]| Ok(Some(a.iter().map(|s| s.to_string()).collect()));
+/// Frame rate of the frames we capture ourselves and feed to ffmpeg.
+const FEED_FPS: u32 = 30;
+
+/// How a source is captured: by ffmpeg itself (its input options), or by us, frames arriving on
+/// the receiver while the handle lives (Wayland portal, Windows Graphics Capture).
+enum Capture {
+    Ffmpeg(Vec<String>),
+    Fed(std::sync::mpsc::Receiver<RawFrame>, Box<dyn Send>),
+}
+
+fn capture(src: Source) -> Result<Capture, String> {
+    let ffmpeg = |a: &[&str]| Ok(Capture::Ffmpeg(a.iter().map(|s| s.to_string()).collect()));
     match src {
         #[cfg(target_os = "linux")]
         Source::Camera => {
             let dev = camera().ok_or(crate::t!("call.no_camera"))?;
-            v(&["-f", "v4l2", "-i", &dev])
+            ffmpeg(&["-f", "v4l2", "-i", &dev])
         }
         #[cfg(target_os = "linux")]
-        Source::Screen if crate::screencast::wayland() => Ok(None),
+        Source::Screen if crate::screencast::wayland() => {
+            let (tx, rx) = sync_channel::<RawFrame>(2);
+            let cast = crate::screencast::start(move |f| {
+                let _ = tx.try_send(RawFrame { width: f.width, height: f.height, data: f.data });
+            })?;
+            Ok(Capture::Fed(rx, Box::new(cast)))
+        }
         #[cfg(target_os = "linux")]
-        Source::Screen => v(&["-f", "x11grab", "-framerate", "15", "-i", &std::env::var("DISPLAY").unwrap_or(":0".into())]),
+        Source::Screen => ffmpeg(&["-f", "x11grab", "-framerate", "15", "-i", &std::env::var("DISPLAY").unwrap_or(":0".into())]),
         #[cfg(windows)]
         Source::Camera => {
             let name = camera().ok_or(crate::t!("call.no_camera"))?;
-            v(&["-f", "dshow", "-i", &format!("video={name}")])
+            ffmpeg(&["-f", "dshow", "-i", &format!("video={name}")])
         }
+        // Windows Graphics Capture (GPU); GDI through ffmpeg only before Windows 10 1903.
         #[cfg(windows)]
-        Source::Screen => match SCREEN.lock().unwrap().clone() {
-            Some(target) => Ok(Some(crate::screens::gdigrab_input(&target))),
-            None => v(&["-f", "gdigrab", "-framerate", "15", "-i", "desktop"]),
-        },
+        Source::Screen => {
+            let target = SCREEN.lock().unwrap().clone().or_else(|| crate::screens::list().into_iter().next());
+            let Some(target) = target else { return ffmpeg(&["-f", "gdigrab", "-framerate", "15", "-i", "desktop"]) };
+            let (tx, rx) = sync_channel::<RawFrame>(2);
+            match crate::wgc::start(&target, FEED_FPS, move |f| {
+                let _ = tx.try_send(f);
+            }) {
+                Ok(cap) => Ok(Capture::Fed(rx, Box::new(cap))),
+                Err(_) => Ok(Capture::Ffmpeg(crate::screens::gdigrab_input(&target))),
+            }
+        }
         #[cfg(not(any(target_os = "linux", windows)))]
         _ => Err(crate::t!("call.no_camera").into()),
     }
@@ -187,36 +276,41 @@ impl Encoder {
             return Err(crate::t!("call.no_ffmpeg").into());
         }
         let sink: Sink = Arc::new(Mutex::new(Box::new(on_frame)));
-        let encode = encode_args(src);
-        match capture_args(src)? {
-            Some(mut input) => {
-                input.extend(encode);
+        match capture(src)? {
+            Capture::Ffmpeg(mut input) => {
+                input.extend(encode_args(src));
                 let child = spawn_encoder(&input, sink)?;
-                Ok(Self {
-                    child: Arc::new(Mutex::new(Some(child))),
-                    #[cfg(target_os = "linux")]
-                    _cast: None,
-                    _feed: None,
-                })
+                Ok(Self { child: Arc::new(Mutex::new(Some(child))), capture: None, _feed: None })
             }
-            None => Self::start_fed(encode, sink),
+            Capture::Fed(frames, capture) => Ok(Self::start_fed(frames, capture, sink)),
         }
     }
 
-    /// Wayland: screencast frames piped into ffmpeg as raw BGRA; ffmpeg restarts when the size changes.
-    /// The last frame is repeated when the screen is static so a keyframe still comes every few seconds.
-    #[cfg(target_os = "linux")]
-    fn start_fed(encode: Vec<String>, sink: Sink) -> Result<Self, String> {
-        let (tx, rx) = sync_channel::<crate::screencast::Frame>(2);
-        let cast = crate::screencast::start(move |f| {
-            let _ = tx.try_send(f);
-        })?;
+    /// Picks up a new quality: with fed frames only ffmpeg restarts, keeping the capture (and the
+    /// portal session); false when the whole capture has to start again.
+    pub fn restart(&self) -> bool {
+        if self.capture.is_none() {
+            return false;
+        }
+        // The feeding loop starts a new ffmpeg with the current settings on the next frame.
+        if let Some(mut c) = self.child.lock().unwrap().take() {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+        true
+    }
+
+    /// Our frames piped into ffmpeg as raw BGRA, at most `FEED_FPS`; ffmpeg restarts when the size
+    /// changes. The last frame is repeated while the screen is static so keyframes keep coming.
+    fn start_fed(rx: std::sync::mpsc::Receiver<RawFrame>, capture: Box<dyn Send>, sink: Sink) -> Self {
         let child = Arc::new(Mutex::new(None::<Child>));
         let (stop, stop_rx) = sync_channel::<()>(0);
         let held = child.clone();
         std::thread::spawn(move || {
-            let mut last: Option<crate::screencast::Frame> = None;
+            let mut last: Option<RawFrame> = None;
             let mut size = (0, 0);
+            let mut sent: Option<Instant> = None;
+            let interval = Duration::from_secs(1) / FEED_FPS;
             loop {
                 if !matches!(stop_rx.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)) {
                     break;
@@ -226,6 +320,10 @@ impl Encoder {
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                     Err(_) => break,
                 }
+                // Frames faster than the encoder's rate are dropped (the newest one is kept).
+                if sent.is_some_and(|t| t.elapsed() < interval) {
+                    continue;
+                }
                 let Some(f) = last.as_ref() else { continue };
                 let mut slot = held.lock().unwrap();
                 if size != (f.width, f.height) || slot.is_none() {
@@ -234,11 +332,10 @@ impl Encoder {
                         let _ = old.wait();
                     }
                     size = (f.width, f.height);
-                    let mut input: Vec<String> = ["-f", "rawvideo", "-pix_fmt", "bgra", "-s", &format!("{}x{}", f.width, f.height), "-r", "15", "-i", "-"]
-                        .iter()
-                        .map(|s| s.to_string())
-                        .collect();
-                    input.extend(encode.iter().cloned());
+                    let fps = FEED_FPS.to_string();
+                    let mut input: Vec<String> =
+                        ["-f", "rawvideo", "-pix_fmt", "bgra", "-s", &format!("{}x{}", f.width, f.height), "-r", &fps, "-i", "-"].iter().map(|s| s.to_string()).collect();
+                    input.extend(encode_args(Source::Screen));
                     match spawn_encoder(&input, sink.clone()) {
                         Ok(c) => *slot = Some(c),
                         Err(_) => break,
@@ -248,14 +345,10 @@ impl Encoder {
                 if stdin.write_all(&f.data).is_err() {
                     *slot = None;
                 }
+                sent = Some(Instant::now());
             }
         });
-        Ok(Self { child, _cast: Some(cast), _feed: Some(stop) })
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    fn start_fed(_: Vec<String>, _: Sink) -> Result<Self, String> {
-        unreachable!("only Wayland feeds frames")
+        Self { child, capture: Some(capture), _feed: Some(stop) }
     }
 }
 
@@ -322,7 +415,7 @@ impl Decoder {
                     break;
                 }
                 let mut s = slot.lock().unwrap();
-                *s = Slot { frame: Some(buf), at: Some(Instant::now()) };
+                *s = Slot { frame: Some(buf), size: (w, h), at: Some(Instant::now()) };
             }
         });
         Ok(Self { tx: Some(tx), child })
@@ -345,4 +438,39 @@ impl Drop for Decoder {
 /// VP8 keyframe: bit 0 of the first byte of the frame tag is 0.
 pub fn is_keyframe(frame: &[u8]) -> bool {
     frame.first().is_some_and(|b| b & 1 == 0)
+}
+
+/// Picture size from a VP8 keyframe header (after the start code 9d 01 2a), capped to `REMOTE_MAX`
+/// with the aspect kept and even sides.
+pub fn keyframe_size(frame: &[u8]) -> Option<(u32, u32)> {
+    if !is_keyframe(frame) || frame.len() < 10 || frame[3..6] != [0x9d, 0x01, 0x2a] {
+        return None;
+    }
+    let dim = |i: usize| (u16::from_le_bytes([frame[i], frame[i + 1]]) & 0x3fff) as f32;
+    let (w, h) = (dim(6), dim(8));
+    if w == 0. || h == 0. {
+        return None;
+    }
+    let k = (REMOTE_MAX.0 as f32 / w).min(REMOTE_MAX.1 as f32 / h).min(1.);
+    let even = |x: f32| ((x * k) as u32 / 2 * 2).max(2);
+    Some((even(w), even(h)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn keyframe_sizes() {
+        let key = |w: u16, h: u16| [[0x10, 0x02, 0x00, 0x9d, 0x01, 0x2a].as_slice(), &w.to_le_bytes(), &h.to_le_bytes()].concat();
+        assert_eq!(keyframe_size(&key(1280, 720)), Some((1280, 720)));
+        // 4K comes down to the cap, aspect kept.
+        assert_eq!(keyframe_size(&key(3840, 2160)), Some((2560, 1440)));
+        // An odd ultrawide side stays even.
+        assert_eq!(keyframe_size(&key(3441, 1440)), Some((2560, 1070)));
+        let mut inter = key(1280, 720);
+        inter[0] |= 1;
+        assert_eq!(keyframe_size(&inter), None);
+        assert_eq!(keyframe_size(&[0x10, 0x02]), None);
+    }
 }

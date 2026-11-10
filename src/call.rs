@@ -3,7 +3,7 @@
 //! Signalling is translated between Jingle XML and the SDP that webrtc-rs speaks.
 //! Video is VP8 in a BUNDLE with the audio; an audio call gains video through content-add.
 use crate::t;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -32,7 +32,7 @@ use webrtc::peer_connection::{
 use webrtc::rtp_transceiver::RtpSender;
 
 use crate::audio::{self, Audio};
-use crate::videocall::{Decoder, Encoder, FRAMES, PREVIEW, REMOTE, Source, is_keyframe};
+use crate::videocall::{Decoder, Encoder, FRAMES, PREVIEW, Source, is_keyframe, keyframe_size};
 use crate::xmpp::{Ev, Net, nc};
 
 const NS_JINGLE: &str = "urn:xmpp:jingle:1";
@@ -70,6 +70,13 @@ const ACTIONS: [&str; 15] = [
 const VP8_PT: u8 = 96;
 const OPUS_PT: u8 = 111;
 
+/// Whether a screen share sends system audio; read when a call starts (later: `CallCmd::ShareAudio`).
+static SHARE_AUDIO: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_share_audio(on: bool) {
+    SHARE_AUDIO.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Received audio RTP packets across all calls; lets tests and diagnostics see that media flows.
 pub static RTP_RECEIVED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -85,6 +92,10 @@ pub enum CallCmd {
     Video(Option<Source>),
     /// The chosen microphone, speaker or camera changed: reopen what the call is using.
     Devices,
+    /// The screen share quality changed: restart its encoder.
+    ScreenQuality,
+    /// Send what other applications play along with a screen share.
+    ShareAudio(bool),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -274,6 +285,13 @@ struct Call {
     peer_muted: bool,
     peer_held: bool,
     peer_ringing: bool,
+    /// Whether to send system audio with a screen share, its capture while running, and the
+    /// captured samples waiting to be mixed into ours.
+    share_audio: bool,
+    system_audio: Option<crate::sysaudio::SystemAudio>,
+    system_buf: Arc<Mutex<VecDeque<f32>>>,
+    /// Keeps the computer awake while the call is up.
+    awake: Option<crate::awake::Awake>,
 }
 
 struct Actor {
@@ -335,10 +353,18 @@ fn spawn_video_writer(track: VideoTrack) -> UnboundedSender<Vec<u8>> {
 
 /// Encodes 20 ms frames in the negotiated codec and sends them as RTP: the codec is known only
 /// after negotiation, so packets are built here rather than by a codec-bound track.
-async fn write_audio(mut frames: futures::channel::mpsc::UnboundedReceiver<Vec<f32>>, track: Arc<TrackLocalStaticRTP>, ssrc: u32, out: AudioOut) {
+async fn write_audio(mut frames: futures::channel::mpsc::UnboundedReceiver<Vec<f32>>, track: Arc<TrackLocalStaticRTP>, ssrc: u32, out: AudioOut, system: Arc<Mutex<VecDeque<f32>>>) {
     let (mut seq, mut ts): (u16, u32) = (rand::random(), rand::random());
     let mut opus = None;
-    while let Some(pcm) = frames.next().await {
+    while let Some(mut pcm) = frames.next().await {
+        // System audio of a screen share rides along with the microphone.
+        {
+            let mut sys = system.lock().unwrap();
+            for x in pcm.iter_mut() {
+                let Some(s) = sys.pop_front() else { break };
+                *x = (*x + s).clamp(-1.0, 1.0);
+            }
+        }
         let f = *out.lock().unwrap();
         let payload = if f.opus {
             if opus.is_none() {
@@ -360,8 +386,9 @@ async fn write_audio(mut frames: futures::channel::mpsc::UnboundedReceiver<Vec<f
 }
 
 /// Reassembles VP8 frames from RTP and decodes them for the UI; asks for a keyframe after loss.
+/// The decoder runs at the picture's own size, restarted when a keyframe brings a new one.
 async fn receive_video(track: Arc<dyn TrackRemote>) {
-    let Ok(dec) = Decoder::start(REMOTE, &FRAMES.remote) else { return };
+    let mut dec: Option<(Decoder, (u32, u32))> = None;
     let mut depack = rtc::rtp::codec::vp8::Vp8Packet::default();
     let (mut frame, mut last_seq, mut broken, mut last_pli) = (Vec::new(), None::<u16>, true, None::<Instant>);
     while let Some(ev) = track.poll().await {
@@ -393,7 +420,12 @@ async fn receive_video(track: Arc<dyn TrackRemote>) {
             }
             continue;
         }
-        broken = !dec.push(f);
+        if let Some(size) = keyframe_size(&f)
+            && dec.as_ref().is_none_or(|d| d.1 != size)
+        {
+            dec = Decoder::start(size, &FRAMES.remote).ok().map(|d| (d, size));
+        }
+        broken = !dec.as_ref().is_some_and(|(d, _)| d.push(f));
     }
 }
 
@@ -461,7 +493,14 @@ impl Actor {
                     return;
                 }
                 match state {
-                    RTCPeerConnectionState::Connected => self.set_state(CallState::Active),
+                    RTCPeerConnectionState::Connected => {
+                        if let Some(c) = self.call.as_mut()
+                            && c.awake.is_none()
+                        {
+                            c.awake = crate::awake::keep_awake(t!("call.awake_reason"));
+                        }
+                        self.set_state(CallState::Active)
+                    }
                     RTCPeerConnectionState::Failed => {
                         self.terminate("failed-transport").await;
                         self.end(t!("call.reason_connect_failed")).await;
@@ -605,6 +644,48 @@ impl Actor {
                     self.set_video(Some(Source::Camera)).await;
                 }
             }
+            CallCmd::ScreenQuality => {
+                let Some(c) = self.call.as_ref().filter(|c| c.sending == Some(Source::Screen)) else { return };
+                // Wayland keeps its portal session; elsewhere the capture restarts on the same target.
+                if !c.encoder.as_ref().is_some_and(|e| e.restart()) {
+                    self.set_video(Some(Source::Screen)).await;
+                }
+            }
+            CallCmd::ShareAudio(on) => {
+                if let Some(c) = self.call.as_mut() {
+                    c.share_audio = on;
+                }
+                self.update_system_audio();
+            }
+        }
+    }
+
+    /// System audio runs only while the screen is shared and the user asked for it.
+    fn update_system_audio(&mut self) {
+        let Some(c) = self.call.as_mut() else { return };
+        let want = c.share_audio && c.sending == Some(Source::Screen);
+        if !want {
+            c.system_audio = None;
+            c.system_buf.lock().unwrap().clear();
+            return;
+        }
+        if c.system_audio.is_some() {
+            return;
+        }
+        let buf = c.system_buf.clone();
+        let res = crate::sysaudio::start(move |frame| {
+            let mut b = buf.lock().unwrap();
+            b.extend(frame);
+            // Its clock drifts from the microphone's: keep at most 200 ms.
+            let max = audio::CALL_RATE as usize / 5;
+            if b.len() > max {
+                let excess = b.len() - max;
+                b.drain(..excess);
+            }
+        });
+        match res {
+            Ok(capture) => c.system_audio = Some(capture),
+            Err(e) => self.notice(t!("call.system_audio_failed", error = e).to_string()),
         }
     }
 
@@ -618,6 +699,7 @@ impl Actor {
         if was.is_some() != src.is_some() {
             self.mute_info("video", src.is_none());
         }
+        self.update_system_audio();
         let Some(src) = src else { return self.emit_media() };
         let Some(c) = self.call.as_mut() else { return };
         let upgrade = c.pc.is_some() && c.video_track.lock().unwrap().is_none();
@@ -680,6 +762,10 @@ impl Actor {
             peer_muted: false,
             peer_held: false,
             peer_ringing: false,
+            share_audio: SHARE_AUDIO.load(std::sync::atomic::Ordering::Relaxed),
+            system_audio: None,
+            system_buf: Arc::default(),
+            awake: None,
         });
         self.emit(state);
         self.emit_media();
@@ -1119,8 +1205,8 @@ impl Actor {
         let audio = audio::start(move |frame| {
             let _ = frames_tx.unbounded_send(frame);
         })?;
-        let out = self.call.as_ref().ok_or(t!("call.err_no_call"))?.audio_out.clone();
-        tokio::spawn(write_audio(frames_rx, track, ssrc, out));
+        let c = self.call.as_ref().ok_or(t!("call.err_no_call"))?;
+        tokio::spawn(write_audio(frames_rx, track, ssrc, c.audio_out.clone(), c.system_buf.clone()));
         let c = self.call.as_mut().ok_or(t!("call.err_no_call"))?;
         audio.muted.store(c.muted || c.peer_held, std::sync::atomic::Ordering::Relaxed);
         audio.deafened.store(c.deafened, std::sync::atomic::Ordering::Relaxed);
@@ -1805,7 +1891,7 @@ a=rtpmap:96 VP8/90000\r\na=rtcp-fb:96 nack pli\r\na=ssrc:43 cname:abc\r\n";
     /// Sends a tone from `a` as the real call path does and returns the first audio packet `b` gets.
     async fn send_tone(a: &TestPc, b: &mut TestPc, format: AudioFormat) -> rtc::rtp::Packet {
         let (tx, rx) = unbounded::<Vec<f32>>();
-        let writer = tokio::spawn(write_audio(rx, a.4.clone(), a.4.track().await.ssrcs().next().unwrap(), Arc::new(Mutex::new(format))));
+        let writer = tokio::spawn(write_audio(rx, a.4.clone(), a.4.track().await.ssrcs().next().unwrap(), Arc::new(Mutex::new(format)), Arc::default()));
         let feeder = tokio::spawn(async move {
             for i in 0.. {
                 let pcm = (0..audio::CALL_FRAME).map(|n| ((i * audio::CALL_FRAME + n) as f32 * 440.0 * std::f32::consts::TAU / 48000.0).sin() * 0.5).collect();
@@ -1961,7 +2047,11 @@ a=rtpmap:96 VP8/90000\r\na=rtcp-fb:96 nack pli\r\na=ssrc:43 cname:abc\r\n";
                 }
             }
             loop {
-                if FRAMES.remote.lock().unwrap().frame.as_ref().is_some_and(|f| f.len() == (REMOTE.0 * REMOTE.1 * 4) as usize) {
+                let done = {
+                    let slot = FRAMES.remote.lock().unwrap();
+                    slot.frame.as_ref().is_some_and(|f| slot.size == (640, 360) && f.len() == 640 * 360 * 4)
+                };
+                if done {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(50)).await;

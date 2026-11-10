@@ -108,9 +108,14 @@ mod tests {
     /// Every `t!("key"` in the sources has a text.
     #[test]
     fn keys_exist() {
-        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/src");
-        for entry in std::fs::read_dir(dir).unwrap() {
-            let path = entry.unwrap().path();
+        let mut dirs = vec![std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/src"))];
+        let mut files = vec![];
+        while let Some(dir) = dirs.pop() {
+            for path in std::fs::read_dir(dir).unwrap().map(|e| e.unwrap().path()) {
+                if path.is_dir() { dirs.push(path) } else { files.push(path) }
+            }
+        }
+        for path in files {
             let src = std::fs::read_to_string(&path).unwrap();
             for (at, _) in src.match_indices("t!(\"") {
                 // Skip `format!(` and the like.

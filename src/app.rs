@@ -19,7 +19,7 @@ use gpui_kit::component::{
 use gpui_kit::*;
 use crabber::call::{CallCmd, CallEv, CallState};
 use crabber::audio::MediaDevice;
-use crabber::videocall::{FRAMES, PREVIEW, REMOTE, Source};
+use crabber::videocall::{FRAMES, Source};
 use crabber::store::{self, ChatRow, Msg, Store};
 use crabber::e2e::DeviceInfo;
 use crabber::xmpp::{self, Account, Bookmark, Cmd, Ev, Occupant, Reply};
@@ -146,6 +146,9 @@ pub struct Settings {
     /// Call volumes, 1.0 = 100 %.
     pub mic_volume: f32,
     pub speaker_volume: f32,
+    /// Screen share: resolution sent, and whether system audio goes with it.
+    pub share_quality: crabber::videocall::Quality,
+    pub share_audio: bool,
 }
 
 impl Settings {
@@ -167,6 +170,8 @@ impl Settings {
             speaker: load_device(s, "speaker"),
             camera: load_device(s, "camera"),
             denoise: s.get("denoise").is_some_and(|v| v == "1"),
+            share_quality: s.get("share_quality").and_then(|v| crabber::videocall::Quality::from_id(&v)).unwrap_or(crabber::videocall::Quality::P1080),
+            share_audio: s.get("share_audio").is_some_and(|v| v == "1"),
             mic_volume: volume(s, "mic_volume"),
             speaker_volume: volume(s, "speaker_volume"),
         }
@@ -178,6 +183,8 @@ impl Settings {
         crabber::videocall::set_camera(id(&self.camera));
         crabber::audio::set_denoise(self.denoise);
         crabber::audio::set_volumes(self.mic_volume, self.speaker_volume);
+        crabber::videocall::set_screen_quality(self.share_quality);
+        crabber::call::set_share_audio(self.share_audio);
     }
     /// Switches the UI texts to the chosen language; "system" follows the OS.
     fn apply_lang(&self) {
@@ -198,6 +205,8 @@ impl Settings {
         s.set("start_minimized", b(self.start_minimized));
         s.set("lang", &self.lang);
         s.set("denoise", b(self.denoise));
+        s.set("share_quality", self.share_quality.id());
+        s.set("share_audio", b(self.share_audio));
         s.set("mic_volume", &self.mic_volume.to_string());
         s.set("speaker_volume", &self.speaker_volume.to_string());
         for (k, d) in [("mic", &self.mic), ("speaker", &self.speaker), ("camera", &self.camera)] {
@@ -571,9 +580,16 @@ pub struct App {
     pub mic_volume: Entity<SliderState>,
     pub speaker_volume: Entity<SliderState>,
     pub call_menu: Option<&'static str>,
-    /// The tile shown over the whole call panel (true: the peer's), and the panel over the whole screen.
+    /// The tile shown over the whole call panel (true: the peer's), the other tiles hidden.
     pub call_focus: Option<bool>,
+    pub call_hide_others: bool,
+    /// The call panel over the whole window; with `call_fullscreen` the window over the whole screen.
+    pub call_expanded: bool,
     pub call_fullscreen: bool,
+    /// Last mouse movement over the call panel: the controls of an expanded panel hide after a pause.
+    pub call_mouse: Instant,
+    /// Previews for the share picker, filled in the background (index of `ScreenPicker::targets`).
+    pub share_thumbs: HashMap<usize, Arc<RenderImage>>,
     /// Size of the area the tiles share, measured while drawing.
     pub call_stage: Rc<std::cell::Cell<Size<Pixels>>>,
     app_store: Store,
@@ -762,7 +778,11 @@ impl App {
             speaker_volume,
             call_menu: None,
             call_focus: None,
+            call_hide_others: false,
+            call_expanded: false,
             call_fullscreen: false,
+            call_mouse: Instant::now(),
+            share_thumbs: HashMap::new(),
             call_stage: Rc::default(),
             app_store,
             _subs: vec![],
@@ -1083,11 +1103,11 @@ impl App {
                         Some(c) => (c.sending.is_some(), [Some(&mut c.remote), Some(&mut c.local)]),
                         None => (false, [None, None]),
                     };
-                    for (i, (slot, (w, h))) in [(&FRAMES.remote, REMOTE), (&FRAMES.local, PREVIEW)].into_iter().enumerate() {
-                        let (frame, live) = {
+                    for (i, slot) in [&FRAMES.remote, &FRAMES.local].into_iter().enumerate() {
+                        let (frame, live, (w, h)) = {
                             let mut sl = slot.lock().unwrap();
                             let live = sl.at.is_some_and(|t| t.elapsed().as_secs() < 3);
-                            (sl.frame.take(), live)
+                            (sl.frame.take(), live, sl.size)
                         };
                         let keep = targets[i].is_some() && if i == 0 { live } else { sending };
                         let img = frame
@@ -1198,12 +1218,21 @@ impl App {
     pub fn update_settings(&mut self, window: &mut Window, cx: &mut Context<Self>, f: impl FnOnce(&mut Settings)) {
         let lang = self.settings.lang.clone();
         let devices = (self.settings.mic.clone(), self.settings.speaker.clone(), self.settings.camera.clone(), self.settings.denoise);
+        let share = (self.settings.share_quality, self.settings.share_audio);
         f(&mut self.settings);
         self.settings.save(&self.app_store);
-        if devices != (self.settings.mic.clone(), self.settings.speaker.clone(), self.settings.camera.clone(), self.settings.denoise) {
+        if devices != (self.settings.mic.clone(), self.settings.speaker.clone(), self.settings.camera.clone(), self.settings.denoise) || share != (self.settings.share_quality, self.settings.share_audio) {
             self.settings.apply_devices();
             if let Some(sess) = self.sess.as_ref().filter(|s| s.call.is_some()) {
-                sess.send(Cmd::Call(CallCmd::Devices));
+                if devices != (self.settings.mic.clone(), self.settings.speaker.clone(), self.settings.camera.clone(), self.settings.denoise) {
+                    sess.send(Cmd::Call(CallCmd::Devices));
+                }
+                if share.0 != self.settings.share_quality {
+                    sess.send(Cmd::Call(CallCmd::ScreenQuality));
+                }
+                if share.1 != self.settings.share_audio {
+                    sess.send(Cmd::Call(CallCmd::ShareAudio(self.settings.share_audio)));
+                }
             }
         }
         if self.settings.lang != lang {
@@ -1222,12 +1251,48 @@ impl App {
     /// elsewhere the system decides (the portal picker on Wayland, the whole desktop on X11).
     pub fn share_screen(&mut self, on: bool, window: &mut Window, cx: &mut Context<Self>) {
         if on && cfg!(windows) {
-            let targets = crabber::screens::list();
-            if !targets.is_empty() {
-                return self.open_modal(Modal::ScreenPicker { targets }, window, cx);
-            }
+            return self.pick_screen(window, cx);
         }
         self.call(CallCmd::Video(on.then_some(Source::Screen)), cx);
+    }
+
+    /// Another monitor or window: our picker on Windows; elsewhere the system's (a new portal
+    /// session on Wayland).
+    pub fn change_screen(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if cfg!(windows) {
+            return self.pick_screen(window, cx);
+        }
+        self.call(CallCmd::Video(Some(Source::Screen)), cx);
+    }
+
+    /// The share picker, with previews captured in the background.
+    fn pick_screen(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let targets = crabber::screens::list();
+        if targets.is_empty() {
+            return self.call(CallCmd::Video(Some(Source::Screen)), cx);
+        }
+        self.share_thumbs.clear();
+        self.open_modal(Modal::ScreenPicker { targets: targets.clone() }, window, cx);
+        cx.spawn(async move |this, cx| {
+            for (ix, t) in targets.into_iter().enumerate() {
+                let shot = cx.background_executor().spawn(async move { crabber::screens::thumbnail(&t, 320, 180) }).await;
+                let Some((w, h, bgra)) = shot else { continue };
+                let Some(buf) = image::RgbaImage::from_raw(w, h, bgra) else { continue };
+                let img = Arc::new(RenderImage::new(vec![image::Frame::new(buf)]));
+                let open = this.update(cx, |app, cx| {
+                    let open = matches!(app.modal, Some(Modal::ScreenPicker { .. }));
+                    if open {
+                        app.share_thumbs.insert(ix, img);
+                        cx.notify();
+                    }
+                    open
+                });
+                if !matches!(open, Ok(true)) {
+                    break;
+                }
+            }
+        })
+        .detach();
     }
 
     pub fn share_target(&mut self, target: crabber::screens::ScreenTarget, cx: &mut Context<Self>) {
@@ -1236,9 +1301,20 @@ impl App {
         self.call(CallCmd::Video(Some(Source::Screen)), cx);
     }
 
-    /// The call panel over the whole window, and the window over the whole screen.
+    /// The call panel over the whole window (the window stays a normal window).
+    pub fn set_call_expanded(&mut self, on: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.call_expanded = on;
+        self.call_mouse = Instant::now();
+        if !on && self.call_fullscreen {
+            self.set_call_fullscreen(false, window, cx);
+        }
+        cx.notify();
+    }
+
+    /// The expanded panel over the whole screen: the window goes full screen.
     pub fn set_call_fullscreen(&mut self, on: bool, window: &mut Window, cx: &mut Context<Self>) {
         self.call_fullscreen = on;
+        self.call_expanded |= on;
         if window.is_fullscreen() != on {
             window.toggle_fullscreen();
         }
@@ -1302,6 +1378,10 @@ impl App {
     pub fn handle_escape(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         if self.call_fullscreen {
             self.set_call_fullscreen(false, window, cx);
+            return true;
+        }
+        if self.call_expanded {
+            self.set_call_expanded(false, window, cx);
             return true;
         }
         if self.update_popup {
@@ -1806,7 +1886,7 @@ impl App {
         }
         sess.sort_chats();
         for c in call_log {
-            (self.call_menu, self.call_focus) = (None, None);
+            (self.call_menu, self.call_focus, self.call_hide_others) = (None, None, false);
             self.log_call(c);
         }
         self.connecting = false;
@@ -2700,11 +2780,11 @@ impl App {
                     c.deafened = *d;
                 }
             }
-            CallCmd::Devices => {}
+            CallCmd::Devices | CallCmd::ScreenQuality | CallCmd::ShareAudio(_) => {}
         }
         sess.send(Cmd::Call(cmd));
         if let Some(c) = ended {
-            (self.call_menu, self.call_focus) = (None, None);
+            (self.call_menu, self.call_focus, self.call_hide_others) = (None, None, false);
             self.log_call(c);
         }
         cx.notify();
@@ -2725,6 +2805,15 @@ impl App {
         let msg = Msg { msg_id: format!("{CALL_ID}{}", xmpp::new_id()), sender, outgoing: c.outgoing, body, url: None, ts: now_ms(), status: 2, enc: 0, edited: false, reply_to: None, retracted: false };
         self.push_outgoing(&c.peer, msg);
     }
+}
+
+/// Whether the user can pick what to share: our picker on Windows, the portal on Wayland
+/// (X11 shares the whole desktop).
+pub fn can_pick_screen() -> bool {
+    #[cfg(target_os = "linux")]
+    return crabber::screencast::wayland();
+    #[cfg(not(target_os = "linux"))]
+    return cfg!(windows);
 }
 
 /// Id prefix of local call lines: they are never sent, ticked or marked read.
