@@ -11,6 +11,13 @@ pub fn keep_awake(reason: &str) -> Option<Awake> {
 #[cfg(target_os = "linux")]
 mod imp {
     pub fn keep_awake(reason: &str) -> Option<impl Send + 'static> {
+        // On a plain thread: zbus's blocking API panics on one that drives a tokio runtime
+        // (where the call actor runs).
+        let reason = reason.to_string();
+        std::thread::spawn(move || inhibit(&reason)).join().ok().flatten()
+    }
+
+    fn inhibit(reason: &str) -> Option<std::os::fd::OwnedFd> {
         let bus = zbus::blocking::Connection::system().ok()?;
         let manager = zbus::blocking::Proxy::new(&bus, "org.freedesktop.login1",
             "/org/freedesktop/login1", "org.freedesktop.login1.Manager").ok()?;
@@ -62,6 +69,13 @@ mod imp {
 
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
+    /// The call actor asks from a tokio task: that must not panic (it killed every later call).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn safe_inside_tokio() {
+        let held = tokio::spawn(async { super::keep_awake("Crabber test").is_some() }).await;
+        assert!(held.is_ok(), "keep_awake panicked inside tokio");
+    }
+
     #[test]
     #[ignore = "requires systemd-logind and permission to inhibit sleep"]
     fn logind_inhibitor_is_released() {
@@ -80,3 +94,4 @@ mod tests {
         assert!(!list().contains(&reason));
     }
 }
+

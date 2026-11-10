@@ -8,7 +8,7 @@ use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use futures::StreamExt;
+use futures::{FutureExt as _, StreamExt};
 use futures::channel::mpsc::{UnboundedSender, unbounded};
 use rtc::media::Sample;
 use rtc::media_stream::MediaStreamTrack;
@@ -205,7 +205,10 @@ impl Calls {
         let mut actor = Actor { net, me: me.clone(), tx: tx.clone(), call: None, session: session.clone(), bound: bound.clone() };
         tokio::spawn(async move {
             while let Some(msg) = rx.next().await {
-                actor.handle(msg).await;
+                // A bug in one call must not take every later call with it: drop that call, go on.
+                if std::panic::AssertUnwindSafe(actor.handle(msg)).catch_unwind().await.is_err() {
+                    actor.end(t!("call.reason_dropped")).await;
+                }
             }
         });
         Self { tx, me, session, bound }
