@@ -384,10 +384,15 @@ impl Store {
     }
 
     /// Incoming messages newer than `ts`: the unread count after a read marker.
-    /// Local call lines ("call-" ids) don't count: the marker can never move past them.
+    /// Local call lines and file offers ("call-" / "jingle-" ids) don't count: the marker can never
+    /// move past them.
     pub fn incoming_after(&self, peer: &str, ts: i64) -> u32 {
         self.db
-            .query_row("SELECT COUNT(*) FROM messages WHERE peer=?1 AND outgoing=0 AND ts>?2 AND msg_id NOT LIKE 'call-%'", params![peer, ts], |r| r.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE peer=?1 AND outgoing=0 AND ts>?2 AND msg_id NOT LIKE 'call-%' AND msg_id NOT LIKE 'jingle-%'",
+                params![peer, ts],
+                |r| r.get(0),
+            )
             .unwrap_or(0)
     }
 
@@ -583,7 +588,8 @@ mod tests {
         s.insert_msg("bob", &msg("1", 10, false));
         s.insert_msg("bob", &msg("call-a", 20, false));
         s.insert_msg("bob", &msg("call-b", 30, false));
-        assert_eq!(s.incoming_after("bob", 10), 0, "missed calls are not unread messages");
+        s.insert_msg("bob", &msg("jingle-c", 35, false));
+        assert_eq!(s.incoming_after("bob", 10), 0, "missed calls and file offers are not unread messages");
         s.insert_msg("bob", &msg("2", 40, false));
         assert_eq!(s.incoming_after("bob", 10), 1);
     }

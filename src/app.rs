@@ -1779,7 +1779,7 @@ impl App {
                         .chats
                         .iter()
                         .filter(|c| c.is_room)
-                        .map(|c| (c.peer.clone(), c.nick.clone(), sess.store.last_ts(&c.peer)))
+                        .map(|c| (c.peer.clone(), c.nick.clone(), sess.store.last_ts(&c.peer), sess.store.last_sid(&c.peer)))
                         .collect();
                     sess.send(Cmd::Sync { mam_after: sess.store.get("mam_last"), rooms });
                     if sess.show.is_some() {
@@ -2016,7 +2016,7 @@ impl App {
                 Ev::RoomLost { room } => {
                     if let Some(c) = sess.chat(&room) {
                         let nick = c.nick.clone();
-                        sess.send(Cmd::Join { room: room.clone(), nick, since: sess.store.last_ts(&room), create_name: None });
+                        sess.send(Cmd::Join { room: room.clone(), nick, since: sess.store.last_ts(&room), after: sess.store.last_sid(&room), create_name: None });
                     }
                 }
                 Ev::Retract { peer, id, sender } => {
@@ -2028,7 +2028,7 @@ impl App {
                     if sess.chat(&room).is_none() {
                         let nick = sess.localpart();
                         sess.ensure_chat(&room, true);
-                        sess.send(Cmd::Join { room: room.clone(), nick, since: None, create_name: None });
+                        sess.send(Cmd::Join { room: room.clone(), nick, since: None, after: None, create_name: None });
                         sess.publish_bookmark(&room);
                         notes.push(t!("note.invited", from = from, room = room));
                     }
@@ -2948,7 +2948,7 @@ impl App {
                 let chat = sess.ensure_chat(&room, true);
                 chat.name = v2.clone();
                 sess.save(&room);
-                sess.send(Cmd::Join { room: room.clone(), nick, since: None, create_name: Some(v2) });
+                sess.send(Cmd::Join { room: room.clone(), nick, since: None, after: None, create_name: Some(v2) });
                 sess.publish_bookmark(&room);
                 self.select(room, window, cx);
             }
@@ -2961,7 +2961,7 @@ impl App {
                 let nick = sess.localpart();
                 sess.ensure_chat(&v2, true);
                 sess.save(&v2);
-                sess.send(Cmd::Join { room: v2.clone(), nick, since: sess.store.last_ts(&v2), create_name: None });
+                sess.send(Cmd::Join { room: v2.clone(), nick, since: sess.store.last_ts(&v2), after: sess.store.last_sid(&v2), create_name: None });
                 sess.publish_bookmark(&v2);
                 self.select(v2, window, cx);
             }
@@ -3151,10 +3151,12 @@ fn read_chat(sess: &mut Session, peer: &str) {
     if is_room {
         return;
     }
+    // Local lines (calls, Jingle file offers) were never sent: the peer knows no such id.
+    let marked = |m: &Msg| !m.outgoing && !is_call(m) && !m.msg_id.starts_with(crabber::filetransfer::MSG_PREFIX);
     let last = if sess.selected.as_deref() == Some(peer) {
-        sess.history.iter().rev().find(|m| !m.outgoing && !is_call(m)).map(|m| m.msg_id.clone())
+        sess.history.iter().rev().find(|m| marked(m)).map(|m| m.msg_id.clone())
     } else {
-        sess.store.history(peer, 50).into_iter().rev().find(|m| !m.outgoing && !is_call(m)).map(|m| m.msg_id)
+        sess.store.history(peer, 50).into_iter().rev().find(|m| marked(m)).map(|m| m.msg_id)
     };
     if let Some(id) = last
         && sess.displayed_sent.get(peer) != Some(&id)
@@ -3274,8 +3276,8 @@ fn add_bookmark(sess: &mut Session, b: Bookmark) {
     chat.name = b.name;
     chat.nick = nick.clone();
     sess.save(&b.room);
-    let since = sess.store.last_ts(&b.room);
-    sess.send(Cmd::Join { room: b.room, nick, since, create_name: None });
+    let (since, after) = (sess.store.last_ts(&b.room), sess.store.last_sid(&b.room));
+    sess.send(Cmd::Join { room: b.room, nick, since, after, create_name: None });
 }
 
 /// Room left on another device: leave here too. History stays in the database for a rejoin.

@@ -123,7 +123,7 @@ fn chat_roundtrip() {
 
     // Group chat: alice creates a room, invites bob, bob joins and receives a message.
     let room = format!("g{}@conference.localhost", xmpp::new_id());
-    a.unbounded_send(Cmd::Join { room: room.clone(), nick: "alice".into(), since: None, create_name: Some("Тест".into()) }).unwrap();
+    a.unbounded_send(Cmd::Join { room: room.clone(), nick: "alice".into(), since: None, after: None, create_name: Some("Тест".into()) }).unwrap();
     wait(&mut a_rx, |e| matches!(e, Ev::RoomJoined { room: r, .. } if *r == room).then_some(()));
     a.unbounded_send(Cmd::Invite { room: room.clone(), jid: "bob@localhost".into() }).unwrap();
     let invited = wait(&mut b2_rx, |e| match e {
@@ -131,7 +131,7 @@ fn chat_roundtrip() {
         _ => None,
     });
     assert_eq!(invited, room);
-    b2.unbounded_send(Cmd::Join { room: room.clone(), nick: "bob".into(), since: None, create_name: None }).unwrap();
+    b2.unbounded_send(Cmd::Join { room: room.clone(), nick: "bob".into(), since: None, after: None, create_name: None }).unwrap();
     wait(&mut b2_rx, |e| matches!(e, Ev::RoomJoined { occupants: 2, .. }).then_some(()));
     let gid = xmpp::new_id();
     a.unbounded_send(Cmd::Send { to: room.clone(), id: gid.clone(), body: "всем привет".into(), groupchat: true, enc: "plain".into(), reply: None }).unwrap();
@@ -166,6 +166,50 @@ fn chat_roundtrip() {
     b2.unbounded_send(Cmd::Download { url: url.clone(), path: target.clone() }).unwrap();
     wait(&mut b2_rx, |e| matches!(e, Ev::Downloaded { .. }).then_some(()));
     assert_eq!(std::fs::read(&target).unwrap(), b"hello file");
+}
+
+/// XEP-0313 in a room: bob joins after the fact and gets the history from the room's archive;
+/// rejoining after the newest message he has brings only what he missed.
+#[test]
+#[ignore]
+fn room_history_from_archive() {
+    reset_accounts();
+    let (a, mut a_rx) = login("alice");
+    wait(&mut a_rx, |e| matches!(e, Ev::Online { .. }).then_some(()));
+    let room = format!("h{}@conference.localhost", xmpp::new_id());
+    a.unbounded_send(Cmd::Join { room: room.clone(), nick: "alice".into(), since: None, after: None, create_name: Some("Архив".into()) }).unwrap();
+    wait(&mut a_rx, |e| matches!(e, Ev::RoomJoined { room: r, .. } if *r == room).then_some(()));
+    std::thread::sleep(Duration::from_secs(1)); // the room config (MAM on) is set right after creation
+    let say = |body: &str| {
+        a.unbounded_send(Cmd::Send { to: room.clone(), id: xmpp::new_id(), body: body.into(), groupchat: true, enc: "plain".into(), reply: None }).unwrap();
+    };
+    say("первое");
+    say("второе");
+    std::thread::sleep(Duration::from_secs(1));
+
+    let (b, mut b_rx) = login("bob");
+    wait(&mut b_rx, |e| matches!(e, Ev::Online { .. }).then_some(()));
+    b.unbounded_send(Cmd::Join { room: room.clone(), nick: "bob".into(), since: None, after: None, create_name: None }).unwrap();
+    let mut got = vec![];
+    while got.len() < 2 {
+        got.push(wait(&mut b_rx, |e| match e {
+            Ev::Message { msg, sid: Some(sid), live: false, .. } => Some((msg.body.clone(), sid.clone())),
+            _ => None,
+        }));
+    }
+    assert_eq!(got.iter().map(|g| g.0.as_str()).collect::<Vec<_>>(), ["первое", "второе"]);
+
+    // bob drops out; alice writes; bob comes back after the newest message he has.
+    b.unbounded_send(Cmd::Leave { room: room.clone() }).unwrap();
+    std::thread::sleep(Duration::from_millis(500));
+    say("третье");
+    std::thread::sleep(Duration::from_secs(1));
+    b.unbounded_send(Cmd::Join { room: room.clone(), nick: "bob".into(), since: None, after: Some(got[1].1.clone()), create_name: None }).unwrap();
+    let body = wait(&mut b_rx, |e| match e {
+        Ev::Message { msg, .. } => Some(msg.body.clone()),
+        _ => None,
+    });
+    assert_eq!(body, "третье", "only what bob missed");
 }
 
 /// XEP-0054: alice fills in her profile, then changes her avatar; bob still sees the profile.
@@ -259,11 +303,11 @@ fn group_call_mesh() {
         wait(rx, |e| matches!(e, Ev::Online { .. }).then_some(()));
     }
     let room = format!("g{}@conference.localhost", xmpp::new_id());
-    clients[0].0.unbounded_send(Cmd::Join { room: room.clone(), nick: "alice".into(), since: None, create_name: Some("Звонок".into()) }).unwrap();
+    clients[0].0.unbounded_send(Cmd::Join { room: room.clone(), nick: "alice".into(), since: None, after: None, create_name: Some("Звонок".into()) }).unwrap();
     wait(&mut clients[0].1, |e| matches!(e, Ev::RoomJoined { room: r, .. } if *r == room).then_some(()));
     std::thread::sleep(Duration::from_millis(500)); // room configuration (non-anonymous)
     for (i, (tx, rx)) in clients.iter_mut().enumerate().skip(1) {
-        tx.unbounded_send(Cmd::Join { room: room.clone(), nick: users[i].into(), since: None, create_name: None }).unwrap();
+        tx.unbounded_send(Cmd::Join { room: room.clone(), nick: users[i].into(), since: None, after: None, create_name: None }).unwrap();
         wait(rx, |e| matches!(e, Ev::RoomJoined { room: r, .. } if *r == room).then_some(()));
     }
     std::thread::sleep(Duration::from_millis(500));

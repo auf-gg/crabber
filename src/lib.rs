@@ -6,6 +6,7 @@ pub mod omemo;
 pub mod pgp;
 pub mod connector;
 pub mod e2e;
+pub mod filetransfer;
 pub mod i18n;
 #[cfg(target_os = "linux")]
 pub mod screencast;
