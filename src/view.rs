@@ -28,7 +28,7 @@ use crabber::videocall::Source;
 use crabber::store::{ChatRow, Msg};
 use tokio_xmpp::parsers::presence::Show;
 
-use crate::app::{App, DeviceKind, MediaTab, Modal, Session, Viewer, ext, file_name, is_audio, is_call, is_image, is_text, is_video, my_occupant};
+use crate::app::{App, DeviceKind, MediaTab, Modal, Session, Viewer, ext, file_name, is_audio, is_call, is_image, is_text, is_video, me_action, my_occupant};
 use crate::style;
 use crabber::e2e::DeviceInfo;
 
@@ -593,8 +593,12 @@ fn icon_box(icon: IconName, size: f32) -> Div {
     div().size(dp(size)).flex_none().rounded_md().flex().items_center().justify_center().bg(code_bg()).child(Icon::new(icon))
 }
 
-fn preview(c: &ChatRow) -> String {
+fn preview(sess: &Session, c: &ChatRow) -> String {
     let Some(m) = &c.last else { return String::new() };
+    if let Some(action) = me_action(m) {
+        let full = format!("* {} {action}", action_name(sess, &c.peer, c.is_room, m));
+        return full.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(60).collect();
+    }
     let text = if m.retracted {
         t!("msg.deleted").to_string()
     } else if m.url.is_some() {
@@ -605,6 +609,32 @@ fn preview(c: &ChatRow) -> String {
     let prefix = if is_call(m) { String::new() } else if m.outgoing { format!("{}: ", t!("msg.you")) } else if c.is_room { format!("{}: ", m.sender) } else { String::new() };
     let full = prefix + &text;
     full.chars().take(60).collect()
+}
+
+/// Who did a "/me" action (XEP-0245): the nick in groups, our name or the contact's in a chat.
+fn action_name(sess: &Session, peer: &str, is_room: bool, m: &Msg) -> String {
+    if is_room {
+        m.sender.clone()
+    } else if m.outgoing {
+        sess.localpart()
+    } else {
+        sess.display_name(peer)
+    }
+}
+
+/// Label of `xmpp::PROFILE_FIELDS[i]`.
+fn profile_label(i: usize) -> &'static str {
+    [
+        t!("vcard.name"),
+        t!("vcard.nickname"),
+        t!("vcard.birthday"),
+        t!("vcard.email"),
+        t!("vcard.phone"),
+        t!("vcard.url"),
+        t!("vcard.org"),
+        t!("vcard.title"),
+        t!("vcard.about"),
+    ][i]
 }
 
 impl Render for App {
@@ -626,6 +656,7 @@ impl Render for App {
             .when_some(self.render_encryption(cx), |d, m| d.child(m))
             .when_some(self.render_pgp_import(cx), |d, m| d.child(m))
             .when_some(self.render_profile(cx), |d, m| d.child(m))
+            .when_some(self.render_profile_editor(cx), |d, m| d.child(m))
             .when_some(self.render_call(cx), |d, c| d.child(c))
             .when_some(self.render_viewer(cx), |d, v| d.child(v))
             .when_some(self.render_update(cx), |d, u| d.child(u));
@@ -948,7 +979,7 @@ impl App {
                 let online = sess.presence.contains(&c.peer);
                 let typing = sess.typing.get(&c.peer).is_some_and(|(_, at)| at.elapsed().as_secs() < 30);
                 let peer = c.peer.clone();
-                let sub = if typing { t!("typing").to_string() } else { preview(c) };
+                let sub = if typing { t!("typing").to_string() } else { preview(sess, c) };
                 let locked = c.last.as_ref().is_some_and(|m| m.enc > 0);
                 // The row is filled with the accent: its text must contrast with it (not always white).
                 let on_acc = style::on_color(p.accent);
@@ -1218,10 +1249,7 @@ impl App {
                             .child(div().text_base().font_weight(FontWeight::SEMIBOLD).truncate().child(name))
                             .child(div().text_sm().text_color(if highlight { p.accent } else { p.muted }).child(subtitle)),
                     )
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.modal = Some(Modal::Profile { peer: pr.clone() });
-                        cx.notify();
-                    }))
+                    .on_click(cx.listener(move |this, _, _, cx| this.open_profile(pr.clone(), cx)))
             })
             .when(!chat.is_room, |d| {
                 let to = peer.clone();
@@ -1558,9 +1586,11 @@ impl App {
                     .on_click(cx.listener(move |this, _, _, cx| this.toggle_reaction(&id, &emoji, cx)))
             }))
         });
+        let action = me_action(&m).map(|a| format!("* {} {a}", action_name(sess, sess.selected.as_deref().unwrap_or_default(), is_room, &m)));
         let content = match &m.url {
             _ if m.retracted => h_flex().gap_2().items_center().italic().opacity(0.7).child(Icon::new(IconName::Ban).small()).child(t!("msg.deleted")).into_any_element(),
             _ if is_call(&m) => h_flex().gap_2().items_center().child(Icon::new(IconName::Phone).small()).child(m.body.clone()).into_any_element(),
+            _ if action.is_some() => div().italic().child(rich_text(SharedString::from(format!("me-{}", m.msg_id)).into(), action.as_deref().unwrap_or_default(), code)).into_any_element(),
             Some(url) => self.render_attachment(url, &m, cx),
             None => v_flex()
                 .gap_1()
@@ -1909,6 +1939,7 @@ impl App {
                     .items_center()
                     .child(avatar(sess, &sess.me, &me, 56.))
                     .child(v_flex().flex_1().min_w_0().child(div().font_weight(FontWeight::SEMIBOLD).child(me)).child(div().text_xs().text_color(t.muted_foreground).truncate().child(sess.me.clone())))
+                    .child(Button::new("set-profile").small().outline().label(t!("settings.edit_profile")).on_click(cx.listener(|this, _, _, cx| this.open_profile_editor(cx))))
                     .child(Button::new("set-avatar").small().outline().label(t!("settings.change_avatar")).on_click(cx.listener(|this, _, _, cx| this.change_avatar(cx))))
                     .child(Button::new("set-logout").small().danger().icon(IconName::LogOut).label(t!("settings.logout")).on_click(cx.listener(|this, _, _, cx| this.logout(cx)))),
             )
@@ -2481,6 +2512,12 @@ impl App {
         let has_photo = sess.avatars.contains_key(&peer);
         let (pa, pc, pd) = (peer.clone(), peer.clone(), peer.clone());
         let blocked = sess.blocked.as_ref().map(|b| b.contains(&peer));
+        // The contact's vCard (XEP-0054): only the fields they filled in.
+        let vcard = sess.profiles.get(&peer).filter(|v| !chat.is_room && v.iter().any(|f| !f.is_empty())).map(|v| {
+            v_flex().w_full().pt_3().gap_2().children(v.iter().enumerate().filter(|(_, f)| !f.is_empty()).map(|(i, f)| {
+                v_flex().child(div().text_xs().text_color(p.muted).child(profile_label(i))).child(div().text_sm().child(f.clone()))
+            }))
+        });
         let body = v_flex()
             .items_center()
             .gap_2()
@@ -2509,6 +2546,7 @@ impl App {
                     .child(Icon::new(IconName::Copy).xsmall().text_color(p.muted))
                     .on_click(move |_, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(pc.clone()))),
             )
+            .children(vcard)
             .when(chat.is_room, |d| d.child(self.render_members(&peer, cx)))
             .when_some(blocked.filter(|_| !chat.is_room), |d, blocked| {
                 let (pb, ps) = (peer.clone(), peer.clone());
@@ -2622,6 +2660,24 @@ impl App {
             .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).text_color(p.muted).child(t!("room.members")))
             .child(v_flex().id("members").max_h(dp(220.)).overflow_y_scroll().children(rows))
             .into_any_element()
+    }
+
+    /// Our vCard (XEP-0054), editable once the current one arrived.
+    fn render_profile_editor(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let Some(Modal::EditProfile { loaded }) = self.modal.as_ref() else { return None };
+        let t = cx.theme().clone();
+        let label = |i: usize| div().text_xs().text_color(t.muted_foreground).child(profile_label(i));
+        let body = if *loaded {
+            v_flex()
+                .gap_2()
+                .children(self.profile_inputs.iter().enumerate().map(|(i, input)| v_flex().gap_1().child(label(i)).child(Input::new(input))))
+                .child(v_flex().gap_1().child(label(8)).child(Textarea::new(&self.profile_about)))
+                .child(h_flex().pt_2().justify_end().child(Button::new("profile-save").primary().label(t!("profile.save")).on_click(cx.listener(|this, _, _, cx| this.save_profile(cx)))))
+                .into_any_element()
+        } else {
+            div().py_4().text_sm().text_color(t.muted_foreground).child(t!("profile.loading")).into_any_element()
+        };
+        Some(self.panel("profile-edit", t!("profile.edit_title"), body, cx))
     }
 
     fn render_pgp_import(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
@@ -3127,7 +3183,7 @@ impl App {
     }
 
     fn render_modal(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let modal = self.modal.as_ref().filter(|m| !matches!(m, Modal::Settings | Modal::Media { .. } | Modal::Encryption { .. } | Modal::PgpImport { .. } | Modal::Profile { .. }))?;
+        let modal = self.modal.as_ref().filter(|m| !matches!(m, Modal::Settings | Modal::Media { .. } | Modal::Encryption { .. } | Modal::PgpImport { .. } | Modal::Profile { .. } | Modal::EditProfile { .. }))?;
         let t = cx.theme().clone();
         let sess = self.sess.as_ref()?;
         let (title, body): (&str, AnyElement) = match modal {
@@ -3212,7 +3268,7 @@ impl App {
                 let text = if room { t!("modal.leave_text") } else { t!("modal.delete_text") };
                 (t!("modal.confirm"), div().child(text).into_any_element())
             }
-            Modal::Settings | Modal::Media { .. } | Modal::Encryption { .. } | Modal::PgpImport { .. } | Modal::Profile { .. } => return None,
+            Modal::Settings | Modal::Media { .. } | Modal::Encryption { .. } | Modal::PgpImport { .. } | Modal::Profile { .. } | Modal::EditProfile { .. } => return None,
         };
         let confirm = match modal {
             Modal::Invite { .. } | Modal::ScreenPicker { .. } => None,
@@ -3955,6 +4011,18 @@ mod tests {
         assert_eq!(initials("bitcoin_casino"), "BC");
         assert_eq!(initials("Bob"), "B");
         assert_eq!(initials("иван петров"), "ИП");
+    }
+
+    #[test]
+    fn me_command_matches_only_the_prefix() {
+        let m = |body: &str| crabber::store::Msg { msg_id: "1".into(), sender: "a".into(), outgoing: false, body: body.into(), url: None, ts: 0, status: 0, enc: 0, edited: false, reply_to: None, retracted: false };
+        assert_eq!(super::me_action(&m("/me shrugs in disgust")), Some("shrugs in disgust"));
+        // XEP-0245 example 4: none of these is an action.
+        for body in ["/meshrugs in disgust", "/me's disgusted", " /me shrugs in disgust", "\"/me shrugs\"", "Why did Atlas say \"/me shrugs\"?"] {
+            assert_eq!(super::me_action(&m(body)), None, "{body}");
+        }
+        assert_eq!(super::me_action(&crabber::store::Msg { retracted: true, ..m("/me waves") }), None);
+        assert_eq!(super::me_action(&crabber::store::Msg { msg_id: "call-1".into(), ..m("/me waves") }), None);
     }
 
     #[test]

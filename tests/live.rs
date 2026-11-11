@@ -168,6 +168,45 @@ fn chat_roundtrip() {
     assert_eq!(std::fs::read(&target).unwrap(), b"hello file");
 }
 
+/// XEP-0054: alice fills in her profile, then changes her avatar; bob still sees the profile.
+#[test]
+#[ignore]
+fn vcard_profile_survives_avatar_change() {
+    reset_accounts();
+    let (a, mut a_rx) = login("alice");
+    let (b, mut b_rx) = login("bob");
+    wait(&mut a_rx, |e| matches!(e, Ev::Online { .. }).then_some(()));
+    wait(&mut b_rx, |e| matches!(e, Ev::Online { .. }).then_some(()));
+
+    let mut profile = xmpp::Profile::default();
+    profile[0] = "Алиса".into();
+    profile[3] = "alice@example.com".into();
+    profile[8] = "строка 1\nстрока 2".into();
+    a.unbounded_send(Cmd::SetProfile(profile.clone())).unwrap();
+    wait(&mut a_rx, |e| match e {
+        Ev::Profile { jid, profile: Some(_) } if jid == "alice@localhost" => Some(()),
+        Ev::Error(e) => panic!("{e}"),
+        _ => None,
+    });
+
+    // 1×1 PNG.
+    let png = std::env::temp_dir().join("re-avatar.png");
+    std::fs::write(&png, b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR\0\0\0\x01\0\0\0\x01\x08\x06\0\0\0\x1f\x15\xc4\x89\0\0\0\nIDATx\x9cc\0\x01\0\0\x05\0\x01\r\n-\xb4\0\0\0\0IEND\xaeB`\x82").unwrap();
+    a.unbounded_send(Cmd::SetAvatar(png)).unwrap();
+    wait(&mut a_rx, |e| match e {
+        Ev::Avatar { jid } if jid == "alice@localhost" => Some(()),
+        Ev::Error(e) => panic!("{e}"),
+        _ => None,
+    });
+
+    b.unbounded_send(Cmd::GetProfile { jid: "alice@localhost".into() }).unwrap();
+    let seen = wait(&mut b_rx, |e| match e {
+        Ev::Profile { jid, profile } if jid == "alice@localhost" => Some(profile.clone()),
+        _ => None,
+    });
+    assert_eq!(seen, Some(profile));
+}
+
 #[test]
 #[ignore]
 fn audio_call_connects() {

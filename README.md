@@ -67,7 +67,7 @@ against the client requirements of the [XMPP Compliance Suites 2023](https://xmp
 | [0027](https://xmpp.org/extensions/xep-0027.html) | Current Jabber OpenPGP Usage | ✅ | Text only, no files; obsolete at the XSF, but still the PGP most clients speak |
 | [0030](https://xmpp.org/extensions/xep-0030.html) | Service Discovery | ✅ | |
 | [0045](https://xmpp.org/extensions/xep-0045.html) | Multi-User Chat | ✅ | Join, create, invite; kick, ban, moderator role from the group card |
-| [0054](https://xmpp.org/extensions/xep-0054.html) | vcard-temp | 🟡 | Avatars only |
+| [0054](https://xmpp.org/extensions/xep-0054.html) | vcard-temp | ✅ | Profile in the contact card, own profile edited in settings; avatars |
 | [0066](https://xmpp.org/extensions/xep-0066.html) | Out of Band Data | ✅ | |
 | [0084](https://xmpp.org/extensions/xep-0084.html) | User Avatar (PEP) | ✅ | Ours is published to both PEP and vCard |
 | [0085](https://xmpp.org/extensions/xep-0085.html) | Chat State Notifications | ✅ | Typing indicator |
@@ -84,6 +84,7 @@ against the client requirements of the [XMPP Compliance Suites 2023](https://xmp
 | [0203](https://xmpp.org/extensions/xep-0203.html) | Delayed Delivery | ✅ | |
 | [0215](https://xmpp.org/extensions/xep-0215.html) | External Service Discovery | ✅ | STUN/TURN for calls |
 | [0223](https://xmpp.org/extensions/xep-0223.html) | Persistent Storage of Private Data via PubSub | ✅ | Private bookmarks and read markers; open OMEMO bundles |
+| [0245](https://xmpp.org/extensions/xep-0245.html) | The /me Command | ✅ | Shown as an action in the chat, the chat list and notifications |
 | [0249](https://xmpp.org/extensions/xep-0249.html) | Direct MUC Invitations | ✅ | |
 | [0272](https://xmpp.org/extensions/xep-0272.html) | Multiparty Jingle (Muji) | ✅ | Group audio calls in a room, peer-to-peer mesh; call negotiated in the room itself (as Movim 0.34), no XEP-0482 invites |
 | [0280](https://xmpp.org/extensions/xep-0280.html) | Message Carbons | ✅ | |
@@ -117,16 +118,14 @@ against the client requirements of the [XMPP Compliance Suites 2023](https://xmp
 
 ### To do
 
-**Core**, **Advanced**: client levels of the Compliance Suites 2023 · **Recommended**: named there
-as worth supporting · **Modern clients**: not required by the suites, but most current clients use it
+Crabber covers the **Core** client level of the Compliance Suites 2023. **Advanced**: their next level ·
+**Recommended**: named there as worth supporting · **Modern clients**: not required by the suites, but most current clients use it
 
 | XEP | Name | Needed for | Notes |
 | --- | --- | --- | --- |
-| [0054](https://xmpp.org/extensions/xep-0054.html) | vcard-temp | Core | Contact profile beyond the avatar |
 | [0077](https://xmpp.org/extensions/xep-0077.html) | In-Band Registration | Recommended | Create an account from the login screen |
 | [0172](https://xmpp.org/extensions/xep-0172.html) | User Nickname | Modern clients | Names contacts pick for themselves, nick in subscription requests |
 | [0234](https://xmpp.org/extensions/xep-0234.html) | Jingle File Transfer | Advanced | Peer-to-peer files. HTTP Upload covers the usual case; Gajim dropped Jingle file transfer, Monal won't add it |
-| [0245](https://xmpp.org/extensions/xep-0245.html) | The /me Command | Core | |
 | [0261](https://xmpp.org/extensions/xep-0261.html) | Jingle In-Band Bytestreams Transport Method | Advanced | Transport for XEP-0234, over XEP-0047 |
 | [0313](https://xmpp.org/extensions/xep-0313.html) | Message Archive Management | Advanced | Room history from the room's own archive |
 | [0368](https://xmpp.org/extensions/xep-0368.html) | SRV records for XMPP over TLS | Advanced | Direct TLS; STARTTLS only now |

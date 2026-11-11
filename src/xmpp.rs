@@ -146,6 +146,10 @@ pub enum Cmd {
     Invite { room: String, jid: String },
     SetShow(Option<Show>),
     SetAvatar(PathBuf),
+    /// XEP-0054: asks for `Ev::Profile` of a JID (our own JID: our vCard).
+    GetProfile { jid: String },
+    /// XEP-0054: new values of our vCard fields; the rest of the vCard stays.
+    SetProfile(Profile),
     /// Asks for `Ev::E2eDevices` of a JID (our own JID lists our devices).
     E2eInfo { jid: String },
     E2eTrust { jid: String, device: u32, trusted: bool },
@@ -202,6 +206,8 @@ pub enum Ev {
     Retract { peer: String, id: String, sender: Option<String> },
     Invite { room: String, from: String },
     Avatar { jid: String },
+    /// XEP-0054 fields of `jid`'s vCard; `None` when it could not be fetched.
+    Profile { jid: String, profile: Option<Profile> },
     Uploaded { peer: String, id: String, url: String },
     SendFailed { peer: String, id: String, error: String },
     Downloaded { url: String },
@@ -795,10 +801,7 @@ impl State {
                 let (net, dir, me) = (self.net.clone(), self.dir.clone(), self.me.to_string());
                 tokio::spawn(async move {
                     let Ok(data) = tokio::fs::read(&path).await else { return };
-                    let vcard = VCard {
-                        photo: Some(Photo { type_: PhotoType { data: mime(&path).into() }, binval: Binval { data: data.clone() } }),
-                        payloads: vec![],
-                    };
+                    let photo: Element = Photo { type_: PhotoType { data: mime(&path).into() }, binval: Binval { data: data.clone() } }.into();
                     let hash = caps::hash_caps(&data, Algo::Sha_1).map(|h| h.to_hex()).unwrap_or_default();
                     let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &data);
                     let pep = publish(&net, ns::AVATAR_DATA, &hash, Element::builder("data", ns::AVATAR_DATA).append(b64).build()).await;
@@ -806,12 +809,43 @@ impl State {
                         let info = Element::builder("info", ns::AVATAR_METADATA).attr(nc("id"), hash.as_str()).attr(nc("bytes"), data.len().to_string()).attr(nc("type"), mime(&path));
                         let _ = publish(&net, ns::AVATAR_METADATA, &hash, Element::builder("metadata", ns::AVATAR_METADATA).append(info).build()).await;
                     }
-                    match net.iq(None, IqRequest::Set(vcard.into())).await {
+                    // A vCard set replaces it whole: keep the name, phone and the rest.
+                    let set = match get_vcard(&net, None).await {
+                        Ok(mut vcard) => {
+                            while vcard.remove_child("PHOTO", ns::VCARD).is_some() {}
+                            vcard.append_child(photo);
+                            net.iq(None, IqRequest::Set(vcard)).await
+                        }
+                        Err(e) => Err(e),
+                    };
+                    match set {
                         Ok(_) => {
                             let _ = tokio::fs::write(store::avatar_path(&dir, &me), data).await;
                             net.emit(Ev::Avatar { jid: me });
                         }
                         Err(e) => net.emit(Ev::Error(t!("err.avatar_failed", e = e))),
+                    }
+                });
+            }
+            Cmd::GetProfile { jid: who } => {
+                let Some(j) = jid(&who) else { return };
+                let to = (j != self.me).then(|| Jid::from(j));
+                let net = self.net.clone();
+                tokio::spawn(async move {
+                    let profile = get_vcard(&net, to).await.ok().map(|v| parse_profile(&v));
+                    net.emit(Ev::Profile { jid: who, profile });
+                });
+            }
+            Cmd::SetProfile(profile) => {
+                let (net, me) = (self.net.clone(), self.me.to_string());
+                tokio::spawn(async move {
+                    let set = match get_vcard(&net, None).await {
+                        Ok(vcard) => net.iq(None, IqRequest::Set(update_vcard(&vcard, &profile))).await,
+                        Err(e) => Err(e),
+                    };
+                    match set {
+                        Ok(_) => net.emit(Ev::Profile { jid: me, profile: Some(profile) }),
+                        Err(e) => net.emit(Ev::Error(t!("err.profile_failed", e = e))),
                     }
                 });
             }
@@ -1676,6 +1710,78 @@ async fn fetch_avatar(net: &Net, dir: &std::path::Path, who: &str) {
     }
 }
 
+/// vCard fields we show and edit (XEP-0054), in display order: the element and, when the value
+/// sits in a child of it, that child. Everything else in a vCard is left as it is.
+pub const PROFILE_FIELDS: [(&str, Option<&str>); 9] = [
+    ("FN", None),
+    ("NICKNAME", None),
+    ("BDAY", None),
+    ("EMAIL", Some("USERID")),
+    ("TEL", Some("NUMBER")),
+    ("URL", None),
+    ("ORG", Some("ORGNAME")),
+    ("TITLE", None),
+    ("DESC", None),
+];
+
+/// Values of `PROFILE_FIELDS`, "" when unset.
+pub type Profile = [String; 9];
+
+/// The vCard of `to` (ours with `None`); an account that never set one has an empty vCard.
+async fn get_vcard(net: &Net, to: Option<Jid>) -> Result<Element, String> {
+    match net.iq(to, IqRequest::Get(VCardQuery.into())).await {
+        Ok(Some(el)) => Ok(el),
+        Ok(None) => Ok(Element::builder("vCard", ns::VCARD).build()),
+        Err(e) if e == "ItemNotFound" => Ok(Element::builder("vCard", ns::VCARD).build()),
+        Err(e) => Err(e),
+    }
+}
+
+/// Our fields of a vCard; of repeated ones (several EMAILs) the first.
+pub fn parse_profile(vcard: &Element) -> Profile {
+    PROFILE_FIELDS.map(|(name, child)| {
+        let Some(el) = vcard.get_child(name, ns::VCARD) else { return String::new() };
+        // Some clients put the address straight into <EMAIL>.
+        child.and_then(|c| el.get_child(c, ns::VCARD)).unwrap_or(el).text().trim().to_string()
+    })
+}
+
+/// `vcard` with our fields set to `new`. An unchanged field keeps its elements as they are (type
+/// flags, further EMAILs); a changed one replaces only the first of its kind.
+pub fn update_vcard(vcard: &Element, new: &Profile) -> Element {
+    let old = parse_profile(vcard);
+    let changed = |i: usize| old[i] != new[i];
+    let mut done = [false; 9];
+    let mut out = Element::builder("vCard", ns::VCARD).build();
+    for el in vcard.children() {
+        match PROFILE_FIELDS.iter().position(|(name, _)| el.is(*name, ns::VCARD)) {
+            Some(i) if changed(i) && !done[i] => {
+                done[i] = true;
+                if !new[i].is_empty() {
+                    out.append_child(vcard_field(Some(el), i, &new[i]));
+                }
+            }
+            _ => {
+                out.append_child(el.clone());
+            }
+        }
+    }
+    for i in (0..new.len()).filter(|&i| changed(i) && !done[i] && !new[i].is_empty()) {
+        out.append_child(vcard_field(None, i, &new[i]));
+    }
+    out
+}
+
+/// Field `i` holding `value`; `old` lends its type flags (HOME, WORK...) when the value sits in a child.
+fn vcard_field(old: Option<&Element>, i: usize, value: &str) -> Element {
+    let (name, child) = PROFILE_FIELDS[i];
+    let Some(child) = child else { return Element::builder(name, ns::VCARD).append(value).build() };
+    let mut el = old.filter(|o| o.has_child(child, ns::VCARD)).cloned().unwrap_or_else(|| Element::builder(name, ns::VCARD).build());
+    el.remove_child(child, ns::VCARD);
+    el.append_child(Element::builder(child, ns::VCARD).append(value).build());
+    el
+}
+
 async fn discover_upload(net: &Net, domain: &str) -> Option<Jid> {
     let server = Jid::from_str(domain).ok()?;
     let items = net.iq(Some(server.clone()), IqRequest::Get(DiscoItemsQuery { node: None, rsm: None }.into())).await.ok()??;
@@ -1762,5 +1868,34 @@ mod caps_tests {
         let b = super::bookmark(&item("true")).unwrap();
         assert_eq!((b.room.as_str(), b.name.as_str(), b.nick.as_str()), ("r@muc.x", "Room", "me"));
         assert!(super::bookmark(&item("false")).is_none(), "not autojoin = left");
+    }
+
+    #[test]
+    fn vcard_profile_edit_keeps_the_rest() {
+        let vcard: super::Element = "<vCard xmlns='vcard-temp'>\
+            <FN>Juliet</FN>\
+            <EMAIL><HOME/><USERID>j@home.lit</USERID></EMAIL>\
+            <EMAIL><WORK/><USERID>j@work.lit</USERID></EMAIL>\
+            <TEL>5551234</TEL>\
+            <ADR><LOCALITY>Verona</LOCALITY></ADR>\
+            <PHOTO><TYPE>image/png</TYPE><BINVAL>AAAA</BINVAL></PHOTO>\
+            </vCard>"
+            .parse()
+            .unwrap();
+        let p = super::parse_profile(&vcard);
+        assert_eq!((p[0].as_str(), p[3].as_str(), p[4].as_str(), p[1].as_str()), ("Juliet", "j@home.lit", "5551234", ""), "first EMAIL; bare TEL text");
+
+        let mut new = p.clone();
+        new[0] = String::new();
+        new[1] = "Jules".into();
+        new[3] = "j@new.lit".into();
+        let out = super::update_vcard(&vcard, &new);
+        assert_eq!(super::parse_profile(&out), new);
+        let names: Vec<&str> = out.children().map(|c| c.name()).collect();
+        assert_eq!(names, ["EMAIL", "EMAIL", "TEL", "ADR", "PHOTO", "NICKNAME"], "FN dropped, NICKNAME added, the rest kept in place");
+        let emails: Vec<_> = out.children().filter(|c| c.name() == "EMAIL").collect();
+        assert!(emails[0].has_child("HOME", "vcard-temp"), "the edited EMAIL keeps its type");
+        assert_eq!(emails[1].get_child("USERID", "vcard-temp").unwrap().text(), "j@work.lit", "the second EMAIL is untouched");
+        assert_eq!(out.get_child("TEL", "vcard-temp").unwrap(), vcard.get_child("TEL", "vcard-temp").unwrap(), "unchanged fields stay as they were");
     }
 }

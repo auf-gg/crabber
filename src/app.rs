@@ -93,6 +93,8 @@ pub enum Modal {
     ConfirmRetract { msg: Msg, moderate: bool },
     /// Contact / group card opened from the chat header.
     Profile { peer: String },
+    /// Our vCard; the fields fill in once the server sent the current one (`loaded`).
+    EditProfile { loaded: bool },
     /// What to share: monitors and windows (Windows has no system picker).
     ScreenPicker { targets: Vec<crabber::screens::ScreenTarget> },
 }
@@ -419,6 +421,8 @@ pub struct Session {
     pub blocked: Option<HashSet<String>>,
     /// Room -> nick -> occupant (roles for moderation).
     pub members: HashMap<String, HashMap<String, Occupant>>,
+    /// XEP-0054 vCard fields, fetched when a contact card (or our editor) opens.
+    pub profiles: HashMap<String, xmpp::Profile>,
 }
 
 impl Session {
@@ -602,6 +606,9 @@ pub struct App {
     pub field2: Entity<InputState>,
     /// Multi-line field for pasting keys.
     pub field3: Entity<TextareaState>,
+    /// Our vCard editor: one line per `xmpp::PROFILE_FIELDS` entry but the last, which is `profile_about`.
+    pub profile_inputs: Vec<Entity<InputState>>,
+    pub profile_about: Entity<TextareaState>,
     pub modal: Option<Modal>,
     pub messages: ListState,
     pub viewer: Option<Viewer>,
@@ -731,6 +738,11 @@ impl App {
         let field1 = cx.new(|cx| InputState::new(window, cx));
         let field2 = cx.new(|cx| InputState::new(window, cx));
         let field3 = cx.new(|cx| TextareaState::new(window, cx).placeholder("-----BEGIN PGP ... KEY BLOCK-----").rows(8));
+        let profile_inputs = xmpp::PROFILE_FIELDS[..8]
+            .iter()
+            .map(|(name, _)| cx.new(|cx| InputState::new(window, cx).placeholder(if *name == "BDAY" { "YYYY-MM-DD" } else { "" })))
+            .collect();
+        let profile_about = cx.new(|cx| TextareaState::new(window, cx).rows(3));
 
         let messages = ListState::new(0, ListAlignment::Top, px(600.));
         messages.set_follow_mode(FollowMode::Tail);
@@ -817,6 +829,8 @@ impl App {
             field1,
             field2,
             field3,
+            profile_inputs,
+            profile_about,
             modal: None,
             messages,
             viewer: None,
@@ -1138,6 +1152,7 @@ impl App {
             mds: HashMap::new(),
             blocked: None,
             members: HashMap::new(),
+            profiles: HashMap::new(),
         };
         for peer in sess.chats.iter().map(|c| c.peer.clone()).chain([jid]).collect::<Vec<_>>() {
             sess.load_avatar(&peer);
@@ -1629,6 +1644,50 @@ impl App {
         cx.notify();
     }
 
+    /// Contact / group card; a contact's vCard is fetched afresh each time.
+    pub fn open_profile(&mut self, peer: String, cx: &mut Context<Self>) {
+        if let Some(sess) = &self.sess
+            && sess.chat(&peer).is_none_or(|c| !c.is_room)
+        {
+            sess.send(Cmd::GetProfile { jid: peer.clone() });
+        }
+        self.modal = Some(Modal::Profile { peer });
+        cx.notify();
+    }
+
+    /// Our vCard editor. It waits for the server's current vCard: another device may have changed it.
+    pub fn open_profile_editor(&mut self, cx: &mut Context<Self>) {
+        let Some(sess) = self.sess.as_mut() else { return };
+        sess.profiles.remove(&sess.me);
+        sess.send(Cmd::GetProfile { jid: sess.me.clone() });
+        self.modal = Some(Modal::EditProfile { loaded: false });
+        cx.notify();
+    }
+
+    fn fill_profile_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(Modal::EditProfile { loaded: false }) = self.modal else { return };
+        let Some(p) = self.sess.as_ref().and_then(|s| s.profiles.get(&s.me)).cloned() else { return };
+        for (input, value) in self.profile_inputs.iter().zip(&p) {
+            input.update(cx, |s, cx| s.set_value(value.clone(), window, cx));
+        }
+        self.profile_about.update(cx, |s, cx| s.set_value(p[8].clone(), window, cx));
+        self.modal = Some(Modal::EditProfile { loaded: true });
+    }
+
+    pub fn save_profile(&mut self, cx: &mut Context<Self>) {
+        let Some(Modal::EditProfile { loaded: true }) = self.modal else { return };
+        let mut p = xmpp::Profile::default();
+        for (v, input) in p.iter_mut().zip(&self.profile_inputs) {
+            *v = input.read(cx).value().trim().to_string();
+        }
+        p[8] = self.profile_about.read(cx).value().trim().to_string();
+        if let Some(sess) = &self.sess {
+            sess.send(Cmd::SetProfile(p));
+        }
+        self.modal = Some(Modal::Settings);
+        cx.notify();
+    }
+
     /// "auto" | "omemo" | "plain" (| "pgp")
     pub fn set_chat_enc(&mut self, peer: &str, mode: &str, cx: &mut Context<Self>) {
         let Some(sess) = self.sess.as_mut() else { return };
@@ -1797,7 +1856,10 @@ impl App {
                             Some(u) if is_image(u) => t!("media.photo").to_string(),
                             Some(u) if is_audio(u) => t!("media.voice").to_string(),
                             Some(_) => t!("media.file").to_string(),
-                            None if notify_text => msg.body.clone(),
+                            None if notify_text => match me_action(&msg) {
+                                Some(action) => format!("* {} {action}", if groupchat { msg.sender.clone() } else { sess.display_name(&peer) }),
+                                None => msg.body.clone(),
+                            },
                             None => t!("notify.new_message").to_string(),
                         };
                         desktop::notify(&peer, &title, &body, Some(&store::avatar_path(&sess.dir, &peer)));
@@ -1972,6 +2034,16 @@ impl App {
                     }
                 }
                 Ev::Avatar { jid } => sess.load_avatar(&jid),
+                Ev::Profile { jid, profile: Some(p) } => {
+                    sess.profiles.insert(jid, p);
+                }
+                Ev::Profile { jid, profile: None } => {
+                    // Without the current vCard, saving the editor would wipe what we could not show.
+                    if jid == sess.me && matches!(self.modal, Some(Modal::EditProfile { loaded: false })) {
+                        self.modal = Some(Modal::Settings);
+                        notes.push(t!("err.profile_load").to_string());
+                    }
+                }
                 Ev::Uploaded { peer, id, url } => {
                     sess.store.set_url(&peer, &id, &url);
                     if let Some(src) = sess.uploads.remove(&id) {
@@ -2096,6 +2168,7 @@ impl App {
         }
         self.connecting = false;
         if let Some(window) = window.as_deref_mut() {
+            self.fill_profile_editor(window, cx);
             for n in notes {
                 window.push_notification(n, cx);
             }
@@ -3053,6 +3126,11 @@ const CALL_ID: &str = "call-";
 
 pub fn is_call(m: &Msg) -> bool {
     m.msg_id.starts_with(CALL_ID)
+}
+
+/// XEP-0245: what a "/me waves" message does ("waves"), shown after the sender's name.
+pub fn me_action(m: &Msg) -> Option<&str> {
+    m.body.strip_prefix("/me ").filter(|_| m.url.is_none() && !m.retracted && !is_call(m))
 }
 
 /// Clears the unread counter and sends a read marker for the newest incoming message.
