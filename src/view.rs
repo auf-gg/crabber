@@ -657,6 +657,28 @@ impl Render for App {
             .when_some(self.render_msg_menu(window, cx), |d, m| d.child(m))
             .when_some(self.render_emoji_picker(window, cx), |d, m| d.child(m))
             .when_some(self.render_viewer_menu(cx), |d, m| d.child(m))
+            // Full screen hides the title bar; the mouse at the top edge slides it down over the
+            // call until it leaves the bar.
+            .when(cfg!(windows) && self.call_fullscreen, |d| {
+                let peek = self.titlebar_peek;
+                d.child(
+                    div()
+                        .id("titlebar-peek")
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .right_0()
+                        .when(!peek, |d| d.h(dp(6.)))
+                        .when(peek, |d| d.shadow_lg().child(self.render_titlebar(window, cx)))
+                        .occlude()
+                        .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                            if this.titlebar_peek != *hovered {
+                                this.titlebar_peek = *hovered;
+                                cx.notify();
+                            }
+                        })),
+                )
+            })
     }
 }
 
@@ -669,6 +691,7 @@ impl App {
         let offline = self.sess.as_ref().is_some_and(|s| s.ever_online && !s.online);
         // Glyphs drawn here (Windows 11 style): the component icon set is not bundled in our assets.
         let glyph = p.text.opacity(0.85);
+        let fullscreen = self.call_fullscreen;
         let line = |w: f32, h: f32| div().w(dp(w)).h(px(h)).bg(glyph);
         let square = |sz: f32| div().size(dp(sz)).border_1().border_color(glyph).rounded(px(1.5));
         let control = |id: &'static str, glyph_el: AnyElement, area: WindowControlArea, close: bool| {
@@ -682,10 +705,10 @@ impl App {
                 .text_color(p.text)
                 .when(close, |d| d.hover(|d| d.bg(rgb(0xE81123)).text_color(white())))
                 .when(!close, |d| d.hover(|d| d.bg(p.hover)))
-                .window_control_area(area)
+                .when(!fullscreen, |d| d.window_control_area(area))
                 .child(glyph_el)
         };
-        let maximized = window.is_maximized();
+        let maximized = window.is_maximized() || fullscreen;
         let max_glyph = if maximized {
             div()
                 .relative()
@@ -711,7 +734,8 @@ impl App {
                     .pl_3()
                     .gap_2()
                     .items_center()
-                    .window_control_area(WindowControlArea::Drag)
+                    // A full-screen window isn't dragged around.
+                    .when(!fullscreen, |d| d.window_control_area(WindowControlArea::Drag))
                     .child(img(self.logo.clone()).size(dp(20.)))
                     .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).child("Crabber"))
                     .when(unread > 0, |d| {
@@ -720,9 +744,20 @@ impl App {
                     .when(offline, |d| d.child(div().text_xs().text_color(p.muted).child(t!("titlebar.connecting"))))
                     .when(self.settings.ui_scale != 1.0, |d| d.child(div().text_xs().text_color(p.muted).child(format!("· {:.0}%", self.settings.ui_scale * 100.)))),
             )
-            .child(control("win-min", line(10., 1.).into_any_element(), WindowControlArea::Min, false))
-            .child(control("win-max", max_glyph, WindowControlArea::Max, false))
-            .child(control("win-close", Icon::new(IconName::X).size(dp(15.)).into_any_element(), WindowControlArea::Close, true))
+            // Full screen turns the system hit-test areas off, so there the buttons act themselves;
+            // the middle one leaves full screen.
+            .child(
+                control("win-min", line(10., 1.).into_any_element(), WindowControlArea::Min, false)
+                    .when(fullscreen, |d| d.on_click(|_, w, _| w.minimize_window())),
+            )
+            .child(control("win-max", max_glyph, WindowControlArea::Max, false).when(fullscreen, |d| {
+                d.tooltip(|w, cx| Tooltip::new(t!("call.exit_fullscreen")).build(w, cx))
+                    .on_click(cx.listener(|this, _, w, cx| this.set_call_fullscreen(false, w, cx)))
+            }))
+            .child(
+                control("win-close", Icon::new(IconName::X).size(dp(15.)).into_any_element(), WindowControlArea::Close, true)
+                    .when(fullscreen, |d| d.on_click(cx.listener(|this, _, w, cx| this.close_window(w, cx)))),
+            )
             .into_any_element()
     }
 
@@ -787,6 +822,7 @@ impl App {
     }
 
     fn render_main(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        self.restore_call_view(window, cx);
         if self.call_expanded {
             match self.render_call_panel(cx) {
                 Some(panel) => return panel,
@@ -3585,10 +3621,7 @@ impl App {
                     .content_center()
                     .children([true, false].map(|peer| {
                         tile(peer).w(px(w)).h(px(h)).when(shows(peer), |d| {
-                            d.on_click(cx.listener(move |this, _, _, cx| {
-                                this.call_focus = Some(peer);
-                                cx.notify();
-                            }))
+                            d.on_click(cx.listener(move |this, _, _, cx| this.set_call_focus(Some(peer), cx)))
                         })
                     }))
                     .into_any_element()
@@ -3600,10 +3633,7 @@ impl App {
                     tile(focus)
                         .size_full()
                         .when(edge, |d| d.rounded_none().border_0().bg(black()))
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.call_focus = None;
-                            cx.notify();
-                        })),
+                        .on_click(cx.listener(|this, _, _, cx| this.set_call_focus(None, cx))),
                 )
                 .when(!self.call_hide_others, |d| {
                     d.child(
@@ -3615,10 +3645,7 @@ impl App {
                         .h(dp(108.))
                         .shadow_lg()
                         .when(shows(!focus), |d| {
-                            d.on_click(cx.listener(move |this, _, _, cx| {
-                                this.call_focus = Some(!focus);
-                                cx.notify();
-                            }))
+                            d.on_click(cx.listener(move |this, _, _, cx| this.set_call_focus(Some(!focus), cx)))
                         }),
                     )
                 })
@@ -3757,11 +3784,12 @@ impl App {
             })
         };
         let expand_menu = {
-            let (this, fullscreen) = (this.clone(), self.call_fullscreen);
+            // An option: expanding then takes the whole screen.
+            let (this, fullscreen) = (this.clone(), self.settings.call_view.fullscreen);
             menu_chevron("call-expand-menu", this.clone(), open("call-expand-menu"), colors, cx, move |menu, _, _| {
                 let this = this.clone();
                 menu.item(check_item(t!("call.fullscreen"), fullscreen).on_click(move |_, w, cx| {
-                    let _ = this.update(cx, |app, cx| app.set_call_fullscreen(!fullscreen, w, cx));
+                    let _ = this.update(cx, |app, cx| app.set_fullscreen_option(!fullscreen, w, cx));
                 }))
             })
         };
@@ -3811,10 +3839,7 @@ impl App {
                 d.child(
                     round("call-others", if hidden { IconName::UserX } else { IconName::Users }, card, false)
                         .tooltip(tip(if hidden { t!("call.show_others") } else { t!("call.hide_others") }))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.call_hide_others = !hidden;
-                            cx.notify();
-                        })),
+                        .on_click(cx.listener(move |this, _, _, cx| this.set_call_hide_others(!hidden, cx))),
                 )
             })
             .when(!expanded, |d| {
@@ -4075,7 +4100,7 @@ mod tests {
 #[cfg(test)]
 mod frame_bench {
     use gpui_kit::prelude::FluentBuilder as _;
-    use gpui_kit::{AppContext as _, Context, IntoElement, ListAlignment, ListState, ParentElement as _, Render, Styled as _, TestAppContext, Window, black, div, list, px};
+    use gpui_kit::{Context, IntoElement, ListAlignment, ListState, ParentElement as _, Render, Styled as _, TestAppContext, Window, black, div, list, px};
     struct V(ListState, bool);
     impl Render for V {
         fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {

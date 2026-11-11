@@ -150,6 +150,42 @@ pub struct Settings {
     /// Screen share: resolution sent, and whether system audio goes with it.
     pub share_quality: crabber::videocall::Quality,
     pub share_audio: bool,
+    /// How the last call was watched, brought back once the next one shows the peer's picture.
+    pub call_view: CallView,
+}
+
+/// The call panel layout the user chose: enlarged tile, other tiles hidden, panel over the window
+/// or the whole screen.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct CallView {
+    /// Some(true): the peer's tile enlarged; Some(false): ours.
+    pub focus: Option<bool>,
+    pub hide_others: bool,
+    pub expanded: bool,
+    pub fullscreen: bool,
+}
+
+impl CallView {
+    fn load(s: &Store) -> Self {
+        let on = |k: &str| s.get(k).is_some_and(|v| v == "1");
+        Self {
+            focus: match s.get("call_focus").as_deref() {
+                Some("peer") => Some(true),
+                Some("self") => Some(false),
+                _ => None,
+            },
+            hide_others: on("call_hide_others"),
+            expanded: on("call_expanded"),
+            fullscreen: on("call_fullscreen"),
+        }
+    }
+    fn save(&self, s: &Store) {
+        let b = |v: bool| if v { "1" } else { "0" };
+        s.set("call_focus", match self.focus { Some(true) => "peer", Some(false) => "self", None => "" });
+        s.set("call_hide_others", b(self.hide_others));
+        s.set("call_expanded", b(self.expanded));
+        s.set("call_fullscreen", b(self.fullscreen));
+    }
 }
 
 impl Settings {
@@ -175,6 +211,7 @@ impl Settings {
             share_audio: s.get("share_audio").is_some_and(|v| v == "1"),
             mic_volume: volume(s, "mic_volume"),
             speaker_volume: volume(s, "speaker_volume"),
+            call_view: CallView::load(s),
         }
     }
     /// Hands the chosen devices to the audio and video code; open streams pick them up on `CallCmd::Devices`.
@@ -210,6 +247,7 @@ impl Settings {
         s.set("share_audio", b(self.share_audio));
         s.set("mic_volume", &self.mic_volume.to_string());
         s.set("speaker_volume", &self.speaker_volume.to_string());
+        self.call_view.save(s);
         for (k, d) in [("mic", &self.mic), ("speaker", &self.speaker), ("camera", &self.camera)] {
             s.set(k, d.as_ref().map_or("", |d| d.id.as_str()));
             s.set(&format!("{k}_name"), d.as_ref().map_or("", |d| d.name.as_str()));
@@ -274,6 +312,8 @@ pub struct CallUi {
     /// Who is talking, and when each side was last loud: [us, peer].
     pub speaking: [bool; 2],
     pub loud: [Option<Instant>; 2],
+    /// The saved `CallView` was brought back (once, when the peer's picture first showed).
+    pub view_restored: bool,
 }
 
 impl CallUi {
@@ -295,6 +335,7 @@ impl CallUi {
             local: None,
             speaking: [false; 2],
             loud: [None; 2],
+            view_restored: false,
         }
     }
 }
@@ -621,6 +662,8 @@ pub struct App {
     pub call_fullscreen: bool,
     /// Last mouse movement over the call panel: the controls of an expanded panel hide after a pause.
     pub call_mouse: Instant,
+    /// Windows, call in full screen: the title bar slid down while the mouse is at the top edge.
+    pub titlebar_peek: bool,
     /// Previews for the share picker, filled in the background (index of `ScreenPicker::targets`).
     pub share_thumbs: HashMap<usize, Arc<RenderImage>>,
     /// Size of the area the tiles share, measured while drawing.
@@ -815,6 +858,7 @@ impl App {
             call_expanded: false,
             call_fullscreen: false,
             call_mouse: Instant::now(),
+            titlebar_peek: false,
             share_thumbs: HashMap::new(),
             call_stage: Rc::default(),
             app_store,
@@ -1356,23 +1400,95 @@ impl App {
     }
 
     /// The call panel over the whole window (the window stays a normal window).
+    /// With the "Full screen" option on, expanding takes the whole screen.
     pub fn set_call_expanded(&mut self, on: bool, window: &mut Window, cx: &mut Context<Self>) {
         self.call_expanded = on;
         self.call_mouse = Instant::now();
-        if !on && self.call_fullscreen {
+        if on && self.settings.call_view.fullscreen && !self.call_fullscreen {
+            self.set_call_fullscreen(true, window, cx);
+        } else if !on && self.call_fullscreen {
+            self.set_call_fullscreen(false, window, cx);
+        }
+        self.remember_call_view();
+        cx.notify();
+    }
+
+    /// The expanded panel over the whole screen: the window goes full screen. Leaving it (Esc,
+    /// the title bar) keeps the panel expanded and the "Full screen" option as it is.
+    pub fn set_call_fullscreen(&mut self, on: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.call_fullscreen = on;
+        self.call_expanded |= on;
+        self.titlebar_peek = false;
+        if window.is_fullscreen() != on {
+            window.toggle_fullscreen();
+        }
+        self.remember_call_view();
+        cx.notify();
+    }
+
+    /// The "Full screen" option: whether expanding the call takes the whole screen. Turning it
+    /// on expands the call right away; off, leaves full screen.
+    pub fn set_fullscreen_option(&mut self, on: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.settings.call_view.fullscreen = on;
+        self.settings.call_view.save(&self.app_store);
+        if on {
+            self.set_call_expanded(true, window, cx);
+        } else if self.call_fullscreen {
             self.set_call_fullscreen(false, window, cx);
         }
         cx.notify();
     }
 
-    /// The expanded panel over the whole screen: the window goes full screen.
-    pub fn set_call_fullscreen(&mut self, on: bool, window: &mut Window, cx: &mut Context<Self>) {
-        self.call_fullscreen = on;
-        self.call_expanded |= on;
-        if window.is_fullscreen() != on {
-            window.toggle_fullscreen();
+    /// The title bar's Close where the system one doesn't work (full screen): to the tray when
+    /// logged in, else quit, like closing the window.
+    pub fn close_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.call_fullscreen {
+            self.set_call_fullscreen(false, window, cx);
         }
+        if self.sess.is_some() && self.tray.is_some() {
+            desktop::hide_window(window);
+        } else {
+            cx.quit();
+        }
+    }
+
+    /// Enlarges a tile (Some(true): the peer's), or goes back to the grid.
+    pub fn set_call_focus(&mut self, focus: Option<bool>, cx: &mut Context<Self>) {
+        self.call_focus = focus;
+        self.remember_call_view();
         cx.notify();
+    }
+
+    pub fn set_call_hide_others(&mut self, hide: bool, cx: &mut Context<Self>) {
+        self.call_hide_others = hide;
+        self.remember_call_view();
+        cx.notify();
+    }
+
+    /// Keeps the call layout for the next call.
+    fn remember_call_view(&mut self) {
+        // Full screen is the user's option, not where the window happens to be.
+        let fullscreen = self.settings.call_view.fullscreen;
+        let view = CallView { focus: self.call_focus, hide_others: self.call_hide_others, expanded: self.call_expanded, fullscreen };
+        if view != self.settings.call_view {
+            self.settings.call_view = view;
+            view.save(&self.app_store);
+        }
+    }
+
+    /// Once per call, when the peer's picture first shows: the layout of the last call.
+    pub fn restore_call_view(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(call) = self.sess.as_mut().and_then(|s| s.call.as_mut()) else { return };
+        if call.view_restored || call.remote.is_none() {
+            return;
+        }
+        call.view_restored = true;
+        let view = self.settings.call_view;
+        (self.call_focus, self.call_hide_others) = (view.focus, view.hide_others);
+        // Expanding goes full screen by itself when that option is on.
+        if view.expanded {
+            self.set_call_expanded(true, window, cx);
+        }
     }
 
     pub fn set_call_volume(&mut self, mic: bool, v: f32, save: bool) {
