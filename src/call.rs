@@ -39,20 +39,20 @@ use crate::audio::{self, Audio};
 use crate::videocall::{Decoder, Encoder, FRAMES, PREVIEW, Source, is_keyframe, keyframe_size};
 use crate::xmpp::{Ev, Net, nc};
 
-const NS_JINGLE: &str = "urn:xmpp:jingle:1";
-const NS_RTP: &str = "urn:xmpp:jingle:apps:rtp:1";
-const NS_ICE: &str = "urn:xmpp:jingle:transports:ice-udp:1";
+pub(crate) const NS_JINGLE: &str = "urn:xmpp:jingle:1";
+pub(crate) const NS_RTP: &str = "urn:xmpp:jingle:apps:rtp:1";
+pub(crate) const NS_ICE: &str = "urn:xmpp:jingle:transports:ice-udp:1";
 const NS_DTLS: &str = "urn:xmpp:jingle:apps:dtls:0";
 const NS_JMI: &str = "urn:xmpp:jingle-message:0";
 const NS_FB: &str = "urn:xmpp:jingle:apps:rtp:rtcp-fb:0";
 const NS_HDREXT: &str = "urn:xmpp:jingle:apps:rtp:rtp-hdrext:0";
 const NS_SSMA: &str = "urn:xmpp:jingle:apps:rtp:ssma:0";
-const NS_GROUP: &str = "urn:xmpp:jingle:apps:grouping:0";
+pub(crate) const NS_GROUP: &str = "urn:xmpp:jingle:apps:grouping:0";
 const NS_HINTS: &str = "urn:xmpp:hints";
-const NS_RTP_INFO: &str = "urn:xmpp:jingle:apps:rtp:info:1";
+pub(crate) const NS_RTP_INFO: &str = "urn:xmpp:jingle:apps:rtp:info:1";
 const NS_JINGLE_ERRORS: &str = "urn:xmpp:jingle:errors:1";
 
-const ACTIONS: [&str; 15] = [
+pub(crate) const ACTIONS: [&str; 15] = [
     "content-accept",
     "content-add",
     "content-modify",
@@ -72,7 +72,7 @@ const ACTIONS: [&str; 15] = [
 
 /// Our payload types in offers; answers echo the offerer's (see `update_formats`).
 const VP8_PT: u8 = 96;
-const OPUS_PT: u8 = 111;
+pub(crate) const OPUS_PT: u8 = 111;
 
 /// Whether a screen share sends system audio; read when a call starts (later: `CallCmd::ShareAudio`).
 static SHARE_AUDIO: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -130,7 +130,7 @@ pub struct JingleError {
 }
 
 impl JingleError {
-    fn new(condition: DefinedCondition, jingle: Option<&'static str>) -> Self {
+    pub(crate) fn new(condition: DefinedCondition, jingle: Option<&'static str>) -> Self {
         Self { condition, jingle }
     }
 
@@ -204,11 +204,12 @@ pub struct Calls {
 }
 
 impl Calls {
-    pub fn new(net: Net, me: BareJid) -> Self {
+    /// `group_busy`: we are in a group call, so 1:1 calls are turned down as busy.
+    pub fn new(net: Net, me: BareJid, group_busy: Arc<std::sync::atomic::AtomicBool>) -> Self {
         let (tx, mut rx) = unbounded();
         let session = Arc::new(Mutex::new(Session::default()));
         let bound = Arc::new(Mutex::new(None));
-        let mut actor = Actor { net, me: me.clone(), tx: tx.clone(), call: None, session: session.clone(), bound: bound.clone() };
+        let mut actor = Actor { net, me: me.clone(), tx: tx.clone(), call: None, session: session.clone(), bound: bound.clone(), group_busy };
         tokio::spawn(async move {
             while let Some(msg) = rx.next().await {
                 // A bug in one call must not take every later call with it: drop that call, go on.
@@ -251,9 +252,9 @@ type VideoTrack = Arc<Mutex<Option<(Arc<TrackLocalStaticSample>, u32, u8)>>>;
 
 /// What our audio goes out as: Opus unless the peer only has PCMU, under the negotiated payload type.
 #[derive(Clone, Copy, Debug, PartialEq)]
-struct AudioFormat {
-    opus: bool,
-    pt: u8,
+pub(crate) struct AudioFormat {
+    pub(crate) opus: bool,
+    pub(crate) pt: u8,
 }
 
 type AudioOut = Arc<Mutex<AudioFormat>>;
@@ -310,6 +311,7 @@ struct Actor {
     call: Option<Call>,
     session: Arc<Mutex<Session>>,
     bound: Arc<Mutex<Option<Jid>>>,
+    group_busy: Arc<std::sync::atomic::AtomicBool>,
 }
 
 fn jmi(name: &str, sid: &str) -> Element {
@@ -323,12 +325,12 @@ fn chat_with(to: Jid, payload: Element) -> Message {
     m
 }
 
-fn media_of(content: &Element) -> Option<&str> {
+pub(crate) fn media_of(content: &Element) -> Option<&str> {
     content.get_child("description", NS_RTP).and_then(|d| d.attr("media")).filter(|m| *m == "audio" || *m == "video")
 }
 
 /// The audio/video contents of a jingle element.
-fn rtp_contents(j: &Element) -> Vec<Element> {
+pub(crate) fn rtp_contents(j: &Element) -> Vec<Element> {
     j.children().filter(|c| c.is("content", NS_JINGLE) && media_of(c).is_some()).cloned().collect()
 }
 
@@ -795,6 +797,10 @@ impl Actor {
                     return;
                 }
                 let video = media("video");
+                if self.group_busy.load(std::sync::atomic::Ordering::Relaxed) {
+                    self.net.send(chat_with(from, jmi("reject", &sid)));
+                    return;
+                }
                 if let Some(c) = self.call.as_ref() {
                     if c.sid == sid {
                         return;
@@ -846,7 +852,7 @@ impl Actor {
         match el.attr("action").unwrap_or_default() {
             "session-initiate" => {
                 let same = self.call.as_ref().is_some_and(|c| c.sid == sid);
-                if self.call.is_some() && !same {
+                if (self.call.is_some() || self.group_busy.load(std::sync::atomic::Ordering::Relaxed)) && !same {
                     let busy = self.jingle("session-terminate", &sid).append(reason("busy")).build();
                     self.iq(from, busy);
                     return;
@@ -1389,7 +1395,7 @@ fn media_engine() -> Result<MediaEngine, String> {
     Ok(media)
 }
 
-fn opus() -> RTCRtpCodec {
+pub(crate) fn opus() -> RTCRtpCodec {
     RTCRtpCodec { mime_type: MIME_TYPE_OPUS.into(), clock_rate: 48000, channels: 2, sdp_fmtp_line: "minptime=10;useinbandfec=1".into(), rtcp_feedback: vec![] }
 }
 
@@ -1399,13 +1405,13 @@ fn pcmu() -> RTCRtpCodec {
 
 /// The audio track carries packets we build (`write_audio`); with no codec of its own it offers
 /// every registered audio codec.
-fn audio_track(sid: &str, ssrc: u32) -> TrackLocalStaticRTP {
+pub(crate) fn audio_track(sid: &str, ssrc: u32) -> TrackLocalStaticRTP {
     let enc = RTCRtpEncodingParameters { rtp_coding_parameters: RTCRtpCodingParameters { ssrc: Some(ssrc), ..Default::default() }, ..Default::default() };
     TrackLocalStaticRTP::new(MediaStreamTrack::new("crabber".into(), format!("audio-{sid}"), "audio".into(), RtpCodecKind::Audio, vec![enc]))
 }
 
 /// The audio format and VP8 payload type a negotiated SDP settles on.
-fn formats(sdp: &str) -> (Option<AudioFormat>, Option<u8>) {
+pub(crate) fn formats(sdp: &str) -> (Option<AudioFormat>, Option<u8>) {
     let p = parse_sdp(sdp);
     let find = |media: &str, name: &str| {
         p.sections.iter().filter(|s| s.media == media).flat_map(|s| s.payloads.iter()).find(|x| x.1.eq_ignore_ascii_case(name)).and_then(|x| x.0.parse::<u8>().ok())
@@ -1415,7 +1421,7 @@ fn formats(sdp: &str) -> (Option<AudioFormat>, Option<u8>) {
 }
 
 /// The default interceptors plus [`KeyframeRequests`], last so the others see all RTCP first.
-fn interceptors(media: &mut MediaEngine) -> Result<Registry, webrtc::error::Error> {
+pub(crate) fn interceptors(media: &mut MediaEngine) -> Result<Registry, webrtc::error::Error> {
     Ok(register_default_interceptors(Registry::new(), media)?.with(Slot::from(14_000), KeyframeRequests::default()))
 }
 
@@ -1504,12 +1510,12 @@ impl PeerConnectionEventHandler for Handler {
     }
 }
 
-fn reason(why: &str) -> Element {
+pub(crate) fn reason(why: &str) -> Element {
     Element::builder("reason", NS_JINGLE).append(Element::builder(why, NS_JINGLE)).build()
 }
 
 /// The LAN address to gather host candidates on (no packet is sent by `connect`).
-fn local_ip() -> std::net::IpAddr {
+pub(crate) fn local_ip() -> std::net::IpAddr {
     std::net::UdpSocket::bind("0.0.0.0:0")
         .and_then(|s| s.connect("8.8.8.8:80").map(|_| s))
         .and_then(|s| s.local_addr())
@@ -1518,7 +1524,7 @@ fn local_ip() -> std::net::IpAddr {
 }
 
 /// STUN/TURN servers announced by the XMPP server (XEP-0215), e.g. ejabberd's mod_stun_disco.
-async fn ice_servers(net: &Net, domain: &str) -> Vec<RTCIceServer> {
+pub(crate) async fn ice_servers(net: &Net, domain: &str) -> Vec<RTCIceServer> {
     let Ok(server) = Jid::from_str(domain) else { return vec![] };
     let query = Element::builder("services", "urn:xmpp:extdisco:2").build();
     let Ok(Some(el)) = net.iq(Some(server), IqRequest::Get(query)).await else { return vec![] };
@@ -1526,6 +1532,8 @@ async fn ice_servers(net: &Net, domain: &str) -> Vec<RTCIceServer> {
         .filter(|s| s.name() == "service")
         .filter_map(|s| {
             let (kind, host, port) = (s.attr("type")?, s.attr("host")?, s.attr("port")?);
+            // An IPv6 address goes in brackets, or its colons read as the port.
+            let host = if host.contains(':') && !host.starts_with('[') { format!("[{host}]") } else { host.to_string() };
             let url = match kind {
                 "stun" => format!("stun:{host}:{port}"),
                 "turn" => format!("turn:{host}:{port}?transport={}", s.attr("transport").unwrap_or("udp")),
@@ -1541,9 +1549,9 @@ async fn ice_servers(net: &Net, domain: &str) -> Vec<RTCIceServer> {
 }
 
 #[derive(Default, Debug)]
-struct Section {
+pub(crate) struct Section {
     media: String,
-    mid: String,
+    pub(crate) mid: String,
     dir: String,
     /// id -> (name, clockrate, channels), in m-line order
     payloads: Vec<(String, String, String, String)>,
@@ -1557,16 +1565,16 @@ struct Section {
 
 /// ICE and DTLS are shared by all m-lines (BUNDLE), so they are kept once.
 #[derive(Default, Debug)]
-struct ParsedSdp {
-    ufrag: String,
+pub(crate) struct ParsedSdp {
+    pub(crate) ufrag: String,
     pwd: String,
     fingerprint: Option<(String, String)>,
     setup: String,
-    sections: Vec<Section>,
+    pub(crate) sections: Vec<Section>,
     candidates: Vec<String>,
 }
 
-fn parse_sdp(sdp: &str) -> ParsedSdp {
+pub(crate) fn parse_sdp(sdp: &str) -> ParsedSdp {
     let mut p = ParsedSdp::default();
     for line in sdp.lines().map(str::trim) {
         if let Some(m) = line.strip_prefix("m=") {
@@ -1640,7 +1648,7 @@ fn parse_sdp(sdp: &str) -> ParsedSdp {
 }
 
 /// One m-line as a Jingle content; `candidates` only on the first (bundled) one.
-fn sdp_to_content(p: &ParsedSdp, s: &Section, initiator: bool, candidates: bool) -> Element {
+pub(crate) fn sdp_to_content(p: &ParsedSdp, s: &Section, initiator: bool, candidates: bool) -> Element {
     let (me, peer) = if initiator { ("initiator", "responder") } else { ("responder", "initiator") };
     let senders = match s.dir.as_str() {
         "sendonly" => me,
@@ -1698,7 +1706,7 @@ fn sdp_to_content(p: &ParsedSdp, s: &Section, initiator: bool, candidates: bool)
 }
 
 /// "candidate:foundation component proto priority ip port typ type [raddr x rport y] ..."
-fn candidate_to_jingle(c: &str) -> Option<Element> {
+pub(crate) fn candidate_to_jingle(c: &str) -> Option<Element> {
     let body = c.strip_prefix("candidate:")?;
     let f: Vec<&str> = body.split_whitespace().collect();
     if f.len() < 8 || f[6] != "typ" {
@@ -1727,7 +1735,7 @@ fn candidate_to_jingle(c: &str) -> Option<Element> {
     Some(el.build())
 }
 
-fn jingle_to_candidate(c: &Element) -> Option<String> {
+pub(crate) fn jingle_to_candidate(c: &Element) -> Option<String> {
     let mut s = format!(
         "candidate:{} {} {} {} {} {} typ {}",
         c.attr("foundation")?,
@@ -1747,7 +1755,7 @@ fn jingle_to_candidate(c: &Element) -> Option<String> {
 
 /// The peer's contents as one SDP. Contents added later may carry an empty transport: ICE and
 /// DTLS come from the first one that has them (BUNDLE). `peer_role` maps `senders` to directions.
-fn contents_to_sdp(contents: &[Element], peer_role: &str) -> String {
+pub(crate) fn contents_to_sdp(contents: &[Element], peer_role: &str) -> String {
     let mut s = String::from("v=0\r\no=- 1 2 IN IP4 0.0.0.0\r\ns=-\r\nt=0 0\r\n");
     let names: Vec<&str> = contents.iter().filter_map(|c| c.attr("name")).collect();
     s += &format!("a=group:BUNDLE {}\r\na=msid-semantic: WMS *\r\n", names.join(" "));

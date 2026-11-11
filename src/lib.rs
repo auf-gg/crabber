@@ -1,6 +1,7 @@
 pub mod audio;
 pub mod awake;
 pub mod call;
+pub mod groupcall;
 pub mod omemo;
 pub mod pgp;
 pub mod connector;

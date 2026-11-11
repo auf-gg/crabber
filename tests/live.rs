@@ -1,7 +1,8 @@
 //! Against a local ejabberd in Docker:
 //!   docker run -d --name ejabberd-test -p 5222:5222 -p 5443:5443 -p 5478:5478/udp ghcr.io/processone/ejabberd
 //!   cargo test --test live -- --ignored --test-threads=1
-//! The tests (re)create the accounts alice/alice and bob/bob themselves.
+//! The tests (re)create the accounts alice/alice, bob/bob and carol/carol themselves.
+//! Without Docker, EJABBERDCTL names the ejabberdctl command of a local server instead.
 use std::str::FromStr;
 use std::time::Duration;
 
@@ -12,13 +13,17 @@ use tokio_xmpp::jid::BareJid;
 
 /// Recreates the test accounts so every run starts from an empty roster and archive.
 fn reset_accounts() {
-    for user in ["alice", "bob"] {
+    for user in ["alice", "bob", "carol"] {
         for args in [vec!["unregister", user, "localhost"], vec!["register", user, "localhost", user]] {
-            let ok = std::process::Command::new("docker")
-                .args(["exec", "ejabberd-test", "ejabberdctl"])
-                .args(&args)
-                .status()
-                .is_ok_and(|s| s.success());
+            let mut cmd = match std::env::var("EJABBERDCTL") {
+                Ok(ctl) => std::process::Command::new(ctl),
+                Err(_) => {
+                    let mut c = std::process::Command::new("docker");
+                    c.args(["exec", "ejabberd-test", "ejabberdctl"]);
+                    c
+                }
+            };
+            let ok = cmd.args(&args).status().is_ok_and(|s| s.success());
             assert!(ok || args[0] == "unregister", "ejabberdctl {args:?} failed");
         }
     }
@@ -197,6 +202,66 @@ fn audio_call_connects() {
         _ => None,
     });
     assert_eq!(end, "", "remote hangup is a normal end");
+}
+
+/// XEP-0272 mesh in a room: alice starts the call, bob and carol join at the same moment (their
+/// preparation and crossing sessions must sort themselves out). Every pair gets a session that
+/// connects and carries audio; when bob leaves, the others drop him.
+#[test]
+#[ignore]
+fn group_call_mesh() {
+    use crabber::groupcall::{GroupCmd, GroupEv};
+    reset_accounts();
+    // Nothing is heard from the speakers while three clients play each other.
+    crabber::audio::set_volumes(1.0, 0.0);
+    let users = ["alice", "bob", "carol"];
+    let mut clients: Vec<_> = users.iter().map(|u| login(u)).collect();
+    for (_, rx) in clients.iter_mut() {
+        wait(rx, |e| matches!(e, Ev::Online { .. }).then_some(()));
+    }
+    let room = format!("g{}@conference.localhost", xmpp::new_id());
+    clients[0].0.unbounded_send(Cmd::Join { room: room.clone(), nick: "alice".into(), since: None, create_name: Some("Звонок".into()) }).unwrap();
+    wait(&mut clients[0].1, |e| matches!(e, Ev::RoomJoined { room: r, .. } if *r == room).then_some(()));
+    std::thread::sleep(Duration::from_millis(500)); // room configuration (non-anonymous)
+    for (i, (tx, rx)) in clients.iter_mut().enumerate().skip(1) {
+        tx.unbounded_send(Cmd::Join { room: room.clone(), nick: users[i].into(), since: None, create_name: None }).unwrap();
+        wait(rx, |e| matches!(e, Ev::RoomJoined { room: r, .. } if *r == room).then_some(()));
+    }
+    std::thread::sleep(Duration::from_millis(500));
+
+    let join = |tx: &UnboundedSender<Cmd>| tx.unbounded_send(Cmd::Group(GroupCmd::Join { room: room.clone() })).unwrap();
+    join(&clients[0].0);
+    wait(&mut clients[0].1, |e| matches!(e, Ev::Group(GroupEv::Joined { .. })).then_some(()));
+    std::thread::sleep(Duration::from_secs(1));
+    join(&clients[1].0);
+    join(&clients[2].0);
+
+    let before = crabber::call::RTP_RECEIVED.load(std::sync::atomic::Ordering::Relaxed);
+    for (i, (_, rx)) in clients.iter_mut().enumerate() {
+        let mut connected = std::collections::BTreeSet::new();
+        wait(rx, |e| {
+            match e {
+                Ev::Group(GroupEv::Peer { nick, connected: true, .. }) => {
+                    connected.insert(nick.clone());
+                }
+                Ev::Group(GroupEv::Ended { reason, .. }) => panic!("{}: call ended: {reason}", users[i]),
+                _ => {}
+            }
+            (connected.len() == 2).then_some(())
+        });
+        let others: std::collections::BTreeSet<String> = users.iter().filter(|u| **u != users[i]).map(|u| u.to_string()).collect();
+        assert_eq!(connected, others, "{} reaches everyone", users[i]);
+    }
+    std::thread::sleep(Duration::from_secs(2));
+    let got = crabber::call::RTP_RECEIVED.load(std::sync::atomic::Ordering::Relaxed) - before;
+    // Six directions at 50 packets/s.
+    assert!(got > 300, "only {got} RTP packets received");
+
+    clients[1].0.unbounded_send(Cmd::Group(GroupCmd::Leave)).unwrap();
+    wait(&mut clients[1].1, |e| matches!(e, Ev::Group(GroupEv::Ended { .. })).then_some(()));
+    for i in [0, 2] {
+        wait(&mut clients[i].1, |e| matches!(e, Ev::Group(GroupEv::PeerGone { nick }) if nick == "bob").then_some(()));
+    }
 }
 
 #[test]

@@ -49,6 +49,7 @@ use tokio_xmpp::xmlstream::Timeouts;
 use tokio_xmpp::{Client, Event, IqRequest, IqResponse, IqResponseToken, Stanza};
 
 use crate::call::{CallCmd, CallEv, Calls};
+use crate::groupcall::{self, GroupCalls, GroupCmd, GroupEv};
 use crate::e2e::{self, DeviceInfo};
 use crate::omemo;
 use crate::pgp;
@@ -101,6 +102,8 @@ pub struct Occupant {
     pub affiliation: String,
     /// Real bare JID, when the room shows it to us.
     pub jid: Option<String>,
+    /// Takes part in the room's group call (XEP-0272 presence).
+    pub call: bool,
 }
 
 pub const NS_REPLY: &str = "urn:xmpp:reply:0";
@@ -154,6 +157,8 @@ pub enum Cmd {
     /// Asks for `Ev::PgpOwn` and, with a JID, `Ev::PgpContact`.
     PgpInfo { jid: Option<String> },
     Call(CallCmd),
+    /// A group call in a room (XEP-0272).
+    Group(GroupCmd),
 }
 
 #[derive(Debug)]
@@ -209,6 +214,7 @@ pub enum Ev {
     DownloadFailed { url: String, error: String },
     Error(String),
     Call(CallEv),
+    Group(GroupEv),
 }
 
 enum Out {
@@ -216,6 +222,8 @@ enum Out {
     /// A decrypted message fed back into normal processing.
     Inject(Box<Message>, Option<(String, Option<i64>)>, u8),
     Iq(Option<Jid>, IqRequest, oneshot::Sender<IqResponseToken>),
+    /// What our presence in a room says about its group call; `None` takes it out.
+    Muji(BareJid, Option<Element>),
 }
 
 /// Cloneable handle that background tasks use to reach the client loop.
@@ -234,6 +242,15 @@ impl Net {
     }
     pub fn emit(&self, e: Ev) {
         let _ = self.ev.unbounded_send(e);
+    }
+    /// Puts `el` (a `<muji>`) into our presence in `room`, or takes it out.
+    pub fn muji(&self, room: BareJid, el: Option<Element>) {
+        let _ = self.out.unbounded_send(Out::Muji(room, el));
+    }
+    /// A handle whose stanzas and events go nowhere.
+    #[cfg(test)]
+    pub fn for_tests() -> Self {
+        Self { out: unbounded().0, ev: unbounded().0 }
     }
     pub async fn iq(&self, to: Option<Jid>, req: IqRequest) -> Result<Option<Element>, String> {
         let (tx, rx) = oneshot::channel();
@@ -276,6 +293,9 @@ struct State {
     upload: Arc<Mutex<Option<Jid>>>,
     show: Option<Show>,
     calls: Calls,
+    group: GroupCalls,
+    /// Our `<muji>` per room while we are in its group call: sent with every presence there.
+    muji: HashMap<BareJid, Element>,
     e2e: Option<e2e::Shared>,
     /// Detached signature of our (empty) presence status, when we have an OpenPGP key.
     pgp_presence: Arc<Mutex<Option<String>>>,
@@ -295,6 +315,8 @@ async fn run(acc: Account, mut cmds: UnboundedReceiver<Cmd>, ev: UnboundedSender
         .tls_danger_accept_invalid_certs(acc.insecure)
         .build()
         .unwrap();
+    // Set while we are in a group call: 1:1 calls are turned down as busy meanwhile.
+    let group_busy = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let mut st = State {
         me: acc.jid.clone(),
         dir: acc.dir,
@@ -304,7 +326,9 @@ async fn run(acc: Account, mut cmds: UnboundedReceiver<Cmd>, ev: UnboundedSender
         resources: HashMap::new(),
         upload: Arc::new(Mutex::new(None)),
         show: None,
-        calls: Calls::new(net.clone(), acc.jid.clone()),
+        calls: Calls::new(net.clone(), acc.jid.clone(), group_busy.clone()),
+        group: GroupCalls::new(net.clone(), acc.jid.clone(), group_busy),
+        muji: HashMap::new(),
         e2e: None,
         pgp_presence: Arc::new(Mutex::new(None)),
         pgp_seen: HashSet::new(),
@@ -329,6 +353,8 @@ async fn run(acc: Account, mut cmds: UnboundedReceiver<Cmd>, ev: UnboundedSender
                 Some(Event::Online { bound_jid, .. }) => st.on_online(bound_jid),
                 Some(Event::Disconnected(e)) => {
                     st.resources.clear();
+                    st.muji.clear();
+                    st.group.on_disconnected();
                     for r in st.rooms.values_mut() { r.joined = false; r.occupants.clear(); }
                     st.net.emit(Ev::Disconnected(e.to_string()));
                 }
@@ -339,6 +365,7 @@ async fn run(acc: Account, mut cmds: UnboundedReceiver<Cmd>, ev: UnboundedSender
                 Some(Out::Stanza(s)) => { let _ = tokio::time::timeout(Duration::from_secs(5), client.send_stanza(*s)).await; }
                 Some(Out::Iq(to, req, reply)) => { let _ = reply.send(client.send_iq(to, req).await); }
                 Some(Out::Inject(m, archived, enc)) => st.on_message(*m, archived, enc),
+                Some(Out::Muji(room, el)) => st.set_muji(room, el),
                 None => break,
             },
             cmd = cmds.next() => match cmd {
@@ -398,6 +425,7 @@ fn disco_info(node: Option<String>) -> DiscoInfoResult {
         "urn:xmpp:avatar:metadata+notify",
         NS_REPLY,
         NS_RETRACT,
+        groupcall::NS_MUJI,
     ];
     DiscoInfoResult {
         node,
@@ -443,6 +471,7 @@ impl State {
 
     fn on_online(&mut self, bound: Jid) {
         self.calls.set_bound(bound.clone());
+        self.group.set_bound(bound.clone());
         self.net.emit(Ev::Online { jid: bound.to_string() });
         self.net.send(self.presence());
         let net = self.net.clone();
@@ -730,6 +759,8 @@ impl State {
             Cmd::Join { room, nick, since, create_name } => self.join(room, nick, since, create_name),
             Cmd::Leave { room } => {
                 let Some(r) = jid(&room) else { return };
+                self.muji.remove(&r);
+                self.group.on_room_gone(r.clone());
                 if let Some(state) = self.rooms.remove(&r)
                     && let Ok(full) = r.with_resource_str(&state.nick)
                 {
@@ -754,7 +785,9 @@ impl State {
                 self.net.send(self.presence());
                 for (room, r) in &self.rooms {
                     if let Ok(full) = room.with_resource_str(&r.nick) {
-                        self.net.send(self.presence().with_to(full));
+                        let mut p = self.presence().with_to(full);
+                        p.payloads.extend(self.muji.get(room).cloned());
+                        self.net.send(p);
                     }
                 }
             }
@@ -783,6 +816,14 @@ impl State {
                 });
             }
             Cmd::Call(c) => self.calls.on_cmd(c),
+            Cmd::Group(c) => {
+                // Joining needs our nick there, and the room joined.
+                let nick = match &c {
+                    GroupCmd::Join { room } => jid(room).and_then(|r| self.rooms.get(&r)).filter(|r| r.joined).map(|r| r.nick.clone()),
+                    _ => None,
+                };
+                self.group.on_cmd(c, nick);
+            }
             Cmd::E2eInfo { jid } => {
                 let (Some(e2e), net) = (self.e2e.clone(), self.net.clone()) else { return };
                 tokio::spawn(async move {
@@ -868,6 +909,19 @@ impl State {
         }
     }
 
+    /// Our group call presence in `room` (XEP-0272): kept for later presences, sent now if we are in.
+    fn set_muji(&mut self, room: BareJid, el: Option<Element>) {
+        match &el {
+            Some(e) => self.muji.insert(room.clone(), e.clone()),
+            None => self.muji.remove(&room),
+        };
+        let Some(r) = self.rooms.get(&room).filter(|r| r.joined) else { return };
+        let Ok(full) = room.with_resource_str(&r.nick) else { return };
+        let mut p = self.presence().with_to(full);
+        p.payloads.extend(el);
+        self.net.send(p);
+    }
+
     fn join(&mut self, room: String, nick: String, since: Option<i64>, create_name: Option<String>) {
         let Some(r) = jid(&room) else { return };
         let Ok(full) = r.with_resource_str(&nick) else { return };
@@ -876,8 +930,12 @@ impl State {
             Some(t) => History::new().with_since(tokio_xmpp::parsers::date::DateTime((t + chrono::Duration::seconds(1)).fixed_offset())),
             None => History::new().with_maxstanzas(50),
         };
+        // A rejoin (XEP-0410) mid-call keeps us in the call.
+        let muji = self.muji.get(&r).cloned();
         self.rooms.insert(r, Room { nick, occupants: HashSet::new(), joined: false, create_name });
-        self.net.send(self.presence().with_to(full).with_payload(Muc::new().with_history(history)));
+        let mut p = self.presence().with_to(full).with_payload(Muc::new().with_history(history));
+        p.payloads.extend(muji);
+        self.net.send(p);
     }
 
     /// XEP-0410: pings our occupant JID in each room; a "not joined" answer rejoins.
@@ -972,7 +1030,8 @@ impl State {
                     }
                     Iq::Result { from: None, to: from, id, payload: None }
                 } else if payload.is("jingle", ns::JINGLE) {
-                    match self.calls.on_jingle(from.clone(), payload) {
+                    let res = if self.group.owns(&payload) { self.group.on_jingle(from.clone(), payload) } else { self.calls.on_jingle(from.clone(), payload) };
+                    match res {
                         Ok(()) => Iq::Result { from: None, to: from, id, payload: None },
                         Err(e) => {
                             let type_ = if e.retry() { ErrorType::Modify } else { ErrorType::Cancel };
@@ -1011,6 +1070,8 @@ impl State {
                     .map(|e| format!("{:?}", e.defined_condition))
                     .unwrap_or_else(|| t!("err.generic").into());
                 self.rooms.remove(&bare);
+                self.muji.remove(&bare);
+                self.group.on_room_gone(bare.clone());
                 self.net.emit(Ev::RoomError { room: bare.to_string(), error });
                 return;
             }
@@ -1029,6 +1090,8 @@ impl State {
                     t!("room.left")
                 };
                 self.rooms.remove(&bare);
+                self.muji.remove(&bare);
+                self.group.on_room_gone(bare.clone());
                 self.net.emit(Ev::RoomRemoved { room: bare.to_string(), reason: reason.into() });
                 return;
             }
@@ -1040,12 +1103,16 @@ impl State {
                 } else {
                     room.occupants.insert(nick.clone());
                 }
+                let muji = groupcall::muji_of(&p.payloads).filter(|_| !gone);
+                let real = item.as_ref().and_then(|i| i.jid.clone()).map(Jid::from);
+                self.group.on_occupant(bare.clone(), nick.clone(), real, muji, gone, statuses.contains(&MucStatus::SelfPresence));
                 let lower = |v: String| v.to_lowercase();
                 let occupant = Occupant {
                     nick,
                     role: item.as_ref().map(|i| lower(format!("{:?}", i.role))).unwrap_or_else(|| "participant".into()),
                     affiliation: item.as_ref().map(|i| lower(format!("{:?}", i.affiliation))).unwrap_or_else(|| "none".into()),
                     jid: item.and_then(|i| i.jid).map(|j| j.to_bare().to_string()),
+                    call: muji.is_some(),
                 };
                 self.net.emit(Ev::Member { room: bare.to_string(), occupant, gone });
             }

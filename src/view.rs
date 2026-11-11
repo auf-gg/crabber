@@ -22,6 +22,7 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use crabber::call::{CallCmd, CallState};
+use crabber::groupcall::GroupCmd;
 use crabber::audio::MediaDevice;
 use crabber::videocall::Source;
 use crabber::store::{ChatRow, Msg};
@@ -527,6 +528,22 @@ fn call_status(call: &crate::app::CallUi) -> String {
     }
 }
 
+/// Nicks of the occupants of `room` taking part in its group call.
+fn room_callers(sess: &Session, room: &str) -> Vec<String> {
+    let mut nicks: Vec<String> = sess.members.get(room).into_iter().flat_map(|m| m.values()).filter(|o| o.call).map(|o| o.nick.clone()).collect();
+    nicks.sort();
+    nicks
+}
+
+/// "Waiting for others…", or how many are in the call and for how long.
+fn group_status(g: &crate::app::GroupCallUi) -> String {
+    if g.peers.is_empty() {
+        return t!("gcall.waiting").to_string();
+    }
+    let secs = g.started.elapsed().as_secs();
+    format!("{} · {:02}:{:02}", t!("gcall.people", n = g.peers.len() + 1), secs / 60, secs % 60)
+}
+
 fn overlay_icon(id: &'static str, icon: IconName) -> Stateful<Div> {
     div().id(id).p_2().rounded_md().cursor_pointer().text_color(white()).hover(|d| d.bg(hsla(0., 0., 1., 0.15))).child(Icon::new(icon))
 }
@@ -782,7 +799,7 @@ impl App {
                 }
             }
         }
-        let strip = self.render_call_strip(cx);
+        let strip = self.render_call_strip(cx).or_else(|| self.render_group_call_strip(cx));
         let conversation = self.render_conversation(window, cx).into_any_element();
         h_flex()
             .size_full()
@@ -1112,6 +1129,33 @@ impl App {
             (t!("status.offline").into(), false)
         };
 
+        // Group call in this room: who is in it, and whether we can join from here.
+        let in_group_call = sess.group_call.as_ref().is_some_and(|g| g.room == peer);
+        let callers = room_callers(sess, &peer);
+        let can_group_call = sess.online && sess.call.is_none() && sess.group_call.is_none() && sess.occupants.contains_key(&peer);
+        let call_banner = (chat.is_room && !in_group_call && !callers.is_empty()).then(|| {
+            let room = peer.clone();
+            h_flex()
+                .flex_shrink_0()
+                .px_4()
+                .py_2()
+                .gap_3()
+                .items_center()
+                .bg(p.online.opacity(0.12))
+                .border_b_1()
+                .border_color(p.border)
+                .child(Icon::new(IconName::Phone).size(dp(16.)).text_color(p.online))
+                .child(div().flex_1().min_w_0().truncate().text_sm().child(t!("gcall.ongoing", who = callers.join(", "))))
+                .child(
+                    Button::new("group-call-join")
+                        .primary()
+                        .small()
+                        .label(t!("gcall.join"))
+                        .disabled(!can_group_call)
+                        .on_click(cx.listener(move |this, _, _, cx| this.group_call(GroupCmd::Join { room: room.clone() }, cx))),
+                )
+        });
+
         let header = h_flex()
             .h(dp(60.))
             .flex_shrink_0()
@@ -1150,7 +1194,7 @@ impl App {
                         .ghost()
                         .icon(IconName::Phone)
                         .tooltip(t!("chat.call"))
-                        .disabled(sess.call.is_some() || !sess.online)
+                        .disabled(sess.call.is_some() || sess.group_call.is_some() || !sess.online)
                         .on_click(cx.listener(move |this, _, _, cx| this.call(CallCmd::Start { to: to.clone(), video: false }, cx))),
                 )
             })
@@ -1161,7 +1205,7 @@ impl App {
                         .ghost()
                         .icon(IconName::Video)
                         .tooltip(t!("chat.video_call"))
-                        .disabled(sess.call.is_some() || !sess.online)
+                        .disabled(sess.call.is_some() || sess.group_call.is_some() || !sess.online)
                         .on_click(cx.listener(move |this, _, _, cx| this.call(CallCmd::Start { to: to.clone(), video: true }, cx))),
                 )
             })
@@ -1174,6 +1218,17 @@ impl App {
                         .icon(if secure || chat.enc == "pgp" { IconName::Lock } else { IconName::LockOpen })
                         .tooltip(t!("e2e.title"))
                         .on_click(cx.listener(move |this, _, _, cx| this.open_encryption(pr.clone(), cx))),
+                )
+            })
+            .when(chat.is_room && !in_group_call, |d| {
+                let room = peer.clone();
+                d.child(
+                    Button::new("group-call")
+                        .ghost()
+                        .icon(IconName::Phone)
+                        .tooltip(if callers.is_empty() { t!("gcall.start") } else { t!("gcall.join") })
+                        .disabled(!can_group_call)
+                        .on_click(cx.listener(move |this, _, _, cx| this.group_call(GroupCmd::Join { room: room.clone() }, cx))),
                 )
             })
             .child({
@@ -1380,7 +1435,10 @@ impl App {
             .children(editing)
             .children(blocked_bar)
             .when(!blocked, |d| d.child(composer));
-        let panel = sess.call.as_ref().filter(|c| c.peer == peer).and_then(|_| self.render_call_panel(cx));
+        let panel = match in_group_call {
+            true => self.render_group_call_panel(cx),
+            false => sess.call.as_ref().filter(|c| c.peer == peer).and_then(|_| self.render_call_panel(cx)),
+        };
         let body = match panel {
             Some(panel) if self.call_chat_hidden => panel,
             Some(panel) => v_resizable("call-split")
@@ -1395,6 +1453,7 @@ impl App {
             .h_full()
             .min_w_0()
             .child(header)
+            .children(call_banner)
             .when(!sess.online, |d| d.child(div().px_4().py_1().text_xs().bg(p.danger.opacity(0.12)).text_color(p.danger).child(sess.status.clone())))
             .child(div().flex_1().min_h_0().flex().child(body))
             .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| this.add_pending(paths.0.iter().cloned(), cx)))
@@ -3250,6 +3309,205 @@ impl App {
                 .on_click(cx.listener(move |this, _, w, cx| this.select(peer.clone(), w, cx)))
                 .into_any_element(),
         )
+    }
+
+    /// While another chat (or none) is open during a group call: a strip back to its room.
+    fn render_group_call_strip(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let sess = self.sess.as_ref()?;
+        let g = sess.group_call.as_ref().filter(|g| sess.selected.as_ref() != Some(&g.room))?;
+        let p = style::palette(cx);
+        let room = g.room.clone();
+        Some(
+            h_flex()
+                .id("group-call-strip")
+                .flex_shrink_0()
+                .h(dp(36.))
+                .px_4()
+                .gap_2()
+                .items_center()
+                .cursor_pointer()
+                .bg(p.online)
+                .text_color(white())
+                .text_sm()
+                .child(Icon::new(IconName::Users).size(dp(16.)))
+                .child(div().flex_1().min_w_0().truncate().child(format!("{} · {}", sess.display_name(&g.room), group_status(g))))
+                .child(
+                    div()
+                        .id("group-call-strip-leave")
+                        .size(dp(28.))
+                        .rounded_full()
+                        .bg(p.danger)
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(Icon::new(IconName::PhoneOff).size(dp(14.)))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.group_call(GroupCmd::Leave, cx);
+                        })),
+                )
+                .on_click(cx.listener(move |this, _, w, cx| this.select(room.clone(), w, cx)))
+                .into_any_element(),
+        )
+    }
+
+    /// Group call over the room's chat: a tile per participant (us first), green while talking,
+    /// faded until connected; microphone, sound, chat and leave under them.
+    fn render_group_call_panel(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let sess = self.sess.as_ref()?;
+        let g = sess.group_call.as_ref()?;
+        let p = style::palette(cx);
+        let (fg, soft) = (p.text, p.hover);
+        let me = sess.chat(&g.room).map(|c| c.nick.clone()).filter(|n| !n.is_empty()).unwrap_or_else(|| sess.localpart());
+        // (avatar JID, name, muted, speaking, connected)
+        let mut people = vec![(sess.me.clone(), me, g.muted, g.speaking, true)];
+        people.extend(g.peers.iter().map(|x| (x.jid.clone(), x.nick.clone(), x.muted, x.speaking, x.connected)));
+        let gap = 12.;
+        let stage_size = self.call_stage.get();
+        let (w, h) = tile_size((f32::from(stage_size.width), f32::from(stage_size.height)), people.len(), gap);
+        let tiles = people.into_iter().map(|(jid, label, muted, speaking, connected)| {
+            div()
+                .relative()
+                .flex_none()
+                .w(px(w))
+                .h(px(h))
+                .rounded(dp(12.))
+                .overflow_hidden()
+                .bg(p.panel)
+                .border_2()
+                .border_color(if speaking { p.online } else { transparent_black() })
+                .flex()
+                .items_center()
+                .justify_center()
+                .when(!connected, |d| d.opacity(0.5))
+                .child(avatar(sess, &jid, &label, 72.))
+                .child(
+                    h_flex()
+                        .absolute()
+                        .left(dp(8.))
+                        .bottom(dp(8.))
+                        .gap_1()
+                        .items_center()
+                        .px_2()
+                        .py(dp(2.))
+                        .rounded_md()
+                        .bg(p.chip)
+                        .text_color(p.chip_text)
+                        .text_xs()
+                        .child(label)
+                        .when(!connected, |d| d.child(format!("· {}", t!("gcall.connecting"))))
+                        .when(muted, |d| d.child(Icon::new(IconName::MicOff).size(dp(12.)).text_color(p.danger))),
+                )
+        });
+        // The tiles are sized from the stage, measured while drawing (a frame late on resize).
+        let measured = self.call_stage.clone();
+        let stage = div().flex_1().min_h_0().p_3().child(
+            div()
+                .size_full()
+                .relative()
+                .child(
+                    canvas(
+                        move |bounds, window, _| {
+                            if measured.get() != bounds.size {
+                                measured.set(bounds.size);
+                                window.refresh();
+                            }
+                        },
+                        |_, _, _, _| {},
+                    )
+                    .absolute()
+                    .size_full(),
+                )
+                .child(h_flex().size_full().flex_wrap().gap(px(gap)).justify_center().items_center().content_center().children(tiles)),
+        );
+
+        let round = |id: &'static str, icon: IconName, fill: Option<(Hsla, Hsla)>, alert: bool| {
+            let icon_color = fill.map_or(if alert { p.danger } else { fg }, |(_, c)| c);
+            div()
+                .id(id)
+                .size(dp(40.))
+                .rounded_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .cursor_pointer()
+                .map(|d| match fill {
+                    Some((bg, _)) => d.bg(bg).hover(|d| d.opacity(0.85)),
+                    None => d.hover(move |d| d.bg(soft)),
+                })
+                .child(Icon::new(icon).size(dp(20.)).text_color(icon_color))
+        };
+        let pill = |main: Stateful<Div>, menu: AnyElement, alert: bool| {
+            h_flex().items_center().p(dp(3.)).gap(dp(2.)).rounded_full().bg(if alert { p.danger.opacity(0.18) } else { p.panel }).child(main).child(menu)
+        };
+        let this = cx.entity().downgrade();
+        let colors = (fg, soft);
+        let open = |id: &'static str| self.call_menu == Some(id);
+        let mic_menu = {
+            let (this, current, denoise, vol) = (this.clone(), self.settings.mic.clone(), self.settings.denoise, self.mic_volume.clone());
+            menu_chevron("gcall-mic-menu", this.clone(), open("gcall-mic-menu"), colors, cx, move |menu, window, cx| {
+                let (this2, this3, current) = (this.clone(), this.clone(), current.clone());
+                menu.submenu(t!("call.input_device"), window, cx, move |m, _, _| device_items(m, DeviceKind::Mic, current.clone(), this2.clone()))
+                    .item(check_item(t!("settings.denoise"), denoise).on_click(move |_, w, cx| {
+                        let _ = this3.update(cx, |app, cx| app.update_settings(w, cx, |st| st.denoise = !denoise));
+                    }))
+                    .separator()
+                    .item(volume_item(t!("call.mic_volume"), vol.clone()))
+            })
+        };
+        let sound_menu = {
+            let (this, current, vol) = (this.clone(), self.settings.speaker.clone(), self.speaker_volume.clone());
+            menu_chevron("gcall-sound-menu", this.clone(), open("gcall-sound-menu"), colors, cx, move |menu, window, cx| {
+                let (this, current) = (this.clone(), current.clone());
+                menu.submenu(t!("call.output_device"), window, cx, move |m, _, _| device_items(m, DeviceKind::Speaker, current.clone(), this.clone()))
+                    .separator()
+                    .item(volume_item(t!("call.speaker_volume"), vol.clone()))
+            })
+        };
+        let (muted, deafened) = (g.muted, g.deafened);
+        let tip = |label: &'static str| move |w: &mut Window, cx: &mut gpui_kit::App| Tooltip::new(label).build(w, cx);
+        let controls = h_flex()
+            .flex_shrink_0()
+            .pb_3()
+            .gap_3()
+            .items_center()
+            .justify_center()
+            .child(pill(
+                round("gcall-mute", if muted { IconName::MicOff } else { IconName::Mic }, None, muted)
+                    .tooltip(tip(t!("call.mic")))
+                    .on_click(cx.listener(move |this, _, _, cx| this.group_call(GroupCmd::Mute(!muted), cx))),
+                mic_menu.into_any_element(),
+                muted,
+            ))
+            .child(pill(
+                round("gcall-deafen", if deafened { IconName::HeadphoneOff } else { IconName::Headphones }, None, deafened)
+                    .tooltip(tip(t!("call.sound")))
+                    .on_click(cx.listener(move |this, _, _, cx| this.group_call(GroupCmd::Deafen(!deafened), cx))),
+                sound_menu.into_any_element(),
+                deafened,
+            ))
+            .child(
+                round("gcall-chat", if self.call_chat_hidden { IconName::MessageSquareOff } else { IconName::MessageSquare }, Some((p.panel, fg)), false)
+                    .tooltip(tip(t!("call.chat")))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.call_chat_hidden = !this.call_chat_hidden;
+                        cx.notify();
+                    })),
+            )
+            .child(
+                round("gcall-leave", IconName::PhoneOff, Some((p.danger, white())), false)
+                    .tooltip(tip(t!("gcall.leave")))
+                    .on_click(cx.listener(|this, _, _, cx| this.group_call(GroupCmd::Leave, cx))),
+            );
+        let header = h_flex()
+            .flex_shrink_0()
+            .px_4()
+            .pt_3()
+            .gap_2()
+            .items_center()
+            .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).child(sess.display_name(&g.room)))
+            .child(div().text_sm().text_color(p.muted).child(group_status(g)));
+        Some(v_flex().id("group-call-panel").size_full().bg(p.chat_top).text_color(fg).child(header).child(stage).child(controls).into_any_element())
     }
 
     /// Discord-like call stage over the chat: both sides as 16:9 tiles, the controls under them.

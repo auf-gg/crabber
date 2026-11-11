@@ -16,6 +16,7 @@ Cross-platform XMPP messenger with a GPU-accelerated [GPUI](https://github.com/z
 - Encrypted file transfer
 - Voice and video calls over WebRTC; screen sharing of a chosen monitor or window, up to its full resolution, with system audio (other apps only, never the call itself); the computer stays awake during a call. Video needs ffmpeg on PATH; capture goes through the desktop portal and PipeWire on Wayland and Windows.Graphics.Capture on Windows
 - Voice messages (Ogg Opus, compatible with Conversations)
+- Group audio calls in rooms: everyone in the room sees the call going on and can join
 - Microphone, speaker and camera chosen in settings, switched on the fly during a call
 - Noise suppression for the microphone ([nnnoiseless](https://github.com/jneem/nnnoiseless), RNNoise in Rust)
 - Message history stored in SQLite with per-chat search
@@ -92,6 +93,7 @@ Crabber stands on each.
 | [0249](https://xmpp.org/extensions/xep-0249.html) | Direct MUC Invitations | ✅ | |
 | [0260](https://xmpp.org/extensions/xep-0260.html) | Jingle SOCKS5 Bytestreams Transport | ❌ | |
 | [0261](https://xmpp.org/extensions/xep-0261.html) | Jingle In-Band Bytestreams Transport | ❌ | |
+| [0272](https://xmpp.org/extensions/xep-0272.html) | Multiparty Jingle (Muji) | ✅ | Group audio calls in a room, peer-to-peer mesh; call negotiated in the room itself (as Movim 0.34), no XEP-0482 invites |
 | [0280](https://xmpp.org/extensions/xep-0280.html) | Message Carbons | ✅ | |
 | [0293](https://xmpp.org/extensions/xep-0293.html) | Jingle RTP Feedback Negotiation | ✅ | |
 | [0294](https://xmpp.org/extensions/xep-0294.html) | Jingle RTP Header Extensions Negotiation | ✅ | |

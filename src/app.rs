@@ -18,6 +18,7 @@ use gpui_kit::component::{
 };
 use gpui_kit::*;
 use crabber::call::{CallCmd, CallEv, CallState};
+use crabber::groupcall::{GroupCmd, GroupEv};
 use crabber::audio::MediaDevice;
 use crabber::videocall::{FRAMES, Source};
 use crabber::store::{self, ChatRow, Msg, Store};
@@ -298,6 +299,37 @@ impl CallUi {
     }
 }
 
+/// Our group call in a room (XEP-0272).
+pub struct GroupCallUi {
+    pub room: String,
+    pub muted: bool,
+    pub deafened: bool,
+    pub started: Instant,
+    pub peers: Vec<GroupPeerUi>,
+    /// Whether we are talking, and when we last were loud.
+    pub speaking: bool,
+    pub loud: Option<Instant>,
+}
+
+impl GroupCallUi {
+    pub fn new(room: String) -> Self {
+        Self { room, muted: false, deafened: false, started: Instant::now(), peers: vec![], speaking: false, loud: None }
+    }
+}
+
+/// A participant we have a session with.
+pub struct GroupPeerUi {
+    pub nick: String,
+    /// Real bare JID: its avatar.
+    pub jid: String,
+    /// Its audio in `audio::take_source_levels`.
+    pub key: u64,
+    pub connected: bool,
+    pub muted: bool,
+    pub speaking: bool,
+    pub loud: Option<Instant>,
+}
+
 pub struct Session {
     pub me: String,
     pub cmd: UnboundedSender<Cmd>,
@@ -321,6 +353,7 @@ pub struct Session {
     pub displayed_sent: HashMap<String, String>,
     pub typing_sent: Option<Instant>,
     pub call: Option<CallUi>,
+    pub group_call: Option<GroupCallUi>,
     /// Files chosen or dropped but not sent yet.
     pub pending: Vec<PathBuf>,
     /// Upload id -> local source, copied into the cache once uploaded (no re-download).
@@ -1048,6 +1081,7 @@ impl App {
             displayed_sent: HashMap::new(),
             typing_sent: None,
             call: None,
+            group_call: None,
             pending: vec![],
             uploads: HashMap::new(),
             flash: None,
@@ -1134,6 +1168,21 @@ impl App {
                     }
                     // Who is talking: louder than the threshold, held a moment so words don't flicker.
                     let levels = [crabber::audio::take_level(false), crabber::audio::take_level(true)];
+                    if let Some(g) = s.group_call.as_mut() {
+                        let sources = crabber::audio::take_source_levels();
+                        let mut mark = |level: f32, loud: &mut Option<Instant>, speaking: &mut bool| {
+                            if level > 0.02 {
+                                *loud = Some(Instant::now());
+                            }
+                            let now = loud.is_some_and(|t| t.elapsed().as_millis() < 300);
+                            changed |= now != *speaking;
+                            *speaking = now;
+                        };
+                        mark(if g.muted { 0.0 } else { levels[0] }, &mut g.loud, &mut g.speaking);
+                        for p in g.peers.iter_mut() {
+                            mark(sources.get(&p.key).copied().unwrap_or(0.0), &mut p.loud, &mut p.speaking);
+                        }
+                    }
                     if let Some(c) = s.call.as_mut() {
                         for (i, level) in levels.into_iter().enumerate() {
                             if level > 0.02 {
@@ -1166,7 +1215,7 @@ impl App {
                         s.flash = None;
                         cx.notify();
                     }
-                    if s.call.is_some() || !s.typing.is_empty() || s.flash.is_some() {
+                    if s.call.is_some() || s.group_call.is_some() || !s.typing.is_empty() || s.flash.is_some() {
                         cx.notify();
                     }
                     true
@@ -1223,6 +1272,11 @@ impl App {
         self.settings.save(&self.app_store);
         if devices != (self.settings.mic.clone(), self.settings.speaker.clone(), self.settings.camera.clone(), self.settings.denoise) || share != (self.settings.share_quality, self.settings.share_audio) {
             self.settings.apply_devices();
+            if devices != (self.settings.mic.clone(), self.settings.speaker.clone(), self.settings.camera.clone(), self.settings.denoise)
+                && let Some(sess) = self.sess.as_ref().filter(|s| s.group_call.is_some())
+            {
+                sess.send(Cmd::Group(GroupCmd::Devices));
+            }
             if let Some(sess) = self.sess.as_ref().filter(|s| s.call.is_some()) {
                 if devices != (self.settings.mic.clone(), self.settings.speaker.clone(), self.settings.camera.clone(), self.settings.denoise) {
                     sess.send(Cmd::Call(CallCmd::Devices));
@@ -1758,6 +1812,17 @@ impl App {
                 }
                 Ev::RoomError { room, error } => notes.push(t!("note.room_error", room = room, error = error)),
                 Ev::Member { room, occupant, gone } => {
+                    let list = sess.members.entry(room.clone()).or_default();
+                    // Someone already in the room started a call there (not a rejoin, not us).
+                    let started = occupant.call
+                        && !gone
+                        && list.get(&occupant.nick).is_some_and(|o| !o.call)
+                        && !list.values().any(|o| o.call)
+                        && occupant.jid.as_deref() != Some(sess.me.as_str());
+                    if started && notify && sess.group_call.as_ref().is_none_or(|g| g.room != room) {
+                        let body = t!("gcall.started", who = occupant.nick);
+                        desktop::notify(&room, &sess.display_name(&room), &body, Some(&store::avatar_path(&sess.dir, &room)));
+                    }
                     let list = sess.members.entry(room).or_default();
                     if gone {
                         list.remove(&occupant.nick);
@@ -1872,6 +1937,30 @@ impl App {
                 Ev::Call(CallEv::Peer { muted, held, ringing }) => {
                     if let Some(c) = sess.call.as_mut() {
                         (c.peer_muted, c.peer_held, c.peer_ringing) = (muted, held, ringing);
+                    }
+                }
+                Ev::Group(GroupEv::Joined { room }) => {
+                    sess.group_call.get_or_insert_with(|| GroupCallUi::new(room));
+                }
+                Ev::Group(GroupEv::Ended { room, reason }) => {
+                    if sess.group_call.as_ref().is_some_and(|g| g.room == room) {
+                        sess.group_call = None;
+                    }
+                    if !reason.is_empty() {
+                        notes.push(t!("note.call_ended", reason = reason));
+                    }
+                }
+                Ev::Group(GroupEv::Peer { nick, jid, key, connected, muted }) => {
+                    if let Some(g) = sess.group_call.as_mut() {
+                        match g.peers.iter_mut().find(|p| p.nick == nick) {
+                            Some(p) => (p.jid, p.key, p.connected, p.muted) = (jid, key, connected, muted),
+                            None => g.peers.push(GroupPeerUi { nick, jid, key, connected, muted, speaking: false, loud: None }),
+                        }
+                    }
+                }
+                Ev::Group(GroupEv::PeerGone { nick }) => {
+                    if let Some(g) = sess.group_call.as_mut() {
+                        g.peers.retain(|p| p.nick != nick);
                     }
                 }
             }
@@ -2787,6 +2876,33 @@ impl App {
             (self.call_menu, self.call_focus, self.call_hide_others) = (None, None, false);
             self.log_call(c);
         }
+        cx.notify();
+    }
+
+    /// Group call in a room: join (or start) it, leave it, and our microphone and sound in it.
+    pub fn group_call(&mut self, cmd: GroupCmd, cx: &mut Context<Self>) {
+        let Some(sess) = self.sess.as_mut() else { return };
+        match &cmd {
+            GroupCmd::Join { room } => {
+                if sess.call.is_some() || sess.group_call.is_some() {
+                    return;
+                }
+                sess.group_call = Some(GroupCallUi::new(room.clone()));
+            }
+            GroupCmd::Leave => sess.group_call = None,
+            GroupCmd::Mute(m) => {
+                if let Some(g) = sess.group_call.as_mut() {
+                    g.muted = *m;
+                }
+            }
+            GroupCmd::Deafen(d) => {
+                if let Some(g) = sess.group_call.as_mut() {
+                    g.deafened = *d;
+                }
+            }
+            GroupCmd::Devices => {}
+        }
+        sess.send(Cmd::Group(cmd));
         cx.notify();
     }
 

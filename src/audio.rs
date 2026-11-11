@@ -49,6 +49,13 @@ pub fn take_level(peer: bool) -> f32 {
     f32::from_bits(LEVELS[peer as usize].swap(0, Ordering::Relaxed))
 }
 
+/// The same for each participant of a group call, by the key its audio comes in under.
+static SOURCE_LEVELS: Mutex<BTreeMap<u64, f32>> = Mutex::new(BTreeMap::new());
+
+pub fn take_source_levels() -> BTreeMap<u64, f32> {
+    std::mem::take(&mut *SOURCE_LEVELS.lock().unwrap())
+}
+
 fn gain(g: &AtomicU32) -> f32 {
     f32::from_bits(g.load(Ordering::Relaxed))
 }
@@ -552,19 +559,59 @@ fn rms(pcm: &[f32]) -> f32 {
     (pcm.iter().map(|x| x * x).sum::<f32>() / pcm.len().max(1) as f32).sqrt()
 }
 
+/// One participant of a group call: its own jitter buffer, and samples decoded but not played yet
+/// (its frames need not be 20 ms).
+struct Source {
+    jitter: Jitter,
+    pending: VecDeque<f32>,
+}
+
 struct Playback {
     buf: VecDeque<f32>,
     up: Up,
     /// Device rate, and the rate of what is fed in (8 kHz µ-law or 48 kHz Opus).
     rate: u32,
     src: u32,
+    /// The peer of a 1:1 call.
     jitter: Jitter,
+    /// Group call participants by key, mixed together.
+    sources: BTreeMap<u64, Source>,
 }
 
 impl Playback {
-    /// Takes the next frame from the jitter buffer into `buf`, at the device rate.
+    fn new() -> Self {
+        Self { buf: VecDeque::new(), up: Up { step: 1.0, frac: 0.0, last: 0.0 }, rate: CALL_RATE, src: CALL_RATE, jitter: Jitter::new(), sources: BTreeMap::new() }
+    }
+
+    /// 20 ms of every participant summed, at the call rate.
+    fn mix(&mut self) -> Vec<f32> {
+        let mut mixed = vec![0f32; CALL_FRAME];
+        let mut levels = SOURCE_LEVELS.lock().unwrap();
+        for (key, s) in self.sources.iter_mut() {
+            while s.pending.len() < CALL_FRAME {
+                let (pcm, rate) = s.jitter.pull();
+                if pcm.is_empty() {
+                    s.pending.resize(CALL_FRAME, 0.0);
+                    break;
+                }
+                // Group calls are Opus; µ-law would come at 8 kHz.
+                let repeat = (CALL_RATE / rate).max(1) as usize;
+                s.pending.extend(pcm.into_iter().flat_map(|x| std::iter::repeat_n(x, repeat)));
+            }
+            let level = levels.entry(*key).or_default();
+            let mut sum = 0.0;
+            for (m, x) in mixed.iter_mut().zip(s.pending.drain(..CALL_FRAME)) {
+                *m += x;
+                sum += x * x;
+            }
+            *level = level.max((sum / CALL_FRAME as f32).sqrt());
+        }
+        mixed
+    }
+
+    /// Takes the next frame from the jitter buffer(s) into `buf`, at the device rate.
     fn refill(&mut self) {
-        let (pcm, rate) = self.jitter.pull();
+        let (pcm, rate) = if self.sources.is_empty() { self.jitter.pull() } else { (self.mix(), CALL_RATE) };
         if rate != self.src {
             self.src = rate;
             self.up.step = rate as f64 / self.rate as f64;
@@ -595,12 +642,28 @@ impl Audio {
         }
         p.jitter.receive(packet, Instant::now());
     }
+
+    /// Queues a packet from group call participant `key`; all participants are played mixed.
+    pub fn receive_from(&self, key: u64, packet: RtpAudio) {
+        let mut p = self.playback.lock().unwrap();
+        let s = p.sources.entry(key).or_insert_with(|| Source { jitter: Jitter::new(), pending: VecDeque::new() });
+        if self.deafened.load(Ordering::Relaxed) {
+            return s.jitter.stop();
+        }
+        s.jitter.receive(packet, Instant::now());
+    }
+
+    /// The participant left: nothing more is played for it.
+    pub fn remove_source(&self, key: u64) {
+        self.playback.lock().unwrap().sources.remove(&key);
+        SOURCE_LEVELS.lock().unwrap().remove(&key);
+    }
 }
 
 /// Opens the chosen (or default) microphone and speaker. `on_frame` receives 20 ms frames of
 /// 48 kHz mono samples, already muted or scaled by the microphone volume.
 pub fn start(on_frame: impl Fn(Vec<f32>) + Send + Sync + 'static) -> Result<Audio, String> {
-    let playback = Arc::new(Mutex::new(Playback { buf: VecDeque::new(), up: Up { step: 1.0, frac: 0.0, last: 0.0 }, rate: CALL_RATE, src: CALL_RATE, jitter: Jitter::new() }));
+    let playback = Arc::new(Mutex::new(Playback::new()));
     let muted = Arc::new(AtomicBool::new(false));
     let on_frame: Arc<dyn Fn(Vec<f32>) + Send + Sync> = Arc::new(on_frame);
     let stop = open(&playback, &muted, &on_frame)?;
@@ -855,6 +918,28 @@ mod tests {
             j.receive(pcmu(seq, 0.4), at(1000 + 20 * i as u64));
         }
         assert!(near(mid(j.pull()), 0.4));
+    }
+
+    /// Group call: every participant has its own buffer; what is played is their sum, and each
+    /// one's loudness is kept apart for the "speaking" marks.
+    #[test]
+    fn group_sources_are_mixed() {
+        let t0 = Instant::now();
+        let mut p = Playback::new();
+        for (key, v) in [(1u64, 0.1f32), (2, 0.2)] {
+            let s = p.sources.entry(key).or_insert_with(|| Source { jitter: Jitter::new(), pending: VecDeque::new() });
+            for seq in 0..4 {
+                s.jitter.receive(RtpAudio { ssrc: key as u32, ..pcmu(seq, v) }, t0);
+            }
+        }
+        let frame = p.mix();
+        assert_eq!(frame.len(), CALL_FRAME);
+        assert!((frame[CALL_FRAME / 2] - 0.3).abs() < 0.02, "{}", frame[CALL_FRAME / 2]);
+        let levels = take_source_levels();
+        assert!(levels[&2] > levels[&1] && levels[&1] > 0.05, "{levels:?}");
+        // A participant that sent nothing yet is silence, not a stall.
+        p.sources.insert(3, Source { jitter: Jitter::new(), pending: VecDeque::new() });
+        assert!((p.mix()[CALL_FRAME / 2] - 0.3).abs() < 0.02);
     }
 
     /// A phone on Wi-Fi: packets of a tone come 0..80 ms late, sequence numbers wrap; the speaker
