@@ -525,22 +525,17 @@ impl Actor {
                         return receive_video(track).await;
                     }
                     let Some(audio) = audio else { return };
-                    // Only Opus and PCMU (static type 0) are negotiated.
-                    let mut opus = None;
                     while let Some(ev) = track.poll().await {
                         let TrackRemoteEvent::OnRtpPacket(p) = ev else { continue };
                         RTP_RECEIVED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        let (pcm, rate) = if p.header.payload_type == 0 {
-                            (audio::ulaw_samples(&p.payload), audio::RATE)
-                        } else {
-                            if opus.is_none() {
-                                opus = audio::OpusDecoder::new().ok();
-                            }
-                            let Some(d) = opus.as_mut() else { continue };
-                            (d.decode(&p.payload), audio::CALL_RATE)
-                        };
-                        audio::note_level(true, &pcm);
-                        audio.play(&pcm, rate);
+                        // Only Opus and PCMU (static type 0) are negotiated.
+                        audio.receive(audio::RtpAudio {
+                            seq: p.header.sequence_number,
+                            ts: p.header.timestamp,
+                            ssrc: p.header.ssrc,
+                            pcmu: p.header.payload_type == 0,
+                            payload: p.payload.to_vec(),
+                        });
                     }
                 });
             }
