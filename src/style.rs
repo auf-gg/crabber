@@ -1,5 +1,6 @@
 //! Design tokens: one palette per mode, also pushed into gpui-component so its
 //! buttons, inputs and switches match the app.
+#[cfg(target_os = "linux")]
 use std::path::PathBuf;
 
 use gpui_kit::component::{ActiveTheme as _, Theme};
@@ -272,18 +273,12 @@ pub fn source_available(scheme: &str) -> bool {
 }
 
 /// The current source file and its modification time; changes mean new colors to pick up.
+/// Linux only: system color sources exist nowhere else.
+#[cfg(target_os = "linux")]
 pub fn source_stamp(scheme: &str) -> Option<(PathBuf, std::time::SystemTime)> {
-    #[cfg(target_os = "linux")]
-    {
-        let path = sources(scheme).into_iter().find(|p| p.is_file())?;
-        let mtime = std::fs::metadata(&path).ok()?.modified().ok()?;
-        Some((path, mtime))
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = scheme;
-        None
-    }
+    let path = sources(scheme).into_iter().find(|p| p.is_file())?;
+    let mtime = std::fs::metadata(&path).ok()?.modified().ok()?;
+    Some((path, mtime))
 }
 
 /// The candidate colors files of a system-scheme source, in the user cache dir.
@@ -411,10 +406,12 @@ pub fn apply(cx: &mut App, scheme: &str, custom: Option<SchemeColors>, scale: f3
 
 #[cfg(test)]
 mod tests {
-    use super::{DEFAULT_BASE, PRESETS, Preset, SchemeBase, c, from_base};
-    use gpui_kit::{Rgba, rgb};
+    use super::{DEFAULT_BASE, PRESETS, Preset, c, from_base};
+    use gpui_kit::Rgba;
     #[cfg(target_os = "linux")]
-    use super::role;
+    use super::{SchemeBase, role};
+    #[cfg(target_os = "linux")]
+    use gpui_kit::rgb;
 
     /// Every preset must stay readable in both modes: bubble text contrasts with its bubble.
     #[test]
@@ -449,7 +446,7 @@ mod tests {
     /// The scheme override plumbing: `apply` installs per-mode palettes, `palette` reads them back.
     #[test]
     fn apply_installs_scheme_override() {
-        let mut cx = gpui_kit::TestAppContext::single();
+        let cx = gpui_kit::TestAppContext::single();
         cx.update(|cx| {
             gpui_kit::init(cx);
             super::apply(cx, "emerald", None, 1.);
