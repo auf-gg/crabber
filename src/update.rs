@@ -66,6 +66,8 @@ pub fn check(portable: bool) -> Result<Option<Release>, String> {
 }
 
 fn hidden(name: impl AsRef<std::ffi::OsStr>) -> Command {
+    // Changed only on Windows.
+    #[cfg_attr(not(windows), allow(unused_mut))]
     let mut c = Command::new(name);
     #[cfg(windows)]
     {
