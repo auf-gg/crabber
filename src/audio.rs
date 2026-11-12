@@ -198,6 +198,19 @@ impl OpusDecoder {
         pcm.truncate(n.max(0) as usize);
         pcm
     }
+
+    /// `samples` in place of a lost packet: rebuilt from the redundancy (FEC) the sender put into
+    /// `next`, the packet after it, when it has some; otherwise continued from what came before.
+    pub fn conceal(&mut self, next: Option<&[u8]>, samples: usize) -> Vec<f32> {
+        let mut pcm = vec![0f32; samples];
+        let (data, len, fec) = match next {
+            Some(p) => (p.as_ptr(), p.len() as i32, 1),
+            None => (std::ptr::null(), 0, 0),
+        };
+        let n = unsafe { unsafe_libopus::opus_decode_float(self.0, data, len, pcm.as_mut_ptr(), samples as i32, fec) };
+        pcm.truncate(n.max(0) as usize);
+        pcm
+    }
 }
 
 impl Drop for OpusEncoder {
@@ -454,7 +467,7 @@ impl Jitter {
             };
             if let Some((pcmu, payload)) = self.packets.remove(&next) {
                 self.next = Some(next + 1);
-                let Some((pcm, rate)) = self.decode(pcmu, &payload) else { return self.conceal() };
+                let Some((pcm, rate)) = self.decode(pcmu, &payload) else { return self.conceal(None) };
                 // Behind (a burst after a stall, or a sender whose clock runs fast): quiet frames
                 // are skipped, and any once far behind.
                 let excess = self.buffered_ms() - self.target;
@@ -467,14 +480,15 @@ impl Jitter {
             match self.packets.first_key_value().map(|(&k, _)| k) {
                 // The stream jumped ahead: go on from what is there.
                 Some(first) if first > next + 50 => self.next = Some(first),
-                // Lost: concealed, and on to the next.
-                Some(_) => {
+                // Lost: concealed (rebuilt from the next packet if that one is here), and on to it.
+                Some(first) => {
                     self.next = Some(next + 1);
-                    return self.conceal();
+                    let fec = (first == next + 1).then(|| self.packets[&first].clone()).filter(|(pcmu, _)| !pcmu).map(|(_, p)| p);
+                    return self.conceal(fec.as_deref());
                 }
                 // Nothing came: late. Concealed without moving on, so it still plays when it
                 // arrives (the buffer grows by a frame); after a while, buffer again.
-                None if self.concealed < MAX_CONCEALED => return self.conceal(),
+                None if self.concealed < MAX_CONCEALED => return self.conceal(None),
                 None => {
                     self.next = None;
                     return self.fade_out();
@@ -499,12 +513,20 @@ impl Jitter {
         Some((pcm, rate))
     }
 
-    /// A missing frame: the sound fades out and comes back in. Not Opus' own concealment (PLC,
-    /// FEC): in unsafe-libopus it turns quiet audio (silence, a muted peer, the pauses in speech)
-    /// into a full-scale burst and spoils the next frame too, heard as a double thump whenever
-    /// packets ran late (a screen share filling the link).
-    fn conceal(&mut self) -> (Vec<f32>, u32) {
+    /// A missing frame. Opus fills it in: from the sender's redundancy in `fec` (the next packet)
+    /// or by continuing the sound, so a short loss in speech is barely heard. µ-law can't; there
+    /// the sound fades out and comes back in.
+    fn conceal(&mut self, fec: Option<&[u8]>) -> (Vec<f32>, u32) {
         self.concealed += 1;
+        let (n, rate) = self.frame;
+        if rate == CALL_RATE
+            && let Some(d) = self.opus.as_mut()
+        {
+            let pcm = d.conceal(fec, n);
+            if !pcm.is_empty() {
+                return self.play(pcm, rate);
+            }
+        }
         self.fade_out()
     }
 
@@ -923,8 +945,35 @@ mod tests {
         assert!((p.mix()[CALL_FRAME / 2] - 0.3).abs() < 0.02);
     }
 
+    /// Opus' own concealment of quiet audio: a lost frame, and a DTX packet (one byte, sent in
+    /// pauses by libwebrtc). unsafe-libopus 0.2.0 made both full-scale (vendor/README.md).
+    #[test]
+    fn opus_concealment_stays_quiet() {
+        let mut enc = OpusEncoder::new().unwrap();
+        let mut dec = OpusDecoder::new().unwrap();
+        let mut rng = 3u32;
+        let mut last = Vec::new();
+        for _ in 0..40 {
+            let pcm: Vec<f32> = (0..CALL_FRAME).map(|_| {
+                rng = rng.wrapping_mul(1664525).wrapping_add(1013904223);
+                ((rng >> 8) as f32 / 8388608.0 - 1.0) * 1e-3
+            }).collect();
+            last = enc.encode(&pcm).unwrap();
+            dec.decode(&last);
+        }
+        let peak = |v: Vec<f32>| v.iter().fold(0f32, |m, x| m.max(x.abs()));
+        // Concealed for as long as asked (120 ms here).
+        let lost = dec.decode(&[]);
+        assert!(!lost.is_empty());
+        assert!(peak(lost) < 0.01, "lost frame");
+        let dtx = dec.decode(&last[..1]);
+        assert_eq!(dtx.len(), CALL_FRAME);
+        assert!(peak(dtx) < 0.01, "DTX packet");
+        assert!(peak(dec.decode(&last)) < 0.01, "the next frame");
+    }
+
     /// Quiet Opus audio (a muted peer, a pause) with packets lost and late: nothing may come out
-    /// louder than what was sent. Opus' concealment in unsafe-libopus made full-scale bursts here.
+    /// louder than what was sent (unsafe-libopus 0.2.0's concealment made full-scale bursts here).
     #[test]
     fn missing_packets_in_quiet_audio_stay_quiet() {
         let mut enc = OpusEncoder::new().unwrap();
@@ -947,6 +996,35 @@ mod tests {
             loudest = out.iter().fold(loudest, |m, x| m.max(x.abs()));
         }
         assert!(loudest < 0.01, "burst of {loudest}");
+    }
+
+    /// A packet lost in the middle of a voice: Opus continues it instead of a gap, and without a
+    /// jump at either end.
+    #[test]
+    fn lost_opus_packet_is_filled_in() {
+        let mut enc = OpusEncoder::new().unwrap();
+        let t0 = Instant::now();
+        let mut j = Jitter::new();
+        let tone = |i: usize| -> Vec<f32> { (0..CALL_FRAME).map(|k| ((i * CALL_FRAME + k) as f32 * std::f32::consts::TAU * 180. / 48000.).sin() * 0.3).collect() };
+        let mut out = Vec::new();
+        let mut lost_frame = Vec::new();
+        for i in 0..60usize {
+            let payload = enc.encode(&tone(i)).unwrap();
+            if i != 30 {
+                j.receive(RtpAudio { seq: i as u16, ts: i as u32 * 960, ssrc: 5, pcmu: false, payload }, t0 + Duration::from_millis(i as u64 * 20));
+            }
+            let (pcm, _) = j.pull();
+            if j.concealed > 0 {
+                lost_frame = pcm.clone();
+            }
+            out.extend(pcm);
+        }
+        // The tone's rms is 0.21; a fade to silence would leave under 0.09 in the second half.
+        let late = rms(&lost_frame[CALL_FRAME / 2..]);
+        assert!(late > 0.15, "the gap is filled: rms {late}");
+        let step = out.windows(2).map(|w| (w[1] - w[0]).abs()).fold(0f32, f32::max);
+        // A 180 Hz tone at 0.3 moves by up to 0.007 a sample.
+        assert!(step < 0.05, "step {step}");
     }
 
     /// A phone on Wi-Fi: packets of a tone come 0..80 ms late, sequence numbers wrap; the speaker

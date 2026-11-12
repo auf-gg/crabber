@@ -280,21 +280,9 @@ fn copy_message_selection(compose: &Entity<TextareaState>, window: &mut Window, 
 }
 
 /// Text with XEP-0393 spans (*bold*, _italic_, ~strike~, `inline code` shaded) and http(s) links
-/// underlined and clickable. The backticks of code are hidden; the other directives stay visible,
-/// styled with their span, as the XEP recommends.
+/// underlined and clickable. The directives themselves are hidden.
 fn rich_text(id: ElementId, text: &str, code_bg: Hsla) -> AnyElement {
-    let spans = styling_spans(text);
-    let hidden: Vec<usize> = spans.iter().filter(|s| s.1 == '`').flat_map(|s| [s.0.start, s.0.end - 1]).collect();
-    // Byte offset in `text` -> in `plain`.
-    let mut at = vec![0; text.len() + 1];
-    let mut plain = String::with_capacity(text.len());
-    for (i, ch) in text.char_indices() {
-        at[i] = plain.len();
-        if !hidden.contains(&i) {
-            plain.push(ch);
-        }
-    }
-    at[text.len()] = plain.len();
+    let (plain, at, spans) = strip_styling(text);
     let mut styles: Vec<(std::ops::Range<usize>, HighlightStyle)> = spans
         .iter()
         .map(|(r, c)| {
@@ -317,8 +305,30 @@ fn rich_text(id: ElementId, text: &str, code_bg: Hsla) -> AnyElement {
     Selectable::new(id, plain, flatten_highlights(styles)).links(links).into_any_element()
 }
 
-/// XEP-0393 spans of each line of `text`: byte range including both directives, and the directive.
-/// Openers start a line, follow whitespace or another opener, and precede non-space; the first
+/// `text` without its XEP-0393 directives, the map from byte offsets in `text` to offsets in it,
+/// and the spans (as `styling_spans`). A span with a directive in the middle of a link
+/// (`_see https://x/Foo_bar_`) keeps both, so the address stays whole.
+fn strip_styling(text: &str) -> (String, Vec<usize>, Vec<Span>) {
+    let spans = styling_spans(text);
+    let urls = url_ranges(text);
+    let mid_url = |i: usize| urls.iter().any(|u| u.start <= i && i + 1 < u.end);
+    let hidden: Vec<usize> = spans.iter().map(|s| [s.0.start, s.0.end - 1]).filter(|d| !d.iter().any(|&i| mid_url(i))).flatten().collect();
+    let mut at = vec![0; text.len() + 1];
+    let mut plain = String::with_capacity(text.len());
+    for (i, ch) in text.char_indices() {
+        at[i] = plain.len();
+        if !hidden.contains(&i) {
+            plain.push(ch);
+        }
+    }
+    at[text.len()] = plain.len();
+    (plain, at, spans)
+}
+
+/// A XEP-0393 span: byte range including both directives, and the directive.
+type Span = (std::ops::Range<usize>, char);
+
+/// XEP-0393 spans of each line of `text`. Openers start a line, follow whitespace or another opener, and precede non-space; the first
 /// closer not after whitespace ends the span, which needs something between that is not the
 /// directive itself. Code spans hold no further spans; others hold spans of the other kinds.
 fn styling_spans(text: &str) -> Vec<(std::ops::Range<usize>, char)> {
@@ -4191,6 +4201,21 @@ mod tests {
             assert_eq!(spans(t), s(&[]), "{t:?}");
         }
         assert_eq!(spans("first\n_second_"), s(&[("_second_", '_')]), "a new line starts a block");
+    }
+
+    /// What is left on screen once the styling directives are hidden.
+    #[test]
+    fn styling_directives_are_hidden() {
+        let plain = |t: &str| super::strip_styling(t).0;
+        assert_eq!(plain("*12*"), "12");
+        assert_eq!(plain("*bold _and italic_* ~no~ `code`"), "bold and italic no code");
+        assert_eq!(plain("второе *слово* тут"), "второе слово тут");
+        assert_eq!(plain("a*b* 2*3*4"), "a*b* 2*3*4", "not directives");
+        assert_eq!(plain("*https://example.com*"), "https://example.com");
+        assert_eq!(plain("_see https://en.wikipedia.org/wiki/Foo_bar_"), "_see https://en.wikipedia.org/wiki/Foo_bar_", "the link stays whole");
+        // The offset map lands the bold range on the digits.
+        let (p, at, spans) = super::strip_styling("x *12*");
+        assert_eq!(&p[at[spans[0].0.start]..at[spans[0].0.end]], "12");
     }
 
     /// XEP-0392 §13.1 test vectors: hue, then RGB at saturation 100 and lightness 50.

@@ -21,6 +21,20 @@ uses the plain glyph of the UI font.
 
 Windows is not affected: it renders text through DirectWrite (`gpui-pre-windows`).
 
+
+## unsafe-libopus 0.2.0
+
+libopus 1.3.1 transpiled to Rust. The transpiler dropped the cast in `silk_SAT16`'s lower bound:
+C's `silk_int16_MIN` is `(opus_int16)0x8000` (-32768), the Rust had `0x8000` (+32768), so every
+clamped sample came out as 32767. That is the SILK packet loss concealment (`src/silk/PLC.rs`) and
+its comfort noise (`src/silk/CNG.rs`), three places each. Every lost frame, every DTX packet (sent
+in pauses by libwebrtc, e.g. Conversations) and every FEC recovery decoded to a full-scale burst,
+heard as a thump in calls. With the fix, decoding matches the C libopus 1.3.1 sample for sample,
+with loss, DTX and FEC included.
+
+`src/lib.rs` also allows the lints newer rustc denies in the transpiled code: built from the source
+tree, they are not capped as for a registry crate.
+
 ## tokio-xmpp 6.0.0
 
 Login the way current servers and clients do it. Upstream only has classic SASL followed by

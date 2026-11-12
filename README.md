@@ -112,7 +112,7 @@ against the client requirements of the [XMPP Compliance Suites 2023](https://xmp
 | [0386](https://xmpp.org/extensions/xep-0386.html) | Bind 2 | ✅ | Resource bound at login; a session to resume is resumed instead |
 | [0388](https://xmpp.org/extensions/xep-0388.html) | Extensible SASL Profile (SASL2) | ✅ | SCRAM-SHA-256-PLUS with `tls-exporter` where offered; the server's signature is checked |
 | [0392](https://xmpp.org/extensions/xep-0392.html) | Consistent Color Generation | ✅ | Nick colours by the XEP's HSLuv algorithm, lighter on a dark theme; no switch to turn them off |
-| [0393](https://xmpp.org/extensions/xep-0393.html) | Message Styling | ✅ | `*bold*`, `_italic_`, `~strike~`, `` `code` ``, quotes and code blocks; markers stay visible; `<unstyled/>` is not honoured |
+| [0393](https://xmpp.org/extensions/xep-0393.html) | Message Styling | ✅ | `*bold*`, `_italic_`, `~strike~`, `` `code` ``, quotes and code blocks; the markers are hidden; `<unstyled/>` is not honoured |
 | [0398](https://xmpp.org/extensions/xep-0398.html) | User Avatar to vCard-Based Avatars Conversion | ✅ | The server's copy is used instead of publishing the vCard avatar ourselves |
 | [0402](https://xmpp.org/extensions/xep-0402.html) | PEP Native Bookmarks | ✅ | Joined rooms sync between devices |
 | [0410](https://xmpp.org/extensions/xep-0410.html) | MUC Self-Ping | ✅ | Every 10 min; rejoins a room we dropped out of |

@@ -10766,8 +10766,6 @@ dependencies = [
 [[package]]
 name = "unsafe-libopus"
 version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c757408e7256c910343c7b215c8c8b878948630eecc774baabcca0972376eb73"
 dependencies = [
  "arrayref",
  "num-complex",
