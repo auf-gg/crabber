@@ -27,6 +27,8 @@ gpui-component = { version = "0.9.0", features = [
 tokio-xmpp = { version = "6", default-features = false, features = ["starttls", "ring", "rustls-native-certs"] }
 # The resolver tokio-xmpp uses; ours looks up XEP-0368 Direct TLS SRV records.
 hickory-resolver = "0.26"
+# XEP-0388 user-agent id (already in the tree through xmpp-parsers).
+uuid = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "fs"] }
 futures = "0.3"
 webrtc = "0.21"
@@ -92,3 +94,4 @@ gpui-pre = { version = "0.3.11", features = ["test-support"] }
 
 [patch.crates-io]
 gpui-pre-wgpu = { path = "vendor/gpui-pre-wgpu" }
+tokio-xmpp = { path = "vendor/tokio-xmpp" }

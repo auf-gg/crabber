@@ -70,6 +70,7 @@ against the client requirements of the [XMPP Compliance Suites 2023](https://xmp
 | [0047](https://xmpp.org/extensions/xep-0047.html) | In-Band Bytestreams | ✅ | Over IQs, for Jingle file transfer |
 | [0054](https://xmpp.org/extensions/xep-0054.html) | vcard-temp | ✅ | Profile in the contact card, own profile edited in settings; avatars |
 | [0066](https://xmpp.org/extensions/xep-0066.html) | Out of Band Data | ✅ | |
+| [0077](https://xmpp.org/extensions/xep-0077.html) | In-Band Registration | ✅ | Sign-up from the login screen, picture CAPTCHAs (XEP-0158/0231) included |
 | [0084](https://xmpp.org/extensions/xep-0084.html) | User Avatar (PEP) | ✅ | Ours goes to PEP, and to the vCard unless the server copies it there (XEP-0398) |
 | [0085](https://xmpp.org/extensions/xep-0085.html) | Chat State Notifications | ✅ | Typing indicator |
 | [0115](https://xmpp.org/extensions/xep-0115.html) | Entity Capabilities | ✅ | |
@@ -77,6 +78,7 @@ against the client requirements of the [XMPP Compliance Suites 2023](https://xmp
 | [0163](https://xmpp.org/extensions/xep-0163.html) | Personal Eventing Protocol | ✅ | Avatars, bookmarks, read markers, OMEMO |
 | [0166](https://xmpp.org/extensions/xep-0166.html) | Jingle | ✅ | Calls; Jingle errors, tie-breaking, content add/modify/remove; file transfer is XEP-0234 |
 | [0167](https://xmpp.org/extensions/xep-0167.html) | Jingle RTP Sessions | ✅ | Opus audio (G.711 µ-law fallback), VP8 video, video added mid-call; ringing, mute and hold info |
+| [0172](https://xmpp.org/extensions/xep-0172.html) | User Nickname | ✅ | Ours from the profile's nickname (or name); contacts' shown where we have no name for them; sent with subscription requests |
 | [0176](https://xmpp.org/extensions/xep-0176.html) | Jingle ICE-UDP Transport | ✅ | |
 | [0184](https://xmpp.org/extensions/xep-0184.html) | Message Delivery Receipts | ✅ | |
 | [0191](https://xmpp.org/extensions/xep-0191.html) | Blocking Command | ✅ | Contact card, chat banner, subscription requests |
@@ -85,7 +87,7 @@ against the client requirements of the [XMPP Compliance Suites 2023](https://xmp
 | [0203](https://xmpp.org/extensions/xep-0203.html) | Delayed Delivery | ✅ | |
 | [0215](https://xmpp.org/extensions/xep-0215.html) | External Service Discovery | ✅ | STUN/TURN for calls |
 | [0223](https://xmpp.org/extensions/xep-0223.html) | Persistent Storage of Private Data via PubSub | ✅ | Private bookmarks and read markers; open OMEMO bundles |
-| [0234](https://xmpp.org/extensions/xep-0234.html) | Jingle File Transfer | ✅ | 1:1, unencrypted: sent when the server has no HTTP Upload; offers arrive as files to download |
+| [0234](https://xmpp.org/extensions/xep-0234.html) | Jingle File Transfer | ✅ | 1:1, unencrypted: sent when the server has no HTTP Upload; offers arrive as files to download. Slow where the server throttles clients (ejabberd: 3 KB/s by default) |
 | [0245](https://xmpp.org/extensions/xep-0245.html) | The /me Command | ✅ | Shown as an action in the chat, the chat list and notifications |
 | [0249](https://xmpp.org/extensions/xep-0249.html) | Direct MUC Invitations | ✅ | |
 | [0261](https://xmpp.org/extensions/xep-0261.html) | Jingle In-Band Bytestreams Transport Method | ✅ | The only transport: SOCKS5 (XEP-0260) is neither offered nor advertised |
@@ -107,38 +109,31 @@ against the client requirements of the [XMPP Compliance Suites 2023](https://xmp
 | [0377](https://xmpp.org/extensions/xep-0377.html) | Blocking Command Reports | ✅ | Sent with a block |
 | [0380](https://xmpp.org/extensions/xep-0380.html) | Explicit Message Encryption | ✅ | |
 | [0384](https://xmpp.org/extensions/xep-0384.html) | OMEMO Encryption | ✅ | Legacy v0.3 namespace |
-| [0392](https://xmpp.org/extensions/xep-0392.html) | Consistent Color Generation | 🟡 | Stable per-nick colours, not the XEP algorithm |
-| [0393](https://xmpp.org/extensions/xep-0393.html) | Message Styling | 🟡 | Code blocks and inline code only |
+| [0386](https://xmpp.org/extensions/xep-0386.html) | Bind 2 | ✅ | Resource bound at login; a session to resume is resumed instead |
+| [0388](https://xmpp.org/extensions/xep-0388.html) | Extensible SASL Profile (SASL2) | ✅ | SCRAM-SHA-256-PLUS with `tls-exporter` where offered; the server's signature is checked |
+| [0392](https://xmpp.org/extensions/xep-0392.html) | Consistent Color Generation | ✅ | Nick colours by the XEP's HSLuv algorithm, lighter on a dark theme; no switch to turn them off |
+| [0393](https://xmpp.org/extensions/xep-0393.html) | Message Styling | ✅ | `*bold*`, `_italic_`, `~strike~`, `` `code` ``, quotes and code blocks; markers stay visible; `<unstyled/>` is not honoured |
 | [0398](https://xmpp.org/extensions/xep-0398.html) | User Avatar to vCard-Based Avatars Conversion | ✅ | The server's copy is used instead of publishing the vCard avatar ourselves |
 | [0402](https://xmpp.org/extensions/xep-0402.html) | PEP Native Bookmarks | ✅ | Joined rooms sync between devices |
 | [0410](https://xmpp.org/extensions/xep-0410.html) | MUC Self-Ping | ✅ | Every 10 min; rejoins a room we dropped out of |
+| [0421](https://xmpp.org/extensions/xep-0421.html) | Occupant identifiers for semi-anonymous MUCs | ✅ | Only from rooms that advertise them; corrections and retractions must come from the same occupant |
 | [0424](https://xmpp.org/extensions/xep-0424.html) | Message Retraction | ✅ | Delete for everyone, with confirmation |
 | [0425](https://xmpp.org/extensions/xep-0425.html) | Moderated Message Retraction | ✅ | `:1`, falls back to `:0` for older servers |
 | [0428](https://xmpp.org/extensions/xep-0428.html) | Fallback Indication | 🟡 | Reply quotes only |
-| [0440](https://xmpp.org/extensions/xep-0440.html) | SASL Channel-Binding Type Capability | 🟡 | `tls-exporter` binding, capability not read |
+| [0440](https://xmpp.org/extensions/xep-0440.html) | SASL Channel-Binding Type Capability | ✅ | `tls-exporter` binding where the server lists it; the list also feeds XEP-0474 |
 | [0444](https://xmpp.org/extensions/xep-0444.html) | Message Reactions | ✅ | Quick set in the message menu; groups use the room's stanza-id |
 | [0454](https://xmpp.org/extensions/xep-0454.html) | OMEMO Media Sharing | ✅ | `aesgcm://` links |
 | [0461](https://xmpp.org/extensions/xep-0461.html) | Message Replies | ✅ | Quote with jump to the original; fallback quote for other clients |
+| [0474](https://xmpp.org/extensions/xep-0474.html) | SASL SCRAM Downgrade Protection | ✅ | The server's `h=` is checked against what it offered |
+| [0484](https://xmpp.org/extensions/xep-0484.html) | Fast Authentication Streamlining Tokens | ✅ | HT-SHA-256-EXPR (TLS 1.3) or -NONE tokens, kept with the password |
+| [0486](https://xmpp.org/extensions/xep-0486.html) | MUC Avatars | ✅ | By the hash in the room's disco info; refreshed when the room's configuration changes |
 | [0490](https://xmpp.org/extensions/xep-0490.html) | Message Displayed Synchronization | ✅ | Unread counters follow other devices |
 
 ### To do
 
-Crabber covers the **Core** and **Advanced** client levels of the Compliance Suites 2023, except the legacy
-bookmark storage (XEP-0048/0049) they still accept as a fallback. **Recommended**: named there as worth
-supporting · **Modern clients**: not required by the suites, but most current clients use it
-
-| XEP | Name | Needed for | Notes |
-| --- | --- | --- | --- |
-| [0077](https://xmpp.org/extensions/xep-0077.html) | In-Band Registration | Recommended | Create an account from the login screen |
-| [0172](https://xmpp.org/extensions/xep-0172.html) | User Nickname | Modern clients | Names contacts pick for themselves, nick in subscription requests |
-| [0386](https://xmpp.org/extensions/xep-0386.html) | Bind 2 | Modern clients | Faster login with SASL2; on the suites' list for the future |
-| [0388](https://xmpp.org/extensions/xep-0388.html) | Extensible SASL Profile (SASL2) | Modern clients | SCRAM over classic SASL now |
-| [0392](https://xmpp.org/extensions/xep-0392.html) | Consistent Color Generation | Recommended | Nick colours that match other clients |
-| [0393](https://xmpp.org/extensions/xep-0393.html) | Message Styling | Recommended | Bold, italic, strikethrough, quotes |
-| [0421](https://xmpp.org/extensions/xep-0421.html) | Occupant identifiers for semi-anonymous MUCs | Modern clients | Ties reactions, edits and retractions to one occupant across nick changes |
-| [0474](https://xmpp.org/extensions/xep-0474.html) | SASL SCRAM Downgrade Protection | Modern clients | |
-| [0484](https://xmpp.org/extensions/xep-0484.html) | Fast Authentication Streamlining Tokens | Modern clients | Token login; needs SASL2 |
-| [0486](https://xmpp.org/extensions/xep-0486.html) | MUC Avatars | Modern clients | Room avatars |
+Crabber covers the **Core** and **Advanced** client levels of the Compliance Suites 2023, the
+extensions they recommend, and the newer ones most current clients use. Not done on purpose: the
+legacy bookmark storage (XEP-0048/0049) the suites still accept as a fallback.
 
 ## Installation
 

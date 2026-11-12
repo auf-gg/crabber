@@ -211,6 +211,8 @@ impl Store {
         let _ = db.execute_batch("ALTER TABLE messages ADD COLUMN sid TEXT");
         let _ = db.execute_batch("ALTER TABLE messages ADD COLUMN reply_to TEXT");
         let _ = db.execute_batch("ALTER TABLE messages ADD COLUMN retracted INTEGER NOT NULL DEFAULT 0");
+        // XEP-0421 occupant-id of the author in a room: what corrections and retractions must match.
+        let _ = db.execute_batch("ALTER TABLE messages ADD COLUMN occupant TEXT");
         // SQLite's LOWER/LIKE only fold ASCII; search needs Cyrillic too.
         db.create_scalar_function("ulower", 1, rusqlite::functions::FunctionFlags::SQLITE_UTF8 | rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC, |ctx| {
             Ok(ctx.get::<String>(0)?.to_lowercase())
@@ -311,20 +313,34 @@ impl Store {
         let _ = self.db.execute("UPDATE messages SET url=?3, body=?3 WHERE peer=?1 AND msg_id=?2", params![peer, msg_id, url]);
     }
 
-    /// XEP-0308: replaces the text of a message, only if `sender` wrote it.
-    pub fn correct(&self, peer: &str, msg_id: &str, sender: &str, body: &str) -> bool {
+    /// Records the XEP-0421 author of a message once: a later stanza reusing its id (a forged
+    /// duplicate) must not take it over.
+    pub fn set_occupant(&self, peer: &str, msg_id: &str, sender: &str, occupant: &str) {
+        let _ = self.db.execute(
+            "UPDATE messages SET occupant=?4 WHERE peer=?1 AND msg_id=?2 AND sender=?3 AND occupant IS NULL",
+            params![peer, msg_id, sender, occupant],
+        );
+    }
+
+    /// XEP-0308: replaces the text of a message, only if `sender` wrote it. In a room that stamps
+    /// XEP-0421 occupant-ids both must carry the same one: a nick can change hands.
+    pub fn correct(&self, peer: &str, msg_id: &str, sender: &str, body: &str, occupant: Option<&str>) -> bool {
         self.db
-            .execute("UPDATE messages SET body=?4, edited=1 WHERE peer=?1 AND msg_id=?2 AND sender=?3 AND url IS NULL", params![peer, msg_id, sender, body])
+            .execute(
+                "UPDATE messages SET body=?4, edited=1 WHERE peer=?1 AND msg_id=?2 AND sender=?3 AND url IS NULL AND (?5 IS NULL OR occupant IS NULL OR occupant=?5)",
+                params![peer, msg_id, sender, body, occupant],
+            )
             .is_ok_and(|n| n > 0)
     }
 
     /// XEP-0424: blanks a message deleted for everyone. `sender: None` = a moderator (XEP-0425) did it.
-    pub fn retract(&self, peer: &str, msg_id: &str, sender: Option<&str>) -> bool {
+    /// `occupant`: as for `correct`.
+    pub fn retract(&self, peer: &str, msg_id: &str, sender: Option<&str>, occupant: Option<&str>) -> bool {
         let n = self
             .db
             .execute(
-                "UPDATE messages SET body='', url=NULL, retracted=1 WHERE peer=?1 AND msg_id=?2 AND (?3 IS NULL OR sender=?3)",
-                params![peer, msg_id, sender],
+                "UPDATE messages SET body='', url=NULL, retracted=1 WHERE peer=?1 AND msg_id=?2 AND (?3 IS NULL OR sender=?3) AND (?3 IS NULL OR ?4 IS NULL OR occupant IS NULL OR occupant=?4)",
+                params![peer, msg_id, sender, occupant],
             )
             .unwrap_or(0);
         if n > 0 {
@@ -598,8 +614,12 @@ mod tests {
     fn corrections_and_reactions() {
         let s = Store::open(Path::new(":memory:")).unwrap();
         s.insert_msg("room", &msg("1", 10, false));
-        assert!(!s.correct("room", "1", "mallory", "x"), "only the author may correct");
-        assert!(s.correct("room", "1", "a", "fixed"));
+        assert!(!s.correct("room", "1", "mallory", "x", None), "only the author may correct");
+        s.set_occupant("room", "1", "a", "occ-a");
+        s.set_occupant("room", "1", "a", "occ-m");
+        assert!(!s.correct("room", "1", "a", "x", Some("occ-m")), "the nick passed to someone else (XEP-0421)");
+        assert!(!s.retract("room", "1", Some("a"), Some("occ-m")), "same for deleting it");
+        assert!(s.correct("room", "1", "a", "fixed", Some("occ-a")));
         let m = s.history("room", 1).pop().unwrap();
         assert_eq!((m.body.as_str(), m.edited), ("fixed", true));
 
@@ -610,8 +630,8 @@ mod tests {
         s.set_reactions("room", "1", "bob", &["👍".into()]);
         s.set_reactions("room", "1", "eve", &["👍".into()]);
         assert_eq!(s.reactions("room")["1"], [("bob".into(), "👍".into()), ("eve".into(), "👍".into())]);
-        assert!(!s.retract("room", "1", Some("mallory")), "only the author may retract");
-        assert!(s.retract("room", "1", None), "a moderator may");
+        assert!(!s.retract("room", "1", Some("mallory"), None), "only the author may retract");
+        assert!(s.retract("room", "1", None, None), "a moderator may");
         let m = s.history("room", 1).pop().unwrap();
         assert!(m.retracted && m.body.is_empty());
         assert!(s.reactions("room").is_empty(), "reactions go with the message");

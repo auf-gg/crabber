@@ -279,32 +279,105 @@ fn copy_message_selection(compose: &Entity<TextareaState>, window: &mut Window, 
     take
 }
 
-/// Plain text with `inline code` shaded and http(s) links underlined and clickable.
+/// Text with XEP-0393 spans (*bold*, _italic_, ~strike~, `inline code` shaded) and http(s) links
+/// underlined and clickable. The backticks of code are hidden; the other directives stay visible,
+/// styled with their span, as the XEP recommends.
 fn rich_text(id: ElementId, text: &str, code_bg: Hsla) -> AnyElement {
-    let mut parts: Vec<&str> = text.split('`').collect();
-    if parts.len() < 3 || parts.len().is_multiple_of(2) {
-        parts = vec![text];
+    let spans = styling_spans(text);
+    let hidden: Vec<usize> = spans.iter().filter(|s| s.1 == '`').flat_map(|s| [s.0.start, s.0.end - 1]).collect();
+    // Byte offset in `text` -> in `plain`.
+    let mut at = vec![0; text.len() + 1];
+    let mut plain = String::with_capacity(text.len());
+    for (i, ch) in text.char_indices() {
+        at[i] = plain.len();
+        if !hidden.contains(&i) {
+            plain.push(ch);
+        }
     }
-    let mut plain = String::new();
-    let mut highlights = vec![];
+    at[text.len()] = plain.len();
+    let mut styles: Vec<(std::ops::Range<usize>, HighlightStyle)> = spans
+        .iter()
+        .map(|(r, c)| {
+            let style = match c {
+                '*' => HighlightStyle { font_weight: Some(FontWeight::BOLD), ..Default::default() },
+                '_' => HighlightStyle { font_style: Some(FontStyle::Italic), ..Default::default() },
+                '~' => HighlightStyle { strikethrough: Some(StrikethroughStyle { thickness: px(1.), color: None }), ..Default::default() },
+                _ => HighlightStyle { background_color: Some(code_bg), ..Default::default() },
+            };
+            (at[r.start]..at[r.end], style)
+        })
+        .collect();
+    let code: Vec<_> = styles.iter().zip(&spans).filter(|(_, s)| s.1 == '`').map(|(h, _)| h.0.clone()).collect();
     let mut links = vec![];
-    for (i, part) in parts.iter().enumerate() {
-        let start = plain.len();
-        plain.push_str(part);
-        if i % 2 == 1 {
-            if !part.is_empty() {
-                highlights.push((start..plain.len(), HighlightStyle { background_color: Some(code_bg), ..Default::default() }));
+    for r in url_ranges(&plain).into_iter().filter(|r| !code.iter().any(|c| c.start < r.end && r.start < c.end)) {
+        let underline = UnderlineStyle { thickness: px(1.), ..Default::default() };
+        styles.push((r.clone(), HighlightStyle { underline: Some(underline), ..Default::default() }));
+        links.push((r.clone(), SharedString::from(plain[r].to_string())));
+    }
+    Selectable::new(id, plain, flatten_highlights(styles)).links(links).into_any_element()
+}
+
+/// XEP-0393 spans of each line of `text`: byte range including both directives, and the directive.
+/// Openers start a line, follow whitespace or another opener, and precede non-space; the first
+/// closer not after whitespace ends the span, which needs something between that is not the
+/// directive itself. Code spans hold no further spans; others hold spans of the other kinds.
+fn styling_spans(text: &str) -> Vec<(std::ops::Range<usize>, char)> {
+    fn parse(text: &str, range: std::ops::Range<usize>, open: &mut Vec<char>, prev_opener: bool, out: &mut Vec<(std::ops::Range<usize>, char)>) {
+        let s = &text[range.clone()];
+        let chars: Vec<(usize, char)> = s.char_indices().map(|(i, c)| (range.start + i, c)).collect();
+        let (mut k, mut after_opener) = (0, prev_opener);
+        while k < chars.len() {
+            let (i, c) = chars[k];
+            let opens = "*_~`".contains(c)
+                && !open.contains(&c)
+                && (k == 0 && (range.start == 0 || after_opener || text[..range.start].ends_with(char::is_whitespace)) || k > 0 && (chars[k - 1].1.is_whitespace() || after_opener))
+                && chars.get(k + 1).is_some_and(|n| !n.1.is_whitespace());
+            let close = opens.then(|| (k + 1..chars.len()).find(|&j| chars[j].1 == c && !chars[j - 1].1.is_whitespace() && chars[k + 1..j].iter().any(|x| x.1 != c))).flatten();
+            if let Some(j) = close {
+                let end = chars[j].0 + c.len_utf8();
+                out.push((i..end, c));
+                if c != '`' {
+                    open.push(c);
+                    parse(text, i + c.len_utf8()..chars[j].0, open, true, out);
+                    open.pop();
+                }
+                k = j + 1;
+                after_opener = false;
+                continue;
             }
-            continue;
-        }
-        for r in url_ranges(part) {
-            let r = start + r.start..start + r.end;
-            let underline = UnderlineStyle { thickness: px(1.), ..Default::default() };
-            highlights.push((r.clone(), HighlightStyle { underline: Some(underline), ..Default::default() }));
-            links.push((r.clone(), SharedString::from(plain[r].to_string())));
+            after_opener = false;
+            k += 1;
         }
     }
-    Selectable::new(id, plain, highlights).links(links).into_any_element()
+    let mut out = vec![];
+    let mut start = 0;
+    for line in text.split('\n') {
+        parse(text, start..start + line.len(), &mut vec![], false, &mut out);
+        start += line.len() + 1;
+    }
+    out
+}
+
+/// Non-overlapping runs for `StyledText`: where ranges overlap, their styles combine.
+fn flatten_highlights(styles: Vec<(std::ops::Range<usize>, HighlightStyle)>) -> Vec<(std::ops::Range<usize>, HighlightStyle)> {
+    let mut cuts: Vec<usize> = styles.iter().flat_map(|(r, _)| [r.start, r.end]).collect();
+    cuts.sort_unstable();
+    cuts.dedup();
+    cuts.windows(2)
+        .filter_map(|w| {
+            let covering = styles.iter().filter(|(r, _)| r.start <= w[0] && w[1] <= r.end);
+            let style = covering.fold(None::<HighlightStyle>, |acc, (_, s)| {
+                let mut m = acc.unwrap_or_default();
+                m.font_weight = s.font_weight.or(m.font_weight);
+                m.font_style = s.font_style.or(m.font_style);
+                m.strikethrough = s.strikethrough.or(m.strikethrough);
+                m.background_color = s.background_color.or(m.background_color);
+                m.underline = s.underline.or(m.underline);
+                Some(m)
+            })?;
+            Some((w[0]..w[1], style))
+        })
+        .collect()
 }
 
 /// A run of message text: consecutive `> quote` lines, or plain text between them.
@@ -548,10 +621,64 @@ fn overlay_icon(id: &'static str, icon: IconName) -> Stateful<Div> {
     div().id(id).p_2().rounded_md().cursor_pointer().text_color(white()).hover(|d| d.bg(hsla(0., 0., 1., 0.15))).child(Icon::new(icon))
 }
 
-/// Stable per-nick colour for sender names in groups.
-fn sender_color(nick: &str) -> Hsla {
-    let hash = nick.bytes().fold(0u32, |h, b| h.wrapping_mul(31).wrapping_add(b as u32));
-    rgb(PALETTE[hash as usize % PALETTE.len()]).into()
+/// Sender names in groups: the XEP-0392 colour other clients show for the same nick, lighter on
+/// a dark theme so it stays readable.
+fn sender_color(nick: &str, dark: bool) -> Hsla {
+    let (r, g, b) = hsluv_to_rgb(xep0392_hue(nick), 100., if dark { 70. } else { 45. });
+    gpui_kit::Rgba { r: r as f32, g: g as f32, b: b as f32, a: 1. }.into()
+}
+
+/// XEP-0392 §5.1: the hue angle of `text`, from the first two bytes of its SHA-1 (little endian).
+fn xep0392_hue(text: &str) -> f64 {
+    use tokio_xmpp::parsers::{caps::hash_caps, hashes::Algo};
+    let h = hash_caps(text.as_bytes(), Algo::Sha_1).map(|h| h.hash).unwrap_or_default();
+    let n = h.first().copied().unwrap_or(0) as u32 | (h.get(1).copied().unwrap_or(0) as u32) << 8;
+    n as f64 / 65536. * 360.
+}
+
+/// HSLuv (hsluv.org) to sRGB in 0..1: hue in degrees, saturation and lightness 0..100.
+fn hsluv_to_rgb(h: f64, s: f64, l: f64) -> (f64, f64, f64) {
+    const M: [[f64; 3]; 3] = [
+        [3.240969941904521, -1.537383177570093, -0.498610760293],
+        [-0.96924363628087, 1.87596750150772, 0.041555057407175],
+        [0.055630079696993, -0.20397695888897, 1.056971514242878],
+    ];
+    const KAPPA: f64 = 903.2962962;
+    const EPSILON: f64 = 0.0088564516;
+    const REF_U: f64 = 0.19783000664283;
+    const REF_V: f64 = 0.46831999493879;
+    if l > 99.9999999 {
+        return (1., 1., 1.);
+    }
+    if l < 1e-8 {
+        return (0., 0., 0.);
+    }
+    // The most chroma the sRGB gamut allows at this lightness and hue: the nearest gamut edge.
+    let hrad = h.to_radians();
+    let sub1 = (l + 16.).powi(3) / 1560896.;
+    let sub2 = if sub1 > EPSILON { sub1 } else { l / KAPPA };
+    let mut max_chroma = f64::MAX;
+    for [m1, m2, m3] in M {
+        for t in [0., 1.] {
+            let top1 = (284517. * m1 - 94839. * m3) * sub2;
+            let top2 = (838422. * m3 + 769860. * m2 + 731718. * m1) * l * sub2 - 769860. * t * l;
+            let bottom = (632260. * m3 - 126452. * m2) * sub2 + 126452. * t;
+            let length = (top2 / bottom) / (hrad.sin() - (top1 / bottom) * hrad.cos());
+            if length >= 0. {
+                max_chroma = max_chroma.min(length);
+            }
+        }
+    }
+    // LCh -> Luv -> XYZ -> linear sRGB -> sRGB.
+    let c = max_chroma / 100. * s;
+    let (u, v) = (hrad.cos() * c, hrad.sin() * c);
+    let y = if l <= 8. { l / KAPPA } else { ((l + 16.) / 116.).powi(3) };
+    let (var_u, var_v) = (u / (13. * l) + REF_U, v / (13. * l) + REF_V);
+    let x = -(9. * y * var_u) / ((var_u - 4.) * var_v - var_u * var_v);
+    let z = (9. * y - 15. * var_v * y - var_v * x) / (3. * var_v);
+    let gamma = |c: f64| if c <= 0.0031308 { 12.92 * c } else { 1.055 * c.powf(1. / 2.4) - 0.055 };
+    let [r, g, b] = M.map(|[a, b, c]| gamma(a * x + b * y + c * z).clamp(0., 1.));
+    (r, g, b)
 }
 
 /// ~80 chars of a message around the first match of `q` (already lowercase).
@@ -799,23 +926,45 @@ impl App {
         } else {
             linear_gradient(160., linear_color_stop(rgb(0x3390EC), 0.), linear_color_stop(rgb(0x7BC4F7), 1.))
         };
-        v_flex().size_full().items_center().justify_center().bg(bg).child(
-            v_flex()
-                .w(dp(380.))
-                .gap_3()
-                .p_8()
-                .rounded(dp(20.))
-                .bg(p.panel)
-                .shadow_2xl()
+        let card = v_flex()
+            .w(dp(380.))
+            .gap_3()
+            .p_8()
+            .rounded(dp(20.))
+            .bg(p.panel)
+            .shadow_2xl()
+            .child(
+                v_flex()
+                    .items_center()
+                    .gap_2()
+                    .pb_2()
+                    .child(img(self.logo.clone()).size(dp(88.)))
+                    .child(div().text_2xl().font_weight(FontWeight::BOLD).child("Crabber"))
+                    .child(div().text_sm().text_color(p.muted).child(t!("login.subtitle"))),
+            );
+        // XEP-0077 second step: what the server asks for besides name and password.
+        if let Some(reg) = self.registration.as_ref()
+            && let Some(form) = &reg.form
+        {
+            let card = card
+                .child(div().font_weight(FontWeight::SEMIBOLD).child(t!("register.title", domain = reg.domain())))
+                .when_some(form.instructions.clone(), |d, i| d.child(div().text_sm().text_color(p.muted).child(i)))
+                .when_some(reg.captcha.clone(), |d, c| d.child(h_flex().justify_center().child(img(c).max_w_full().rounded_md())))
+                .children(reg.inputs.iter().zip(&form.fields).map(|(input, f)| v_flex().gap_1().child(div().text_xs().text_color(p.muted).child(f.label.clone())).child(Input::new(input))))
                 .child(
-                    v_flex()
-                        .items_center()
-                        .gap_2()
-                        .pb_2()
-                        .child(img(self.logo.clone()).size(dp(88.)))
-                        .child(div().text_2xl().font_weight(FontWeight::BOLD).child("Crabber"))
-                        .child(div().text_sm().text_color(p.muted).child(t!("login.subtitle"))),
+                    Button::new("register-submit")
+                        .primary()
+                        .large()
+                        .w_full()
+                        .label(t!("register.submit"))
+                        .loading(reg.busy)
+                        .on_click(cx.listener(|this, _, _, cx| this.submit_registration(cx))),
                 )
+                .child(Button::new("register-cancel").ghost().w_full().label(t!("modal.cancel")).on_click(cx.listener(|this, _, _, cx| this.cancel_registration(cx))));
+            return v_flex().size_full().items_center().justify_center().bg(bg).child(card);
+        }
+        v_flex().size_full().items_center().justify_center().bg(bg).child(
+            card
                 .child(Input::new(&self.login_jid))
                 .child(Input::new(&self.login_pass).mask_toggle())
                 .child(Input::new(&self.login_host))
@@ -845,6 +994,15 @@ impl App {
                         .label(t!("login.submit"))
                         .loading(self.connecting)
                         .on_click(cx.listener(|this, _, _, cx| this.login(cx))),
+                )
+                .child(
+                    Button::new("register")
+                        .ghost()
+                        .w_full()
+                        .label(t!("login.register"))
+                        .tooltip(t!("login.register_tip"))
+                        .loading(self.registration.is_some())
+                        .on_click(cx.listener(|this, _, w, cx| this.register(w, cx))),
                 )
                 .when(!self.login_error.is_empty(), |d| {
                     d.child(div().p_2().rounded_md().bg(p.danger.opacity(0.1)).text_sm().text_color(p.danger).child(self.login_error.clone()))
@@ -941,7 +1099,7 @@ impl App {
                 .gap_2()
                 .rounded_xl()
                 .bg(p.accent_soft)
-                .child(div().text_sm().child(t!("request.text", jid = jid)))
+                .child(div().text_sm().child(t!("request.text", jid = sess.nicks.get(jid).map_or_else(|| jid.clone(), |n| format!("{n} ({jid})")))))
                 .child(
                     h_flex()
                         .gap_2()
@@ -1608,7 +1766,7 @@ impl App {
                                     .py_0p5()
                                     .rounded_md()
                                     .bg(code)
-                                    .child(div().w(px(4.)).self_stretch().rounded_l_md().bg(if m.outgoing { fg } else { sender_color(&m.sender) }))
+                                    .child(div().w(px(4.)).self_stretch().rounded_l_md().bg(if m.outgoing { fg } else { sender_color(&m.sender, p.dark) }))
                                     .child(v_flex().flex_1().min_w_0().child(rich_text(SharedString::from(format!("qt-{i}-{j}-{}", m.msg_id)).into(), &text, code)))
                                     .into_any_element(),
                             })
@@ -1694,7 +1852,7 @@ impl App {
             .when(m.outgoing && last_in_group, |d| d.rounded_br(tail))
             .when(!m.outgoing && last_in_group, |d| d.rounded_bl(tail))
             .when(!p.dark, |d| d.shadow_sm())
-            .when(show_sender, |b| b.child(div().text_sm().font_weight(FontWeight::SEMIBOLD).text_color(sender_color(&m.sender)).child(m.sender.clone())))
+            .when(show_sender, |b| b.child(div().text_sm().font_weight(FontWeight::SEMIBOLD).text_color(sender_color(&m.sender, p.dark)).child(m.sender.clone())))
             .children(quote.map(|(id, ts, who, text, peer)| {
                 h_flex()
                     .id(SharedString::from(format!("q-{}", m.msg_id)))
@@ -1704,7 +1862,7 @@ impl App {
                     .rounded_md()
                     .bg(code)
                     .cursor_pointer()
-                    .child(div().w(px(4.)).self_stretch().rounded_l_md().bg(if m.outgoing { fg } else { sender_color(&who) }))
+                    .child(div().w(px(4.)).self_stretch().rounded_l_md().bg(if m.outgoing { fg } else { sender_color(&who, p.dark) }))
                     .child(
                         v_flex()
                             .flex_1()
@@ -2630,7 +2788,7 @@ impl App {
                 .gap_2()
                 .py_1()
                 .items_center()
-                .child(div().flex_1().min_w_0().truncate().text_sm().text_color(sender_color(&o.nick)).child(o.nick.clone()))
+                .child(div().flex_1().min_w_0().truncate().text_sm().text_color(sender_color(&o.nick, p.dark)).child(o.nick.clone()))
                 .when(!badge.is_empty(), |d| d.child(div().text_xs().text_color(p.muted).child(badge)))
                 .when(promote, |d| {
                     d.child(
@@ -4011,6 +4169,47 @@ mod tests {
         assert_eq!(initials("bitcoin_casino"), "BC");
         assert_eq!(initials("Bob"), "B");
         assert_eq!(initials("иван петров"), "ИП");
+    }
+
+    /// XEP-0393 §6.2: what is styled and what is not.
+    #[test]
+    fn message_styling_spans() {
+        let spans = |t: &str| super::styling_spans(t).into_iter().map(|(r, c)| (t[r].to_string(), c)).collect::<Vec<_>>();
+        let s = |v: &[(&str, char)]| v.iter().map(|(t, c)| (t.to_string(), *c)).collect::<Vec<_>>();
+        assert_eq!(spans("plain span"), s(&[]));
+        assert_eq!(spans("*strong span*"), s(&[("*strong span*", '*')]));
+        assert_eq!(spans("plain _emphasis_ plain"), s(&[("_emphasis_", '_')]));
+        assert_eq!(spans("`pre` plain *strong*"), s(&[("`pre`", '`'), ("*strong*", '*')]));
+        assert_eq!(spans("*strong*plain*"), s(&[("*strong*", '*')]));
+        assert_eq!(spans("* plain *strong*"), s(&[("*strong*", '*')]));
+        assert_eq!(spans("Everyone ~dis~likes cake."), s(&[("~dis~", '~')]));
+        assert_eq!(spans("This is `*monospace*`"), s(&[("`*monospace*`", '`')]), "nothing styled inside code");
+        assert_eq!(spans("This is *`monospace and bold`*"), s(&[("*`monospace and bold`*", '*'), ("`monospace and bold`", '`')]));
+        assert_eq!(spans("*bold _and italic_*"), s(&[("*bold _and italic_*", '*'), ("_and italic_", '_')]));
+        assert_eq!(spans("второе *слово* тут"), s(&[("*слово*", '*')]), "byte offsets with Cyrillic");
+        for t in ["not strong*", "*not strong", "*not \n strong*", "*not *strong", "**", "***", "****", "a*b*"] {
+            assert_eq!(spans(t), s(&[]), "{t:?}");
+        }
+        assert_eq!(spans("first\n_second_"), s(&[("_second_", '_')]), "a new line starts a block");
+    }
+
+    /// XEP-0392 §13.1 test vectors: hue, then RGB at saturation 100 and lightness 50.
+    #[test]
+    fn consistent_colors_match_the_xep() {
+        for (text, hue, rgb) in [
+            ("Romeo", 327.255249, (0.865, 0.000, 0.686)),
+            ("juliet@capulet.lit", 209.410400, (0.000, 0.515, 0.573)),
+            ("😺", 331.199341, (0.872, 0.000, 0.659)),
+            ("council", 359.994507, (0.918, 0.000, 0.394)),
+            ("Board", 171.430664, (0.000, 0.527, 0.457)),
+        ] {
+            let h = super::xep0392_hue(text);
+            assert!((h - hue).abs() < 1e-4, "{text}: hue {h}");
+            let (r, g, b) = super::hsluv_to_rgb(h, 100., 50.);
+            for (got, want) in [(r, rgb.0), (g, rgb.1), (b, rgb.2)] {
+                assert!((got - want).abs() < 0.001, "{text}: {:?} != {rgb:?}", (r, g, b));
+            }
+        }
     }
 
     #[test]

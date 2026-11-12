@@ -216,7 +216,7 @@ impl FileTransfers {
             reply_to: None,
             retracted: false,
         };
-        self.net.emit(Ev::Message { peer, groupchat: false, msg, archive_id: None, live: true, sid: None });
+        self.net.emit(Ev::Message { peer, groupchat: false, msg, archive_id: None, live: true, sid: None, occupant: None });
         Ok(())
     }
 

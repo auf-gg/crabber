@@ -56,6 +56,9 @@ impl ServerConnector for Connector {
     ) -> Result<(PendingFeaturesRecv<Self::Stream>, ChannelBinding), Error> {
         let domain = jid.domain().as_str();
         let header = || StreamHeader { to: Some(Cow::Owned(domain.to_owned())), from: None, id: None };
+        // Once encrypted the header names us: FAST (XEP-0484) needs it, and nobody else can read it.
+        // (Not for a sign-up, which connects as the bare domain.)
+        let secure_header = || StreamHeader { from: jid.node().map(|_| Cow::Owned(jid.to_bare().to_string())), ..header() };
 
         // XEP-0368: Direct TLS first, on the domain's xmpps SRV targets or a manual host on 5223.
         let direct = match &self.host {
@@ -69,7 +72,7 @@ impl ServerConnector for Connector {
                 Ok::<_, Error>(handshake(tcp, domain, self.insecure, true).await?)
             };
             if let Ok(Ok((tls, binding))) = tokio::time::timeout(CONNECT_TIMEOUT, attempt).await {
-                return Ok((initiate_stream(BufStream::new(tls), ns, header(), timeouts).await?, binding));
+                return Ok((initiate_stream(BufStream::new(tls), ns, secure_header(), timeouts).await?, binding));
             }
         }
 
@@ -94,7 +97,7 @@ impl ServerConnector for Connector {
         }
 
         let (tls, binding) = handshake(stream.into_inner().into_inner(), domain, self.insecure, false).await?;
-        Ok((initiate_stream(BufStream::new(tls), ns, header(), timeouts).await?, binding))
+        Ok((initiate_stream(BufStream::new(tls), ns, secure_header(), timeouts).await?, binding))
     }
 }
 

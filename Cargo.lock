@@ -1872,6 +1872,7 @@ dependencies = [
  "tokio-xmpp",
  "tray-icon",
  "unsafe-libopus",
+ "uuid",
  "webrtc",
  "windows 0.62.2",
  "windows-core 0.62.2",
@@ -10041,12 +10042,12 @@ dependencies = [
 [[package]]
 name = "tokio-xmpp"
 version = "6.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8921a165ab1eefd447cb1661423c582ac77b9c6960e123a71c8ad9cebc40b026"
 dependencies = [
+ "base64 0.22.1",
  "bytes",
  "futures",
  "hickory-resolver",
+ "hmac 0.12.1",
  "idna",
  "log",
  "pin-project-lite",
@@ -10054,10 +10055,13 @@ dependencies = [
  "rustls-native-certs",
  "rxml",
  "sasl",
+ "sha1 0.10.7",
+ "sha2 0.10.9",
  "thiserror 2.0.21",
  "tokio",
  "tokio-rustls",
  "tokio-stream",
+ "uuid",
  "xmpp-parsers",
  "xso",
 ]

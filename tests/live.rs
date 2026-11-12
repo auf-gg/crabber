@@ -46,6 +46,8 @@ fn login_as(user: &str, profile: &str) -> (UnboundedSender<Cmd>, UnboundedReceiv
         port: 5222,
         insecure: true,
         dir,
+        device_id: None,
+        fast: None,
     })
 }
 
@@ -80,13 +82,15 @@ fn chat_roundtrip() {
     wait(&mut b_rx, |e| matches!(e, Ev::Online { .. }).then_some(()));
     a.unbounded_send(Cmd::Sync { mam_after: None, rooms: vec![] }).unwrap();
 
-    // Roster + subscription: alice adds bob, bob approves.
+    // Roster + subscription: alice adds bob, bob approves; the request carries her nick (XEP-0172).
+    a.unbounded_send(Cmd::SetNick("Алиса".into())).unwrap();
     a.unbounded_send(Cmd::AddContact { jid: "bob@localhost".into(), name: "Bob".into() }).unwrap();
-    let from = wait(&mut b_rx, |e| match e {
-        Ev::SubscribeRequest { jid } => Some(jid.clone()),
+    let (from, nick) = wait(&mut b_rx, |e| match e {
+        Ev::SubscribeRequest { jid, nick } => Some((jid.clone(), nick.clone())),
         _ => None,
     });
     assert_eq!(from, "alice@localhost");
+    assert_eq!(nick.as_deref(), Some("Алиса"));
     b.unbounded_send(Cmd::Approve { jid: from }).unwrap();
     wait(&mut a_rx, |e| match e {
         Ev::RosterItem(c) if c.jid == "bob@localhost" && (c.subscription == "to" || c.subscription == "both") => Some(()),
@@ -166,6 +170,200 @@ fn chat_roundtrip() {
     b2.unbounded_send(Cmd::Download { url: url.clone(), path: target.clone() }).unwrap();
     wait(&mut b2_rx, |e| matches!(e, Ev::Downloaded { .. }).then_some(()));
     assert_eq!(std::fs::read(&target).unwrap(), b"hello file");
+}
+
+/// XEP-0234 over XEP-0261: with no HTTP Upload (pretended), alice's file goes to bob directly;
+/// bob takes the offer like a download and gets the same bytes, alice a delivery tick.
+#[test]
+#[ignore]
+fn jingle_file_transfer() {
+    reset_accounts();
+    /// Pretends there is no HTTP Upload until the test ends (also when it fails), so the later
+    /// tests in this run upload as usual. The clients read it after their roster, any time later.
+    struct NoUpload;
+    impl Drop for NoUpload {
+        fn drop(&mut self) {
+            // SAFETY: tests run one at a time (--test-threads=1).
+            unsafe { std::env::remove_var("CRABBER_NO_HTTP_UPLOAD") };
+        }
+    }
+    // SAFETY: tests run one at a time (--test-threads=1).
+    unsafe { std::env::set_var("CRABBER_NO_HTTP_UPLOAD", "1") };
+    let _no_upload = NoUpload;
+    let (a, mut a_rx) = login("alice");
+    let (b, mut b_rx) = login("bob");
+    wait(&mut a_rx, |e| matches!(e, Ev::Online { .. }).then_some(()));
+    wait(&mut b_rx, |e| matches!(e, Ev::Online { .. }).then_some(()));
+    a.unbounded_send(Cmd::AddContact { jid: "bob@localhost".into(), name: String::new() }).unwrap();
+    let from = wait(&mut b_rx, |e| match e {
+        Ev::SubscribeRequest { jid, .. } => Some(jid.clone()),
+        _ => None,
+    });
+    b.unbounded_send(Cmd::Approve { jid: from }).unwrap();
+    // Presence again: what the server sends on approval alone does not always reach alice in time.
+    b.unbounded_send(Cmd::SetShow(None)).unwrap();
+    // alice must see bob online: the file goes to one of his resources.
+    wait(&mut a_rx, |e| matches!(e, Ev::Presence { jid, online: true } if jid == "bob@localhost").then_some(()));
+
+    // Three blocks, the last one short. Small: IBB goes through the server, whose default c2s
+    // shaper allows 3 KB/s.
+    let data: Vec<u8> = (0..16_484u32).map(|i| (i * 7 % 251) as u8).collect();
+    let src = std::env::temp_dir().join("re-jingle-src.bin");
+    std::fs::write(&src, &data).unwrap();
+    let id = xmpp::new_id();
+    a.unbounded_send(Cmd::Upload { to: "bob@localhost".into(), id: id.clone(), path: src, groupchat: false, enc: "plain".into() }).unwrap();
+
+    let url = wait(&mut b_rx, |e| match e {
+        Ev::Message { msg, .. } if msg.url.as_deref().is_some_and(|u| u.starts_with("jingle://")) => msg.url.clone(),
+        _ => None,
+    });
+    assert!(url.ends_with("/re-jingle-src.bin"), "{url}");
+    let dst = std::env::temp_dir().join("re-jingle-dst.bin");
+    let _ = std::fs::remove_file(&dst);
+    b.unbounded_send(Cmd::Download { url: url.clone(), path: dst.clone() }).unwrap();
+    wait(&mut b_rx, |e| match e {
+        Ev::Downloaded { url: u } if *u == url => Some(()),
+        Ev::DownloadFailed { error, .. } => panic!("download failed: {error}"),
+        _ => None,
+    });
+    assert_eq!(std::fs::read(&dst).unwrap(), data);
+    wait(&mut a_rx, |e| match e {
+        Ev::Uploaded { id: i, url, .. } if *i == id => {
+            assert!(url.starts_with("jingle://"));
+            Some(())
+        }
+        Ev::SendFailed { error, .. } => panic!("send failed: {error}"),
+        _ => None,
+    });
+    wait(&mut a_rx, |e| matches!(e, Ev::Receipt { id: i, .. } if *i == id).then_some(()));
+}
+
+/// XEP-0421: bob writes as "x" and leaves; carol takes the nick "x" and tries to correct his
+/// message. The room's occupant-ids differ, so the correction is refused. Needs
+/// mod_muc_occupantid on the server.
+#[test]
+#[ignore]
+fn occupant_id_guards_corrections() {
+    reset_accounts();
+    let (a, mut a_rx) = login("alice");
+    wait(&mut a_rx, |e| matches!(e, Ev::Online { .. }).then_some(()));
+    let room = format!("o{}@conference.localhost", xmpp::new_id());
+    a.unbounded_send(Cmd::Join { room: room.clone(), nick: "alice".into(), since: None, after: None, create_name: Some("Ники".into()) }).unwrap();
+    wait(&mut a_rx, |e| matches!(e, Ev::RoomJoined { room: r, .. } if *r == room).then_some(()));
+    std::thread::sleep(Duration::from_secs(1)); // room config and disco after creation
+
+    let say = |tx: &UnboundedSender<Cmd>, id: &str, body: &str| {
+        tx.unbounded_send(Cmd::Send { to: room.clone(), id: id.into(), body: body.into(), groupchat: true, enc: "plain".into(), reply: None }).unwrap();
+    };
+    let (b, mut b_rx) = login("bob");
+    wait(&mut b_rx, |e| matches!(e, Ev::Online { .. }).then_some(()));
+    b.unbounded_send(Cmd::Join { room: room.clone(), nick: "x".into(), since: None, after: None, create_name: None }).unwrap();
+    wait(&mut b_rx, |e| matches!(e, Ev::RoomJoined { room: r, .. } if *r == room).then_some(()));
+    let id = xmpp::new_id();
+    say(&b, &id, "оригинал");
+    let original = wait(&mut a_rx, |e| match e {
+        Ev::Message { msg, occupant, .. } if msg.msg_id == id => Some(occupant.clone()),
+        _ => None,
+    });
+    let original = original.expect("the room stamps an occupant-id");
+    b.unbounded_send(Cmd::Leave { room: room.clone() }).unwrap();
+    std::thread::sleep(Duration::from_millis(500));
+
+    let (c, mut c_rx) = login("carol");
+    wait(&mut c_rx, |e| matches!(e, Ev::Online { .. }).then_some(()));
+    c.unbounded_send(Cmd::Join { room: room.clone(), nick: "x".into(), since: None, after: None, create_name: None }).unwrap();
+    wait(&mut c_rx, |e| matches!(e, Ev::RoomJoined { room: r, .. } if *r == room).then_some(()));
+    c.unbounded_send(Cmd::Correct { to: room.clone(), replace: id.clone(), body: "подделка".into(), groupchat: true, enc: "plain".into() }).unwrap();
+    let (sender, forged) = wait(&mut a_rx, |e| match e {
+        Ev::Correct { id: i, sender, occupant, .. } if *i == id => Some((sender.clone(), occupant.clone())),
+        _ => None,
+    });
+    assert_eq!(sender, "x", "same nick");
+    assert_ne!(forged.as_ref(), Some(&original), "but someone else");
+
+    // What the app then does with it.
+    let store = crabber::store::Store::open(std::path::Path::new(":memory:")).unwrap();
+    let msg = crabber::store::Msg { msg_id: id.clone(), sender: "x".into(), outgoing: false, body: "оригинал".into(), url: None, ts: 1, status: 0, enc: 0, edited: false, reply_to: None, retracted: false };
+    store.insert_msg(&room, &msg);
+    store.set_occupant(&room, &id, "x", &original);
+    assert!(!store.correct(&room, &id, "x", "подделка", forged.as_deref()));
+}
+
+/// XEP-0388/0484: the password login hands out a FAST token; the next login works with the token
+/// alone (the password given is wrong). Needs mod_auth_fast on the server.
+#[test]
+#[ignore]
+fn fast_token_login() {
+    reset_accounts();
+    let _ = tokio_xmpp::rustls::crypto::ring::default_provider().install_default();
+    let device = "0f8fad5b-d9cb-469f-a165-70867728950e".to_string();
+    let connect = |password: &str, fast: Option<tokio_xmpp::FastToken>| {
+        xmpp::connect(Account {
+            jid: BareJid::from_str("alice@localhost").unwrap(),
+            password: password.into(),
+            host: Some("127.0.0.1".into()),
+            port: 5222,
+            insecure: true,
+            dir: std::env::temp_dir().join("re-test-fast"),
+            device_id: Some(device.clone()),
+            fast,
+        })
+    };
+    let (tx, mut rx) = connect("alice", None);
+    let token = wait(&mut rx, |e| match e {
+        Ev::FastToken(Some(t)) => Some(t.clone()),
+        _ => None,
+    });
+    assert!(token.mechanism.starts_with("HT-SHA-256-"), "{token:?}");
+    wait(&mut rx, |e| matches!(e, Ev::Online { .. }).then_some(()));
+    drop((tx, rx));
+
+    let (_tx, mut rx) = connect("not the password", Some(token));
+    wait(&mut rx, |e| matches!(e, Ev::Online { .. }).then_some(()));
+}
+
+/// XEP-0077: a new account from the client (the test server allows it from loopback, no CAPTCHA),
+/// then a login with it; a taken name is refused.
+#[test]
+#[ignore]
+fn register_account() {
+    let user = format!("reg{}", std::process::id());
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let register = |name: &str| {
+        let (tx, mut rx) = crabber::register::start("localhost".into(), Some("127.0.0.1".into()), 5222, true);
+        rt.block_on(async {
+            tokio::time::timeout(Duration::from_secs(15), async {
+                loop {
+                    match rx.next().await.expect("closed") {
+                        crabber::register::Ev::Form(f) => {
+                            assert!(f.ready(), "the test server asks for nothing but name and password: {f:?}");
+                            tx.unbounded_send(crabber::register::Submit { username: name.into(), password: "pw".into(), values: Default::default() }).unwrap();
+                        }
+                        crabber::register::Ev::Done => return Ok(()),
+                        crabber::register::Ev::Failed(e) => return Err(e),
+                    }
+                }
+            })
+            .await
+            .expect("timed out")
+        })
+    };
+    register(&user).unwrap();
+    assert!(register(&user).is_err(), "the name is taken now");
+
+    let (_tx, mut rx) = xmpp::connect(Account {
+        jid: BareJid::from_str(&format!("{user}@localhost")).unwrap(),
+        password: "pw".into(),
+        host: Some("127.0.0.1".into()),
+        port: 5222,
+        insecure: true,
+        dir: std::env::temp_dir().join(format!("re-test-{user}")),
+        device_id: None,
+        fast: None,
+    });
+    wait(&mut rx, |e| matches!(e, Ev::Online { .. }).then_some(()));
+    let ctl = std::env::var("EJABBERDCTL").unwrap_or_else(|_| "ejabberdctl".into());
+    let _ = std::process::Command::new(ctl).args(["unregister", &user, "localhost"]).status();
 }
 
 /// XEP-0313 in a room: bob joins after the fact and gets the history from the room's archive;
@@ -482,6 +680,9 @@ fn omemo_multi_device() {
     std::thread::sleep(Duration::from_secs(2));
     let id = send(&a, &mut a_rx, "bob@localhost", "шесть");
     let (b, mut b_rx) = login("bob");
+    // With Bind 2 (XEP-0386) the server drops offline messages: the archive has them, as the app syncs.
+    wait(&mut b_rx, |e| matches!(e, Ev::Online { .. }).then_some(()));
+    b.unbounded_send(Cmd::Sync { mam_after: None, rooms: vec![] }).unwrap();
     assert_eq!(recv(&mut b_rx, &id), ("шесть".into(), 1));
     let id = send(&b, &mut b_rx, "alice@localhost", "семь");
     assert_eq!(recv(&mut a_rx, &id), ("семь".into(), 1));

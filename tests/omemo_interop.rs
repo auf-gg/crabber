@@ -32,6 +32,8 @@ fn login(user: &str) -> (UnboundedSender<Cmd>, UnboundedReceiver<Ev>) {
         port: 5222,
         insecure: true,
         dir,
+        device_id: None,
+        fast: None,
     })
 }
 

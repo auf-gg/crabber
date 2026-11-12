@@ -4,6 +4,7 @@ pub mod call;
 pub mod groupcall;
 pub mod omemo;
 pub mod pgp;
+pub mod register;
 pub mod connector;
 pub mod e2e;
 pub mod filetransfer;

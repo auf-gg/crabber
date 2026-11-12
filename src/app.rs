@@ -53,6 +53,20 @@ fn save_password(jid: &str, password: &str) {
     }
 }
 
+/// Where an account's FAST token (XEP-0484) is kept: next to its password, as secret.
+fn fast_key(jid: &str) -> String {
+    format!("{jid}#fast")
+}
+
+fn encode_fast(t: &tokio_xmpp::FastToken) -> String {
+    format!("{}\n{}\n{}", t.mechanism, t.token, t.expiry)
+}
+
+fn decode_fast(v: &str) -> Option<tokio_xmpp::FastToken> {
+    let mut it = v.splitn(3, '\n');
+    Some(tokio_xmpp::FastToken { mechanism: it.next()?.into(), token: it.next()?.into(), expiry: it.next().unwrap_or_default().into() })
+}
+
 fn delete_password(jid: &str) {
     match store::portable_dir() {
         Some(dir) => {
@@ -292,6 +306,25 @@ fn load_device(s: &Store, key: &str) -> Option<MediaDevice> {
     Some(MediaDevice { id, name: s.get(&format!("{key}_name")).unwrap_or_default() })
 }
 
+/// A new account being made from the login screen (XEP-0077).
+pub struct Registration {
+    submit: UnboundedSender<crabber::register::Submit>,
+    jid: String,
+    password: String,
+    /// Waiting for the server: its form, or its answer to ours.
+    pub busy: bool,
+    pub form: Option<crabber::register::Form>,
+    /// One per `form.fields`.
+    pub inputs: Vec<Entity<InputState>>,
+    pub captcha: Option<Arc<Image>>,
+}
+
+impl Registration {
+    pub fn domain(&self) -> &str {
+        self.jid.split('@').nth(1).unwrap_or_default()
+    }
+}
+
 pub struct CallUi {
     pub peer: String,
     pub state: CallState,
@@ -423,6 +456,8 @@ pub struct Session {
     pub members: HashMap<String, HashMap<String, Occupant>>,
     /// XEP-0054 vCard fields, fetched when a contact card (or our editor) opens.
     pub profiles: HashMap<String, xmpp::Profile>,
+    /// XEP-0172 names contacts gave themselves (kept in the database as "nick:<jid>").
+    pub nicks: HashMap<String, String>,
 }
 
 impl Session {
@@ -435,10 +470,19 @@ impl Session {
     fn chat_mut(&mut self, peer: &str) -> Option<&mut ChatRow> {
         self.chats.iter_mut().find(|c| c.peer == peer)
     }
+    /// Our name for the chat, else the name the contact gave themselves (XEP-0172), else the JID's user part.
     pub fn display_name(&self, peer: &str) -> String {
         match self.chat(peer) {
             Some(c) if !c.name.is_empty() => c.name.clone(),
-            _ => peer.split('@').next().unwrap_or(peer).to_string(),
+            _ => self.nicks.get(peer).cloned().unwrap_or_else(|| peer.split('@').next().unwrap_or(peer).to_string()),
+        }
+    }
+    fn set_nick(&mut self, jid: String, nick: String) {
+        self.store.set(&format!("nick:{jid}"), &nick);
+        if nick.is_empty() {
+            self.nicks.remove(&jid);
+        } else {
+            self.nicks.insert(jid, nick);
         }
     }
     pub fn localpart(&self) -> String {
@@ -598,6 +642,7 @@ pub struct App {
     pub remember: bool,
     pub login_error: SharedString,
     pub connecting: bool,
+    pub registration: Option<Registration>,
 
     pub sess: Option<Session>,
     pub search: Entity<InputState>,
@@ -823,6 +868,7 @@ impl App {
             remember: true,
             login_error: "".into(),
             connecting: false,
+            registration: None,
             sess: None,
             search,
             compose,
@@ -1065,31 +1111,124 @@ impl App {
     }
 
     pub fn login(&mut self, cx: &mut Context<Self>) {
-        if self.connecting || self.sess.is_some() {
+        if self.connecting || self.sess.is_some() || self.registration.is_some() {
             return;
         }
-        let jid = self.login_jid.read(cx).value().trim().to_string();
-        let password = self.login_pass.read(cx).value().to_string();
-        if BareJid::from_str(&jid).is_err() || !jid.contains('@') {
-            self.login_error = t!("login.bad_jid").into();
-            cx.notify();
-            return;
-        }
-        if password.is_empty() {
-            self.login_error = t!("login.no_password").into();
-            cx.notify();
-            return;
-        }
+        let Some((jid, password)) = self.credentials(cx) else { return };
         self.start_session(jid, password, cx);
     }
 
-    fn start_session(&mut self, jid: String, password: String, cx: &mut Context<Self>) {
-        let host_field = self.login_host.read(cx).value().trim().to_string();
-        let (host, port) = match host_field.rsplit_once(':') {
+    /// The XEP-0388 user-agent id of this installation: made once, then kept.
+    fn device_id(&self) -> String {
+        if let Some(id) = self.app_store.get("device_id") {
+            return id;
+        }
+        let id = uuid::Builder::from_random_bytes(rand::random()).into_uuid().to_string();
+        self.app_store.set("device_id", &id);
+        id
+    }
+
+    /// JID and password from the login form, or `None` with the error shown.
+    fn credentials(&mut self, cx: &mut Context<Self>) -> Option<(String, String)> {
+        let jid = self.login_jid.read(cx).value().trim().to_string();
+        let password = self.login_pass.read(cx).value().to_string();
+        let error = if BareJid::from_str(&jid).is_err() || !jid.contains('@') {
+            t!("login.bad_jid")
+        } else if password.is_empty() {
+            t!("login.no_password")
+        } else {
+            return Some((jid, password));
+        };
+        self.login_error = error.into();
+        cx.notify();
+        None
+    }
+
+    /// Manual server from the login form: (host, port, the field as typed).
+    fn server_address(&self, cx: &Context<Self>) -> (Option<String>, u16, String) {
+        let field = self.login_host.read(cx).value().trim().to_string();
+        let (host, port) = match field.rsplit_once(':') {
             Some((h, p)) if p.parse::<u16>().is_ok() => (Some(h.to_string()), p.parse().unwrap()),
-            _ if !host_field.is_empty() => (Some(host_field.clone()), 5222),
+            _ if !field.is_empty() => (Some(field.clone()), 5222),
             _ => (None, 5222),
         };
+        (host, port, field)
+    }
+
+    /// "Create account": asks the server of the typed JID for its registration form (XEP-0077).
+    pub fn register(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.connecting || self.sess.is_some() || self.registration.is_some() {
+            return;
+        }
+        let Some((jid, password)) = self.credentials(cx) else { return };
+        let (host, port, _) = self.server_address(cx);
+        let domain = jid.split('@').nth(1).unwrap_or_default().to_string();
+        let (submit, mut events) = crabber::register::start(domain, host, port, self.insecure);
+        self.registration = Some(Registration { submit, jid, password, busy: true, form: None, inputs: vec![], captcha: None });
+        self.login_error = "".into();
+        cx.spawn_in(window, async move |this, cx| {
+            while let Some(ev) = events.next().await {
+                if this.update_in(cx, |app, window, cx| app.on_register(ev, window, cx)).is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn on_register(&mut self, ev: crabber::register::Ev, window: &mut Window, cx: &mut Context<Self>) {
+        use crabber::register::Ev;
+        let Some(reg) = self.registration.as_mut() else { return };
+        match ev {
+            // Only the name and password typed already: no second step.
+            Ev::Form(form) if form.ready() => {
+                let _ = reg.submit.unbounded_send(crabber::register::Submit {
+                    username: reg.jid.split('@').next().unwrap_or_default().to_string(),
+                    password: reg.password.clone(),
+                    values: HashMap::new(),
+                });
+            }
+            Ev::Form(form) => {
+                reg.inputs = form.fields.iter().map(|f| cx.new(|cx| InputState::new(window, cx).placeholder(f.label.clone()).masked(f.private))).collect();
+                reg.captcha = form.captcha.clone().and_then(|b| image_format(&b).map(|fmt| Arc::new(Image::from_bytes(fmt, b))));
+                if let Some(first) = reg.inputs.last() {
+                    first.update(cx, |s, cx| s.focus(window, cx));
+                }
+                reg.form = Some(form);
+                reg.busy = false;
+            }
+            Ev::Done => {
+                let reg = self.registration.take().unwrap();
+                self.start_session(reg.jid, reg.password, cx);
+            }
+            Ev::Failed(e) => {
+                self.registration = None;
+                self.login_error = t!("register.failed", e = e).into();
+            }
+        }
+        cx.notify();
+    }
+
+    /// Second step: the answers to the server's form (CAPTCHA and the like).
+    pub fn submit_registration(&mut self, cx: &mut Context<Self>) {
+        let Some(reg) = self.registration.as_mut().filter(|r| !r.busy) else { return };
+        let Some(form) = &reg.form else { return };
+        let values = form.fields.iter().zip(&reg.inputs).map(|(f, i)| (f.var.clone(), i.read(cx).value().trim().to_string())).collect();
+        let username = reg.jid.split('@').next().unwrap_or_default().to_string();
+        let _ = reg.submit.unbounded_send(crabber::register::Submit { username, password: reg.password.clone(), values });
+        reg.busy = true;
+        cx.notify();
+    }
+
+    /// Back to the login form; the server connection closes with the channel.
+    pub fn cancel_registration(&mut self, cx: &mut Context<Self>) {
+        self.registration = None;
+        cx.notify();
+    }
+
+    fn start_session(&mut self, jid: String, password: String, cx: &mut Context<Self>) {
+        let (host, port, host_field) = self.server_address(cx);
         let dir = store::account_dir(&jid);
         let store = match Store::open(&dir.join("chat.db")) {
             Ok(s) => s,
@@ -1106,6 +1245,9 @@ impl App {
             save_password(&jid, &password);
         }
 
+        // Tokens (XEP-0484) only where the password is kept too.
+        let device_id = self.remember.then(|| self.device_id());
+        let fast = device_id.as_ref().and_then(|_| load_password(&fast_key(&jid))).and_then(|v| decode_fast(&v));
         let (cmd, mut events) = xmpp::connect(Account {
             jid: BareJid::from_str(&jid).unwrap(),
             password,
@@ -1113,10 +1255,13 @@ impl App {
             port,
             insecure: self.insecure,
             dir: dir.clone(),
+            device_id,
+            fast,
         });
         let _ = cmd.unbounded_send(Cmd::E2eBlindTrust(self.settings.blind_trust));
         let mut chats = store.chats();
         chats.sort_by_key(|c| std::cmp::Reverse(c.last.as_ref().map_or(0, |m| m.ts)));
+        let nicks = chats.iter().filter_map(|c| store.get(&format!("nick:{}", c.peer)).filter(|n| !n.is_empty()).map(|n| (c.peer.clone(), n))).collect();
         let mut sess = Session {
             me: jid.clone(),
             cmd,
@@ -1153,6 +1298,7 @@ impl App {
             blocked: None,
             members: HashMap::new(),
             profiles: HashMap::new(),
+            nicks,
         };
         for peer in sess.chats.iter().map(|c| c.peer.clone()).chain([jid]).collect::<Vec<_>>() {
             sess.load_avatar(&peer);
@@ -1291,6 +1437,7 @@ impl App {
     pub fn logout(&mut self, cx: &mut Context<Self>) {
         if let Some(sess) = self.sess.take() {
             delete_password(&sess.me);
+            delete_password(&fast_key(&sess.me));
         }
         self.connecting = false;
         self.modal = None;
@@ -1682,6 +1829,9 @@ impl App {
         }
         p[8] = self.profile_about.read(cx).value().trim().to_string();
         if let Some(sess) = &self.sess {
+            // XEP-0172: what others see us as, for contacts who have no name for us yet.
+            let nick = if p[1].is_empty() { p[0].clone() } else { p[1].clone() };
+            sess.send(Cmd::SetNick(nick));
             sess.send(Cmd::SetProfile(p));
         }
         self.modal = Some(Modal::Settings);
@@ -1786,6 +1936,10 @@ impl App {
                         sess.send(Cmd::SetShow(sess.show.clone()));
                     }
                 }
+                Ev::FastToken(token) => match token {
+                    Some(t) => save_password(&fast_key(&sess.me), &encode_fast(&t)),
+                    None => delete_password(&fast_key(&sess.me)),
+                },
                 Ev::Disconnected(e) => {
                     if !sess.ever_online {
                         failed_login = Some(e);
@@ -1814,7 +1968,11 @@ impl App {
                         sess.presence.remove(&jid);
                     }
                 }
-                Ev::SubscribeRequest { jid } => {
+                Ev::Nick { jid, nick } => sess.set_nick(jid, nick),
+                Ev::SubscribeRequest { jid, nick } => {
+                    if let Some(nick) = nick {
+                        sess.set_nick(jid.clone(), nick);
+                    }
                     // We asked for their presence already (we added them): approve automatically.
                     let ours = sess.chat(&jid).is_some_and(|c| c.in_roster && (c.subscription == "to" || c.subscription == "none"));
                     if ours {
@@ -1823,7 +1981,7 @@ impl App {
                         sess.requests.push(jid);
                     }
                 }
-                Ev::Message { peer, groupchat, mut msg, archive_id, live, sid } => {
+                Ev::Message { peer, groupchat, mut msg, archive_id, live, sid, occupant } => {
                     if let Some(id) = archive_id {
                         sess.store.set("mam_last", &id);
                     }
@@ -1834,6 +1992,9 @@ impl App {
                     // Our own groupchat messages learn their stanza-id from the room's echo.
                     if let Some(sid) = &sid {
                         sess.store.set_sid(&peer, &msg.msg_id, sid);
+                    }
+                    if let Some(o) = &occupant {
+                        sess.store.set_occupant(&peer, &msg.msg_id, &msg.sender, o);
                     }
                     if !inserted {
                         // Duplicate: MUC echo / carbon of something we sent confirms delivery.
@@ -1888,7 +2049,7 @@ impl App {
                         self.messages.splice(pos..pos, 1);
                     }
                 }
-                Ev::Correct { peer, id, sender, body } => apply_correction(sess, &peer, &id, &sender, &body),
+                Ev::Correct { peer, id, sender, body, occupant } => apply_correction(sess, &peer, &id, &sender, &body, occupant.as_deref()),
                 Ev::Mds { peer, sid } => {
                     sess.mds.insert(peer.clone(), sid);
                     if let Some(ts) = read_marker_ts(sess, &peer) {
@@ -2019,9 +2180,9 @@ impl App {
                         sess.send(Cmd::Join { room: room.clone(), nick, since: sess.store.last_ts(&room), after: sess.store.last_sid(&room), create_name: None });
                     }
                 }
-                Ev::Retract { peer, id, sender } => {
+                Ev::Retract { peer, id, sender, occupant } => {
                     if let Some(msg_id) = sess.store.resolve(&peer, &id) {
-                        apply_retract(sess, &peer, &msg_id, sender.as_deref());
+                        apply_retract(sess, &peer, &msg_id, sender.as_deref(), occupant.as_deref());
                     }
                 }
                 Ev::Invite { room, from } => {
@@ -2331,7 +2492,7 @@ impl App {
         } else {
             let id = if groupchat { sid.unwrap_or_else(|| m.msg_id.clone()) } else { m.msg_id.clone() };
             sess.send(Cmd::Retract { to: peer.clone(), id, groupchat });
-            apply_retract(sess, &peer, &m.msg_id, None);
+            apply_retract(sess, &peer, &m.msg_id, None, None);
         }
         cx.notify();
     }
@@ -2368,7 +2529,7 @@ impl App {
         let enc = sess.chat(peer).map(|c| c.enc.clone()).unwrap_or_default();
         let sender = sess.my_sender(peer);
         sess.send(Cmd::Correct { to: peer.to_string(), replace: id.clone(), body: body.clone(), groupchat, enc });
-        apply_correction(sess, peer, &id, &sender, &body);
+        apply_correction(sess, peer, &id, &sender, &body, None);
     }
 
     /// "Edit" from the message menu: loads our text into the composer.
@@ -3210,8 +3371,8 @@ pub fn my_occupant<'a>(sess: &'a Session, room: &str) -> Option<&'a Occupant> {
     sess.members.get(room)?.get(nick)
 }
 
-fn apply_retract(sess: &mut Session, peer: &str, msg_id: &str, sender: Option<&str>) {
-    if !sess.store.retract(peer, msg_id, sender) {
+fn apply_retract(sess: &mut Session, peer: &str, msg_id: &str, sender: Option<&str>, occupant: Option<&str>) {
+    if !sess.store.retract(peer, msg_id, sender, occupant) {
         return;
     }
     let blank = |m: &mut Msg| {
@@ -3250,8 +3411,8 @@ fn reply_for(sess: &Session, peer: &str, groupchat: bool, r: &Msg) -> Reply {
     Reply { id, to, quote }
 }
 
-fn apply_correction(sess: &mut Session, peer: &str, id: &str, sender: &str, body: &str) {
-    if !sess.store.correct(peer, id, sender, body) {
+fn apply_correction(sess: &mut Session, peer: &str, id: &str, sender: &str, body: &str, occupant: Option<&str>) {
+    if !sess.store.correct(peer, id, sender, body, occupant) {
         return;
     }
     let fix = |m: &mut Msg| {

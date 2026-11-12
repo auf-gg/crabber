@@ -67,6 +67,11 @@ pub struct Account {
     pub port: u16,
     pub insecure: bool,
     pub dir: PathBuf,
+    /// XEP-0388 user-agent id (a UUID) that stays the same for this installation; FAST tokens
+    /// (XEP-0484) are tied to it. `None`: no tokens.
+    pub device_id: Option<String>,
+    /// The FAST token saved last time; a new one comes back as `Ev::FastToken`.
+    pub fast: Option<tokio_xmpp::FastToken>,
 }
 
 #[derive(Clone, Debug)]
@@ -114,6 +119,7 @@ const NS_MODERATE: &str = "urn:xmpp:message-moderate:1";
 const NS_FALLBACK: &str = "urn:xmpp:fallback:0";
 const NS_SID: &str = "urn:xmpp:sid:0";
 const NS_PEP_VCARD_CONVERSION: &str = "urn:xmpp:pep-vcard-conversion:0";
+const NS_OCCUPANT_ID: &str = "urn:xmpp:occupant-id:0";
 
 pub enum Cmd {
     /// Sent by the UI after `Ev::Online`: MAM catch-up point and rooms to rejoin (room, nick, since, after).
@@ -154,6 +160,8 @@ pub enum Cmd {
     GetProfile { jid: String },
     /// XEP-0054: new values of our vCard fields; the rest of the vCard stays.
     SetProfile(Profile),
+    /// XEP-0172: the name we want others to see; empty takes it down.
+    SetNick(String),
     /// Asks for `Ev::E2eDevices` of a JID (our own JID lists our devices).
     E2eInfo { jid: String },
     E2eTrust { jid: String, device: u32, trusted: bool },
@@ -172,16 +180,22 @@ pub enum Cmd {
 #[derive(Debug)]
 pub enum Ev {
     Online { jid: String },
+    /// XEP-0484: the token to log in with next time (`None`: forget the old one). A secret.
+    FastToken(Option<tokio_xmpp::FastToken>),
     Disconnected(String),
     Roster(Vec<Contact>),
     RosterItem(Contact),
     Presence { jid: String, online: bool },
-    SubscribeRequest { jid: String },
+    /// `nick`: the name they gave themselves (XEP-0172).
+    SubscribeRequest { jid: String, nick: Option<String> },
+    /// XEP-0172: the name `jid` gave themselves; empty when they took it down.
+    Nick { jid: String, nick: String },
     /// `live`: arrived just now (not from MAM, offline storage or MUC history) — worth a notification.
     /// `sid`: stanza-id the room (groups) or our archive (1:1) assigned.
-    Message { peer: String, groupchat: bool, msg: Msg, archive_id: Option<String>, live: bool, sid: Option<String> },
+    /// `occupant`: XEP-0421 id of the sender in a room that stamps them.
+    Message { peer: String, groupchat: bool, msg: Msg, archive_id: Option<String>, live: bool, sid: Option<String>, occupant: Option<String> },
     /// XEP-0308: `sender` replaced the text of their message `id`.
-    Correct { peer: String, id: String, sender: String, body: String },
+    Correct { peer: String, id: String, sender: String, body: String, occupant: Option<String> },
     /// XEP-0444: `sender`'s full reaction set for message `id`.
     Reactions { peer: String, id: String, sender: String, emojis: Vec<String> },
     /// Server bookmarks at login; `None`: the account has no bookmarks node yet.
@@ -207,7 +221,7 @@ pub enum Ev {
     /// We were kicked, banned or removed from `room`.
     RoomRemoved { room: String, reason: String },
     /// XEP-0424/0425: message `id` deleted for everyone; `sender: None` = by a moderator.
-    Retract { peer: String, id: String, sender: Option<String> },
+    Retract { peer: String, id: String, sender: Option<String>, occupant: Option<String> },
     Invite { room: String, from: String },
     Avatar { jid: String },
     /// XEP-0054 fields of `jid`'s vCard; `None` when it could not be fetched.
@@ -302,6 +316,8 @@ struct Room {
     occupants: HashSet<String>,
     joined: bool,
     create_name: Option<String>,
+    /// XEP-0421: the room stamps occupant-ids (and strips forged ones), so they can be trusted.
+    occupant_ids: Arc<AtomicBool>,
 }
 
 struct State {
@@ -331,12 +347,22 @@ struct State {
     photo_hash: Arc<Mutex<Option<String>>>,
     /// XEP-0398: the server mirrors our PEP avatar into our vCard.
     vcard_conversion: Arc<AtomicBool>,
+    /// XEP-0172: our published nick, sent along with subscription requests.
+    my_nick: Option<String>,
 }
 
 async fn run(acc: Account, mut cmds: UnboundedReceiver<Cmd>, ev: UnboundedSender<Ev>) {
     let connector = Connector { host: acc.host.clone(), port: acc.port, insecure: acc.insecure };
     let timeouts = Timeouts { read_timeout: Duration::from_secs(60), response_timeout: Duration::from_secs(30) };
-    let mut client = Client::new_with_connector(acc.jid.clone(), acc.password.clone(), connector, timeouts);
+    // SASL2 with Bind 2 and FAST tokens where the server has them (vendor/tokio-xmpp).
+    let fast = Arc::new(Mutex::new(acc.fast.clone()));
+    let login = tokio_xmpp::LoginOptions {
+        user_agent: acc.device_id.as_deref().and_then(|id| uuid::Uuid::parse_str(id).ok()).map(|id| (id, "Crabber".into(), std::env::consts::OS.into())),
+        tag: Some("Crabber".into()),
+        fast: acc.device_id.is_some().then(|| fast.clone()),
+    };
+    let mut saved_token = acc.fast.clone();
+    let mut client = Client::new_with_login(acc.jid.clone(), acc.password.clone(), connector, timeouts, login);
     let (out_tx, mut out_rx) = unbounded();
     let net = Net { out: out_tx, ev };
     let http = reqwest::Client::builder()
@@ -367,6 +393,7 @@ async fn run(acc: Account, mut cmds: UnboundedReceiver<Cmd>, ev: UnboundedSender
         pep_avatars: HashMap::new(),
         photo_hash: Arc::new(Mutex::new(photo_hash)),
         vcard_conversion: Arc::default(),
+        my_nick: None,
     };
     match e2e::E2e::open(&st.dir, &acc.jid.to_string()) {
         Ok(e) => {
@@ -384,7 +411,15 @@ async fn run(acc: Account, mut cmds: UnboundedReceiver<Cmd>, ev: UnboundedSender
             _ = self_ping.tick() => st.self_ping(),
             event = client.next() => match event {
                 None => break,
-                Some(Event::Online { bound_jid, .. }) => st.on_online(bound_jid),
+                Some(Event::Online { bound_jid, .. }) => {
+                    // A token handed out (or dropped as refused) during this login: the UI keeps it.
+                    let token = fast.lock().unwrap().clone();
+                    if token != saved_token {
+                        saved_token = token.clone();
+                        st.net.emit(Ev::FastToken(token));
+                    }
+                    st.on_online(bound_jid)
+                }
                 Some(Event::Disconnected(e)) => {
                     st.resources.clear();
                     st.muji.clear();
@@ -461,9 +496,12 @@ fn disco_info(node: Option<String>) -> DiscoInfoResult {
         "urn:xmpp:bookmarks:1+notify",
         "urn:xmpp:mds:displayed:0+notify",
         "urn:xmpp:avatar:metadata+notify",
+        "http://jabber.org/protocol/nick+notify",
         NS_REPLY,
         NS_RETRACT,
         groupcall::NS_MUJI,
+        // XEP-0393: we render *bold*, _italic_, ~strike~ and code.
+        "urn:xmpp:styling:0",
     ];
     DiscoInfoResult {
         node,
@@ -543,7 +581,12 @@ impl State {
                     fetch_avatar(&net, &dir, &c.jid).await;
                 }
             }
-            *upload.lock().unwrap() = discover_upload(&net, domain.as_str()).await;
+            // Debug builds can pretend the server has no HTTP Upload, so tests reach the
+            // direct (Jingle) file transfer.
+            let no_upload = cfg!(debug_assertions) && std::env::var_os("CRABBER_NO_HTTP_UPLOAD").is_some();
+            if !no_upload {
+                *upload.lock().unwrap() = discover_upload(&net, domain.as_str()).await;
+            }
             upload_known.store(true, Ordering::Relaxed);
         });
         let net = self.net.clone();
@@ -799,11 +842,16 @@ impl State {
                     approved: None,
                 };
                 let net = self.net.clone();
+                // XEP-0172: the request carries our name, so they know who asks.
+                let mut subscribe = Presence::subscribe().with_to(to);
+                if let Some(nick) = self.my_nick.clone() {
+                    subscribe.payloads.push(Element::builder("nick", ns::NICK).append(nick).build());
+                }
                 tokio::spawn(async move {
                     if let Err(e) = net.iq(None, IqRequest::Set(Roster { ver: None, items: vec![item] }.into())).await {
                         net.emit(Ev::Error(t!("err.add_contact_failed", e = e)));
                     }
-                    net.send(Presence::subscribe().with_to(to));
+                    net.send(subscribe);
                 });
             }
             Cmd::RemoveContact { jid: j } => {
@@ -895,6 +943,24 @@ impl State {
                             net.emit(Ev::Avatar { jid: me });
                         }
                         Err(e) => net.emit(Ev::Error(t!("err.avatar_failed", e = e))),
+                    }
+                });
+            }
+            Cmd::SetNick(nick) => {
+                self.my_nick = (!nick.is_empty()).then(|| nick.clone());
+                let net = self.net.clone();
+                tokio::spawn(async move {
+                    let res = if nick.is_empty() {
+                        let retract = Element::builder("pubsub", ns::PUBSUB)
+                            .append(Element::builder("retract", ns::PUBSUB).attr(nc("node"), ns::NICK).attr(nc("notify"), "true").append(Element::builder("item", ns::PUBSUB).attr(nc("id"), "current")))
+                            .build();
+                        // item-not-found: there was nothing to take down.
+                        net.iq(None, IqRequest::Set(retract)).await.map(|_| ()).or_else(|e| if e == "ItemNotFound" { Ok(()) } else { Err(e) })
+                    } else {
+                        publish(&net, ns::NICK, "current", Element::builder("nick", ns::NICK).append(nick).build()).await
+                    };
+                    if let Err(e) = res {
+                        eprintln!("nick publish: {e}");
                     }
                 });
             }
@@ -1038,21 +1104,24 @@ impl State {
         };
         // A rejoin (XEP-0410) mid-call keeps us in the call.
         let muji = self.muji.get(&r).cloned();
-        self.rooms.insert(r.clone(), Room { nick, occupants: HashSet::new(), joined: false, create_name });
+        let occupant_ids = Arc::new(AtomicBool::new(false));
+        self.rooms.insert(r.clone(), Room { nick, occupants: HashSet::new(), joined: false, create_name, occupant_ids: occupant_ids.clone() });
         let presence = |history: History| {
             let mut p = self.presence().with_to(full.clone()).with_payload(Muc::new().with_history(history));
             p.payloads.extend(muji.clone());
             p
         };
         let (with_history, without) = (presence(history), presence(History::new().with_maxstanzas(0)));
-        let net = self.net.clone();
+        let (net, dir) = (self.net.clone(), self.dir.clone());
         tokio::spawn(async move {
+            let info = room_info(&net, &r).await;
+            if let Some(info) = &info {
+                room_avatar(&net, &dir, &r, info).await;
+            }
+            let features = info.map(|i| i.features).unwrap_or_default();
+            occupant_ids.store(features.iter().any(|f| f == NS_OCCUPANT_ID), Ordering::Relaxed);
             // XEP-0313: a room that keeps an archive gives the history from there; the MUC sends none then.
-            let archived = match net.iq(Some(r.clone().into()), IqRequest::Get(DiscoInfoQuery { node: None }.into())).await {
-                Ok(Some(el)) => DiscoInfoResult::try_from(el).is_ok_and(|i| i.features.iter().any(|f| f == ns::MAM)),
-                _ => false,
-            };
-            if !archived {
+            if !features.iter().any(|f| f == ns::MAM) {
                 return net.send(with_history);
             }
             // Sent in order: the room handles our join before the archive query.
@@ -1264,12 +1333,12 @@ impl State {
             }
             if statuses.contains(&MucStatus::SelfPresence) && !room.joined {
                 room.joined = true;
-                let (net, to) = (self.net.clone(), bare.clone());
+                let (net, to, occupant_ids) = (self.net.clone(), bare.clone(), room.occupant_ids.clone());
                 tokio::spawn(async move {
-                    if let Ok(Some(el)) = net.iq(Some(to.clone().into()), IqRequest::Get(DiscoInfoQuery { node: None }.into())).await
-                        && let Ok(info) = DiscoInfoResult::try_from(el)
-                        && let Some(name) = info.identities.into_iter().find_map(|i| i.name).filter(|n| !n.is_empty())
-                    {
+                    let Some(info) = room_info(&net, &to).await else { return };
+                    // A room we just created was not there to ask before joining.
+                    occupant_ids.store(info.features.iter().any(|f| f == NS_OCCUPANT_ID), Ordering::Relaxed);
+                    if let Some(name) = info.identities.into_iter().find_map(|i| i.name).filter(|n| !n.is_empty()) {
                         net.emit(Ev::RoomName { room: to.to_string(), name });
                     }
                 });
@@ -1280,7 +1349,10 @@ impl State {
             return;
         }
         match p.type_ {
-            PresenceType::Subscribe => self.net.emit(Ev::SubscribeRequest { jid: bare.to_string() }),
+            PresenceType::Subscribe => {
+                let nick = p.payloads.iter().find(|e| e.is("nick", ns::NICK)).map(|e| e.text().trim().to_string()).filter(|n| !n.is_empty());
+                self.net.emit(Ev::SubscribeRequest { jid: bare.to_string(), nick });
+            }
             PresenceType::None if bare != self.me && p.payloads.iter().any(|e| e.is("x", pgp::NS_SIGNED)) && self.pgp_seen.insert(bare.to_string()) => {
                 // XEP-0027: learn the contact's key id and try to fetch a key that verifies their signature.
                 let sig = p.payloads.iter().find(|e| e.is("x", pgp::NS_SIGNED)).map(|e| e.text()).unwrap_or_default();
@@ -1405,6 +1477,19 @@ impl State {
             }
             return;
         }
+        // XEP-0172: a contact's (or our own) published nick; a retraction takes it down.
+        if let Some(items) = pep.filter(|i| i.attr("node") == Some(ns::NICK)) {
+            let who = from.to_bare();
+            let nick = items.children().find_map(|i| i.get_child("nick", ns::NICK)).map(|n| n.text().trim().to_string());
+            if nick.is_some() || items.children().any(|c| c.name() == "retract") {
+                let nick = nick.unwrap_or_default();
+                if who == self.me {
+                    self.my_nick = (!nick.is_empty()).then(|| nick.clone());
+                }
+                self.net.emit(Ev::Nick { jid: who.to_string(), nick });
+            }
+            return;
+        }
         // XEP-0490: read state from our other devices.
         if let Some(items) = pep.filter(|i| i.attr("node") == Some(ns::MDS)) {
             if outgoing_carbon {
@@ -1437,6 +1522,21 @@ impl State {
         // Calls: XEP-0353 propose/proceed/accept/reject/retract.
         if let Some(el) = m.payloads.iter().find(|e| e.ns() == ns::JINGLE_MESSAGE) {
             self.calls.on_jmi(&from, m.to.as_ref(), el.clone(), archived.is_some());
+            return;
+        }
+
+        // The room's configuration changed (status 104): its avatar may have too (XEP-0486).
+        if groupchat
+            && from.resource().is_none()
+            && self.rooms.contains_key(&from.to_bare())
+            && m.payloads.iter().filter_map(|p| MucUser::try_from(p.clone()).ok()).any(|u| u.status.contains(&MucStatus::ConfigNonPrivacyRelated))
+        {
+            let (net, dir, room) = (self.net.clone(), self.dir.clone(), from.to_bare());
+            tokio::spawn(async move {
+                if let Some(info) = room_info(&net, &room).await {
+                    room_avatar(&net, &dir, &room, &info).await;
+                }
+            });
             return;
         }
 
@@ -1486,12 +1586,19 @@ impl State {
         }
         // A moderator's deletion comes from the room itself, not from an occupant.
         let from_room = groupchat && from.resource().is_none();
+        // XEP-0421: who wrote it, across nick changes; only from rooms that stamp it.
+        let occupant = groupchat
+            .then(|| self.rooms.get(&from.to_bare()).filter(|r| r.occupant_ids.load(Ordering::Relaxed)))
+            .flatten()
+            .and_then(|_| m.payloads.iter().find(|p| p.is("occupant-id", NS_OCCUPANT_ID)))
+            .and_then(|p| p.attr("id"))
+            .map(String::from);
         if let Some(r) = m.payloads.iter().find(|p| p.is("retract", NS_RETRACT)) {
             let moderated = r.has_child("moderated", NS_MODERATE);
             if let Some(id) = r.attr("id")
                 && (!groupchat || from_room == moderated)
             {
-                self.net.emit(Ev::Retract { peer, id: id.to_string(), sender: (!moderated).then_some(sender) });
+                self.net.emit(Ev::Retract { peer, id: id.to_string(), sender: (!moderated).then_some(sender), occupant });
             }
             return;
         }
@@ -1500,7 +1607,7 @@ impl State {
             && a.get_child("moderated", "urn:xmpp:message-moderate:0").is_some_and(|md| md.has_child("retract", "urn:xmpp:message-retract:0"))
             && let Some(id) = a.attr("id")
         {
-            self.net.emit(Ev::Retract { peer, id: id.to_string(), sender: None });
+            self.net.emit(Ev::Retract { peer, id: id.to_string(), sender: None, occupant: None });
             return;
         }
         if let Some(r) = m.payloads.iter().find_map(|p| Reactions::try_from(p.clone()).ok()) {
@@ -1583,7 +1690,7 @@ impl State {
         }
         if let Some(r) = m.payloads.iter().find_map(|p| Replace::try_from(p.clone()).ok()) {
             if url.is_none() {
-                self.net.emit(Ev::Correct { peer, id: r.id.0, sender, body });
+                self.net.emit(Ev::Correct { peer, id: r.id.0, sender, body, occupant });
             }
             return;
         }
@@ -1609,6 +1716,7 @@ impl State {
             archive_id,
             live: live && delay_ts.is_none(),
             sid,
+            occupant,
         });
     }
 }
@@ -1826,6 +1934,29 @@ async fn fetch_avatar(net: &Net, dir: &std::path::Path, who: &str) {
     {
         net.emit(Ev::Avatar { jid: who.to_string() });
     }
+}
+
+async fn room_info(net: &Net, room: &BareJid) -> Option<DiscoInfoResult> {
+    let el = net.iq(Some(room.clone().into()), IqRequest::Get(DiscoInfoQuery { node: None }.into())).await.ok()??;
+    DiscoInfoResult::try_from(el).ok()
+}
+
+/// XEP-0486: fetches the room's vCard avatar when its advertised hash differs from ours.
+async fn room_avatar(net: &Net, dir: &std::path::Path, room: &BareJid, info: &DiscoInfoResult) {
+    let hash = info
+        .extensions
+        .iter()
+        .filter(|f| f.form_type() == Some("http://jabber.org/protocol/muc#roominfo"))
+        .flat_map(|f| &f.fields)
+        .find(|f| f.var.as_deref() == Some("muc#roominfo_avatarhash"))
+        .and_then(|f| f.values.first())
+        .filter(|h| !h.is_empty());
+    let Some(hash) = hash else { return };
+    let path = store::avatar_path(dir, &room.to_string());
+    if tokio::fs::read(&path).await.is_ok_and(|d| sha1_hex(&d) == *hash) {
+        return;
+    }
+    fetch_avatar(net, dir, &room.to_string()).await;
 }
 
 /// Hex SHA-1: XEP-0084 item ids and XEP-0153 photo hashes.
