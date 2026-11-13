@@ -3,6 +3,9 @@ name = "crabber"
 version = "0.9.1"
 edition = "2024"
 license = "MIT"
+description = "GPU-accelerated XMPP messenger: OMEMO encryption, voice and video calls, screen sharing"
+homepage = "https://github.com/auf-gg/crabber"
+repository = "https://github.com/auf-gg/crabber"
 
 [[bin]]
 name = "crabber"
@@ -80,6 +83,25 @@ pipewire = "0.10"
 zbus = { version = "5", default-features = false, features = ["async-io", "blocking-api"] }
 ksni = { version = "0.3", features = ["blocking"] }
 notify-rust = "4"
+
+# Packages built by build.yml (cargo-deb / cargo-generate-rpm, binary built beforehand).
+# Shared-library dependencies are detected automatically from the binary.
+[package.metadata.deb]
+section = "net"
+priority = "optional"
+depends = "$auto, fonts-noto-color-emoji"
+assets = [
+    ["target/release/crabber", "usr/bin/", "755"],
+    ["dist/linux/crabber.desktop", "usr/share/applications/", "644"],
+    ["icon.png", "usr/share/icons/hicolor/1024x1024/apps/crabber.png", "644"],
+]
+
+[package.metadata.generate-rpm]
+assets = [
+    { source = "target/release/crabber", dest = "/usr/bin/crabber", mode = "755" },
+    { source = "dist/linux/crabber.desktop", dest = "/usr/share/applications/crabber.desktop", mode = "644" },
+    { source = "icon.png", dest = "/usr/share/icons/hicolor/1024x1024/apps/crabber.png", mode = "644" },
+]
 
 [profile.release]
 strip = true

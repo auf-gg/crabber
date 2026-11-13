@@ -1,5 +1,5 @@
 # Build artifacts for all platforms:
-#   Linux  x86_64 / aarch64 — tar.gz (binary, .desktop, icon, install.sh)
+#   Linux  x86_64 / aarch64 — tar.gz (binary, .desktop, icon, install.sh), .deb and .rpm
 #   Windows x86_64 / aarch64 — portable .zip + NSIS installer setup.exe
 # Runs on v* tags and manual dispatch only; a tag additionally creates a GitHub Release.
 
@@ -106,6 +106,19 @@ jobs:
 
           tar -czf "${pkg}.tar.gz" "$pkg"
 
+      - name: Package .deb and .rpm (Linux)
+        if: matrix.platform == 'linux'
+        run: |
+          set -euo pipefail
+          sudo apt-get install -y --no-install-recommends rpm
+          cargo install --locked cargo-deb cargo-generate-rpm
+          cargo deb --no-build --no-strip -o .
+          cargo generate-rpm -o .
+          # rename to the same scheme as the tarballs
+          version="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n1)"
+          mv crabber_*.deb "crabber-${version}-${{ matrix.arch }}-linux.deb"
+          mv crabber-*.rpm "crabber-${version}-${{ matrix.arch }}-linux.rpm"
+
       - name: Package portable (Windows)
         if: matrix.platform == 'windows'
         shell: pwsh
@@ -147,6 +160,8 @@ jobs:
           name: crabber-${{ matrix.platform }}-${{ matrix.arch }}
           path: |
             crabber-*-linux.tar.gz
+            crabber-*-linux.deb
+            crabber-*-linux.rpm
             crabber-*-windows-portable.zip
             crabber-*-setup.exe
           if-no-files-found: error

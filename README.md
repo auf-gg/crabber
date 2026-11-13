@@ -159,8 +159,9 @@ paru -S crabber-git
 Grab them from [GitHub Releases](https://github.com/auf-gg/crabber/releases):
 
 - **Windows** — `setup.exe` installer or a portable `.zip` (x86_64 and ARM64)
-- **Linux** — `tar.gz` archive (x86_64 and aarch64) with an `install.sh` script
-  that installs the app to `~/.local` for the current user
+- **Linux** — `.deb` (Debian, Ubuntu), `.rpm` (Fedora, openSUSE) or a `tar.gz` archive
+  (x86_64 and aarch64) with an `install.sh` script that installs the app to `~/.local`
+  for the current user
 
 On Linux, emoji are drawn with Noto Color Emoji when it is installed (`noto-fonts-emoji` on Arch,
 `fonts-noto-color-emoji` on Debian/Ubuntu); the AUR packages depend on it.
@@ -195,6 +196,8 @@ The [`dist/`](dist) directory holds packaging templates:
 - [`PKGBUILD-git`](dist/PKGBUILD-git) — AUR `crabber-git`, compiled from source
 - [`PKGBUILD-bin`](dist/PKGBUILD-bin) — AUR `crabber-bin`, installed from release binaries
 - [`windows/installer.nsi`](dist/windows/installer.nsi) — NSIS installer script
+- [`linux/crabber.desktop`](dist/linux/crabber.desktop) — desktop entry shared by the `.deb` and `.rpm`
+  (their metadata is in [`Cargo.toml`](Cargo.toml))
 
 CI workflows keep everything in sync: [`build.yml`](.github/workflows/build.yml)
 builds and publishes artifacts for every platform, [`aur.yml`](.github/workflows/aur.yml)
