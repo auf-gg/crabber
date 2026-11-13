@@ -1,56 +1,59 @@
-<p align="center">
-  <img src="icon.svg" width="128" alt="Crabber logo">
-</p>
+<div align="center">
+
+<img src="icon.svg" width="120" alt="Crabber logo">
 
 # Crabber
 
-[![Build](https://github.com/auf-gg/crabber/actions/workflows/build.yml/badge.svg)](https://github.com/auf-gg/crabber/actions/workflows/build.yml)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+**A fast, GPU-accelerated XMPP messenger written in Rust.**
+Encrypted chats, voice and video calls, screen sharing — on Linux and Windows.
 
-Cross-platform XMPP messenger with a GPU-accelerated [GPUI](https://github.com/zed-industries/gpui) interface.
+[![Build](https://github.com/auf-gg/crabber/actions/workflows/build.yml/badge.svg)](https://github.com/auf-gg/crabber/actions/workflows/build.yml)
+[![Release](https://img.shields.io/github/v/release/auf-gg/crabber?color=orange)](https://github.com/auf-gg/crabber/releases/latest)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+![Rust](https://img.shields.io/badge/Rust-2024-b7410e?logo=rust&logoColor=white)
+![Platforms](https://img.shields.io/badge/Linux%20%7C%20Windows-blue)
+[![AUR](https://img.shields.io/aur/version/crabber-bin?logo=archlinux&logoColor=white)](https://aur.archlinux.org/packages/crabber-bin)
+
+[Features](#features) · [Installation](#installation) · [XEP support](#xep-support) · [Building](#building-from-source)
+
+</div>
+
+Crabber is a desktop client for [XMPP](https://xmpp.org), the open and federated messaging
+standard. The interface is drawn on the GPU with [GPUI](https://github.com/zed-industries/gpui)
+(the framework behind the Zed editor), so it stays smooth on long histories and big rooms.
 
 ## Features
 
-- XMPP instant messaging with STARTTLS/TLS (rustls)
+### 💬 Messaging
+- Message history in SQLite with per-chat search
+- Replies, reactions, edits and retraction (also moderated, in rooms)
+- Group chats (MUC) with kick, ban and moderator tools; bookmarks sync between devices
+- Sign-up straight from the login screen (in-band registration, CAPTCHAs included)
+- Read ticks and unread counters that follow your other devices
+
+### 🔒 Privacy and security
 - OMEMO end-to-end encryption (libsignal-compatible) and PGP support
 - Encrypted file transfer
-- Voice and video calls over WebRTC; screen sharing of a chosen monitor or window, up to its full resolution, with system audio (other apps only, never the call itself); the computer stays awake during a call. Video needs ffmpeg on PATH; capture goes through the desktop portal and PipeWire on Wayland and Windows.Graphics.Capture on Windows
-- Voice messages (Ogg Opus, compatible with Conversations)
+- STARTTLS/TLS on rustls, SCRAM-SHA-256-PLUS with channel binding
+- Credentials kept in the system keyring
+
+### 📞 Calls
+- Voice and video calls over WebRTC (Jingle), ringing on all your devices
+- Screen sharing of a chosen monitor or window, up to its full resolution, with system audio
+  (other apps only, never the call itself); the computer stays awake during a call. Video needs
+  ffmpeg on PATH; capture goes through the desktop portal and PipeWire on Wayland and
+  Windows.Graphics.Capture on Windows
 - Group audio calls in rooms: everyone in the room sees the call going on and can join
 - Microphone, speaker and camera chosen in settings, switched on the fly during a call
 - Noise suppression for the microphone ([nnnoiseless](https://github.com/jneem/nnnoiseless), RNNoise in Rust)
-- Message history stored in SQLite with per-chat search
-- Account credentials kept in the system keyring
-- Desktop integration: tray icon, native notifications
-- Themes: light/dark following the system, color schemes with a custom color editor, and Material You colors from matugen on Linux
+- Voice messages (Ogg Opus, compatible with Conversations)
+
+### 🎨 Desktop
+- Tray icon and native notifications
+- Light/dark themes following the system, color schemes with a custom color editor,
+  and Material You colors on Linux from [matugen](https://github.com/InioX/matugen) or
+  [dux-shell](https://github.com/duxlabs-dev/dux-shell)
 - Linux (X11/Wayland, Vulkan) and Windows (x64/ARM64)
-
-### Matugen colors (Linux)
-
-The «Matugen» scheme in settings takes colors from `~/.cache/matugen/colors.json`, and the
-«Dux» scheme from `~/.cache/DankMaterialShell/dms-colors.json` or `~/.cache/dms/dms-colors.json`
-([dux-shell](https://github.com/duxlabs-dev/dux-shell) / DankMaterialShell, depending on the version).
-Both buttons appear only when the file is found. Add a template to `~/.config/matugen/config.toml`:
-
-```toml
-[templates.crabber]
-input_path = '~/.config/matugen/templates/crabber.json'
-output_path = '~/.cache/matugen/colors.json'
-```
-
-with a `crabber.json` like:
-
-```json
-{
-  "primary": "{{colors.primary.default.hex}}",
-  "surface": "{{colors.surface.default.hex}}",
-  "surface_container_high": "{{colors.surface_container_high.default.hex}}",
-  "on_surface": "{{colors.on_surface.default.hex}}"
-}
-```
-
-The output of `matugen image wallpaper.jpg --json > ~/.cache/matugen/colors.json` works too.
-Colors are picked up automatically when the file changes.
 
 ## XEP support
 
