@@ -118,21 +118,20 @@ pub struct MediaDevice {
 pub fn devices(input: bool) -> Vec<MediaDevice> {
     let list = |host: &cpal::Host, input: bool| -> Vec<MediaDevice> {
         let devs = if input { host.input_devices().map(|d| d.collect::<Vec<_>>()) } else { host.output_devices().map(|d| d.collect()) };
-        let pipewire = host.id() != system_host().id();
         devs.unwrap_or_default()
             .into_iter()
-            // PipeWire also lists other apps' streams; only nodes made by a driver (factory) are devices.
-            .filter(|d| !pipewire || d.description().is_ok_and(|x| x.driver().is_some()))
             .filter_map(|d| Some(MediaDevice { id: d.id().ok()?.to_string(), name: d.to_string() }))
             .collect()
     };
     #[cfg(target_os = "linux")]
     {
-        if let Ok(pw) = cpal::host_from_id(cpal::HostId::PipeWire) {
-            let outputs = list(&pw, false);
-            let mut out = if input { list(&pw, true) } else { outputs.clone() };
-            // "…_default" aliases duplicate the system default; inputs that are also outputs are monitors.
-            out.retain(|d| !d.id.ends_with("_default") && !(input && outputs.iter().any(|o| o.id == d.id)));
+        // cpal's PipeWire host also lists other apps' streams, sinks again as inputs (their monitors)
+        // and "…_default" aliases; only the real source/sink nodes are kept.
+        if let Ok(pw) = cpal::host_from_id(cpal::HostId::PipeWire)
+            && let Some(nodes) = pipewire_devices(input)
+        {
+            let mut out = list(&pw, input);
+            out.retain(|d| d.id.parse::<cpal::DeviceId>().is_ok_and(|id| nodes.contains(id.id())));
             return out;
         }
         let mut out = list(&system_host(), input);
@@ -141,6 +140,49 @@ pub fn devices(input: bool) -> Vec<MediaDevice> {
     }
     #[cfg(not(target_os = "linux"))]
     list(&cpal::default_host(), input)
+}
+
+/// Node names of PipeWire's microphones (`input`) or speakers, hardware and virtual alike: mixer
+/// channels and filters are loopback streams without a factory name, so only the media class
+/// tells them from other apps' streams.
+#[cfg(target_os = "linux")]
+fn pipewire_devices(input: bool) -> Option<std::collections::HashSet<String>> {
+    use pipewire as pw;
+    use std::{cell::RefCell, collections::HashSet, rc::Rc};
+    pw::init();
+    let mainloop = pw::main_loop::MainLoopRc::new(None).ok()?;
+    let context = pw::context::ContextRc::new(&mainloop, None).ok()?;
+    let core = context.connect_rc(None).ok()?;
+    let registry = core.get_registry_rc().ok()?;
+    let class = if input { "Audio/Source" } else { "Audio/Sink" };
+    let names = Rc::new(RefCell::new(HashSet::new()));
+    let _registry = registry.add_listener_local().global({
+        let names = names.clone();
+        move |global| {
+            let Some(props) = global.props else { return };
+            if global.type_ == pw::types::ObjectType::Node
+                && matches!(props.get("media.class"), Some(c) if c == class || c == "Audio/Duplex")
+                && let Some(name) = props.get("node.name")
+            {
+                names.borrow_mut().insert(name.to_owned());
+            }
+        }
+    }).register();
+    // The answer to this sync arrives once every existing node has been announced.
+    let pending = core.sync(0).ok()?;
+    let done = Rc::new(RefCell::new(false));
+    let _core = core.add_listener_local().done({
+        let (mainloop, done) = (mainloop.clone(), done.clone());
+        move |id, seq| if id == pw::core::PW_ID_CORE && seq == pending { *done.borrow_mut() = true; mainloop.quit(); }
+    }).register();
+    // The settings menu waits on this: give up rather than hang on a stuck daemon.
+    let timer = mainloop.loop_().add_timer({
+        let mainloop = mainloop.clone();
+        move |_| mainloop.quit()
+    });
+    timer.update_timer(Some(Duration::from_secs(2)), None);
+    mainloop.run();
+    done.take().then(|| names.take())
 }
 /// 20 ms at 8 kHz.
 pub const FRAME: usize = 160;
