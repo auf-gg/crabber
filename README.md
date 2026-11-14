@@ -21,6 +21,39 @@ Crabber is a desktop client for [XMPP](https://xmpp.org), the open and federated
 standard. The interface is drawn on the GPU with [GPUI](https://github.com/zed-industries/gpui)
 (the framework behind the Zed editor), so it stays smooth on long histories and big rooms.
 
+<p align="center">
+  <img src="docs/screenshots/chat.png" alt="A chat with a video, a voice message, reactions, message styling, a quote and a code block">
+</p>
+
+<table>
+  <tr>
+    <td width="50%"><img src="docs/screenshots/group.png" alt="A group chat with replies, reactions and a voice message"></td>
+    <td width="50%"><img src="docs/screenshots/call.png" alt="A voice call in progress above the chat"></td>
+  </tr>
+  <tr>
+    <td align="center">Group chats: replies, everyone's reactions, voice messages</td>
+    <td align="center">Voice and video calls</td>
+  </tr>
+  <tr>
+    <td width="50%"><img src="docs/screenshots/media.png" alt="The photos shared in a chat"></td>
+    <td width="50%"><img src="docs/screenshots/code.png" alt="A room with a highlighted diff and a code file shown inline"></td>
+  </tr>
+  <tr>
+    <td align="center">Photos and files shared in a chat</td>
+    <td align="center">Highlighted code blocks; text files shown inline</td>
+  </tr>
+  <tr>
+    <td width="50%"><img src="docs/screenshots/chat-light.png" alt="The same chat in the light theme"></td>
+    <td width="50%"><img src="docs/screenshots/settings.png" alt="Settings: theme, language, accent color, scale, startup and notifications"></td>
+  </tr>
+  <tr>
+    <td align="center">Light theme</td>
+    <td align="center">Themes, accent colors, interface scale</td>
+  </tr>
+</table>
+
+The chats in the screenshots come from the [test server](tests/xmpp_server/README.md).
+
 ## Features
 
 ### 💬 Messaging
