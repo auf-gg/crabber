@@ -73,6 +73,12 @@ resource binding.
    `&mut Client`, so a send waiting for room in the outgoing queue, which fills up while the
    stream reconnects, held up the task reading the client as well. The stream closes once no
    handle is left: drop them all before `Client::send_end`.
+8. Connection loss reaches the app. `src/client/worker.rs` turns `StreamEvent::Suspended` into
+   `Event::Disconnected`; upstream dropped it, so a client never heard of a lost connection.
+   `Online { resumed }` follows once it is back. `LoginOptions::on_error` (`src/client/sasl2.rs`,
+   called by the reconnector in `src/stanzastream/mod.rs`) is told of each failed login attempt,
+   a wrong password included. A refused FAST token is not reported: the password follows right
+   away.
 
 Its own tests, including the new ones for the patches, run from `vendor/tokio-xmpp`:
 `cargo test --lib --no-default-features --features starttls,ring,rustls-native-certs`.

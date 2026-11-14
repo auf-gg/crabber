@@ -54,6 +54,9 @@ pub struct LoginOptions {
     /// XEP-0484: the token to log in with; replaced whenever the server hands out a new one,
     /// cleared when it is refused.
     pub fast: Option<Arc<Mutex<Option<FastToken>>>>,
+    /// Told of each login attempt that fails; the stream tries again after a growing pause. Not
+    /// called for a refused FAST token: the password follows right away.
+    pub on_error: Option<Arc<dyn Fn(&Error) + Send + Sync>>,
 }
 
 /// SASL2 authentication; with `bind` and Bind 2 on offer, the resource is bound in the same go

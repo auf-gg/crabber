@@ -145,8 +145,10 @@ impl StanzaStream {
                 tokio::spawn(async move {
                     const MAX_DELAY: Duration = Duration::new(30, 0);
                     let mut delay = Duration::new(1, 0);
+                    let has_token = || login.fast.as_ref().is_some_and(|f| f.lock().unwrap().is_some());
                     loop {
                         log::debug!("Starting new connection as {}", jid);
+                        let had_token = has_token();
                         match crate::client::login::client_login(
                             server.clone(),
                             jid.clone(),
@@ -184,6 +186,14 @@ impl StanzaStream {
                                 return;
                             }
                             Err(e) => {
+                                // crabber patch: a refused FAST token is gone now, and the
+                                // password comes next, right away. Other failures are reported.
+                                if had_token && !has_token() {
+                                    continue;
+                                }
+                                if let Some(report) = &login.on_error {
+                                    report(&e);
+                                }
                                 // TODO: auth errors should probably be fatal??
                                 log::error!("Failed to connect: {}. Retrying in {:?}.", e, delay);
                                 tokio::time::sleep(delay).await;

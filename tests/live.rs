@@ -59,7 +59,7 @@ fn wait<T>(rx: &mut UnboundedReceiver<Ev>, mut f: impl FnMut(&Ev) -> Option<T>) 
             loop {
                 let ev = rx.next().await.expect("channel closed");
                 eprintln!("  ev: {ev:?}");
-                if let Ev::Disconnected(e) = &ev {
+                if let Ev::Disconnected(e) | Ev::LoginFailed(e) = &ev {
                     panic!("disconnected: {e}");
                 }
                 if let Some(v) = f(&ev) {

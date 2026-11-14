@@ -1923,33 +1923,38 @@ impl App {
         let active = window.as_ref().is_some_and(|w| w.is_window_active());
         for ev in batch {
             match ev {
-                Ev::Online { .. } => {
+                Ev::Online { resumed, .. } => {
                     sess.online = true;
                     sess.ever_online = true;
                     sess.status = t!("status.online_title").into();
-                    let rooms = sess
-                        .chats
-                        .iter()
-                        .filter(|c| c.is_room)
-                        .map(|c| (c.peer.clone(), c.nick.clone(), sess.store.last_ts(&c.peer), sess.store.last_sid(&c.peer)))
-                        .collect();
-                    sess.send(Cmd::Sync { mam_after: sess.store.get("mam_last"), rooms });
-                    if sess.show.is_some() {
-                        sess.send(Cmd::SetShow(sess.show.clone()));
+                    // A resumed session lost nothing; a new one starts from scratch.
+                    if !resumed {
+                        sess.presence.clear();
+                        sess.members.clear();
+                        let rooms = sess
+                            .chats
+                            .iter()
+                            .filter(|c| c.is_room)
+                            .map(|c| (c.peer.clone(), c.nick.clone(), sess.store.last_ts(&c.peer), sess.store.last_sid(&c.peer)))
+                            .collect();
+                        sess.send(Cmd::Sync { mam_after: sess.store.get("mam_last"), rooms });
+                        if sess.show.is_some() {
+                            sess.send(Cmd::SetShow(sess.show.clone()));
+                        }
                     }
                 }
                 Ev::FastToken(token) => match token {
                     Some(t) => save_password(&fast_key(&sess.me), &encode_fast(&t)),
                     None => delete_password(&fast_key(&sess.me)),
                 },
-                Ev::Disconnected(e) => {
-                    if !sess.ever_online {
-                        failed_login = Some(e);
-                        break;
-                    }
+                Ev::LoginFailed(e) if !sess.ever_online => {
+                    failed_login = Some(e);
+                    break;
+                }
+                // Presence and rooms stay until we know the session is lost: a resumed one keeps them.
+                // Before the first login a network error only keeps us connecting.
+                Ev::Disconnected(e) | Ev::LoginFailed(e) => {
                     sess.online = false;
-                    sess.presence.clear();
-                    sess.members.clear();
                     sess.status = t!("status.reconnecting", e = e).into();
                 }
                 Ev::Roster(contacts) => {
@@ -2325,11 +2330,12 @@ impl App {
             return;
         }
         sess.sort_chats();
+        let connecting = !sess.ever_online;
         for c in call_log {
             (self.call_menu, self.call_focus, self.call_hide_others) = (None, None, false);
             self.log_call(c);
         }
-        self.connecting = false;
+        self.connecting = connecting;
         if let Some(window) = window.as_deref_mut() {
             self.fill_profile_editor(window, cx);
             for n in notes {

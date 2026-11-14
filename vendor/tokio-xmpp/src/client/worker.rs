@@ -98,7 +98,11 @@ impl ClientWorker {
                 features: self.features.as_ref().unwrap().clone(),
                 resumed: true,
             },
-            StanzaStreamEvent::Stream(StreamEvent::Suspended) => return,
+            // crabber patch: the connection is lost. The stream reconnects by itself; `Online`
+            // then tells whether the session came back whole (`resumed`).
+            StanzaStreamEvent::Stream(StreamEvent::Suspended) => {
+                Event::Disconnected(crate::Error::Disconnected)
+            }
         };
 
         let Ok(()) = self.stanza_w2f_tx.send(send_event).await else {

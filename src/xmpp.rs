@@ -179,10 +179,15 @@ pub enum Cmd {
 
 #[derive(Debug)]
 pub enum Ev {
-    Online { jid: String },
+    /// `resumed`: the session came back whole after a disconnect (XEP-0198), presence and
+    /// rooms included; otherwise everything starts over.
+    Online { jid: String, resumed: bool },
     /// XEP-0484: the token to log in with next time (`None`: forget the old one). A secret.
     FastToken(Option<tokio_xmpp::FastToken>),
+    /// The connection is lost, or an attempt to get it back failed; tokio-xmpp keeps trying.
     Disconnected(String),
+    /// The server refused the login (wrong password, say); attempts go on all the same.
+    LoginFailed(String),
     Roster(Vec<Contact>),
     RosterItem(Contact),
     Presence { jid: String, online: bool },
@@ -360,6 +365,15 @@ async fn run(acc: Account, mut cmds: UnboundedReceiver<Cmd>, ev: UnboundedSender
         user_agent: acc.device_id.as_deref().and_then(|id| uuid::Uuid::parse_str(id).ok()).map(|id| (id, "Crabber".into(), std::env::consts::OS.into())),
         tag: Some("Crabber".into()),
         fast: acc.device_id.is_some().then(|| fast.clone()),
+        on_error: Some(Arc::new({
+            let ev = ev.clone();
+            move |e: &tokio_xmpp::Error| {
+                let _ = ev.unbounded_send(match e {
+                    tokio_xmpp::Error::Auth(_) => Ev::LoginFailed(e.to_string()),
+                    _ => Ev::Disconnected(e.to_string()),
+                });
+            }
+        })),
     };
     let mut saved_token = acc.fast.clone();
     let mut client = Client::new_with_login(acc.jid.clone(), acc.password.clone(), connector, timeouts, login);
@@ -423,25 +437,35 @@ async fn run(acc: Account, mut cmds: UnboundedReceiver<Cmd>, ev: UnboundedSender
     // XEP-0410: check now and then that we are still in our rooms.
     let mut self_ping = tokio::time::interval(Duration::from_secs(10 * 60));
     self_ping.tick().await;
+    let mut online = false;
     loop {
         tokio::select! {
             _ = self_ping.tick() => st.self_ping(),
             event = client.next() => match event {
                 None => break,
-                Some(Event::Online { bound_jid, .. }) => {
+                Some(Event::Online { bound_jid, resumed, .. }) => {
+                    online = true;
                     // A token handed out (or dropped as refused) during this login: the UI keeps it.
                     let token = fast.lock().unwrap().clone();
                     if token != saved_token {
                         saved_token = token.clone();
                         st.net.emit(Ev::FastToken(token));
                     }
-                    st.on_online(bound_jid)
+                    if resumed {
+                        // XEP-0198: nothing was lost, rooms and calls included.
+                        st.net.emit(Ev::Online { jid: bound_jid.to_string(), resumed: true });
+                    } else {
+                        // A new session: what we knew of an old one is gone.
+                        st.resources.clear();
+                        st.muji.clear();
+                        st.group.on_disconnected();
+                        for r in st.rooms.values_mut() { r.joined = false; r.occupants.clear(); }
+                        st.on_online(bound_jid)
+                    }
                 }
+                // tokio-xmpp reconnects by itself; whether the session survives, `Online` tells.
                 Some(Event::Disconnected(e)) => {
-                    st.resources.clear();
-                    st.muji.clear();
-                    st.group.on_disconnected();
-                    for r in st.rooms.values_mut() { r.joined = false; r.occupants.clear(); }
+                    online = false;
                     st.net.emit(Ev::Disconnected(e.to_string()));
                 }
                 Some(Event::Stanza(stanza)) => st.on_stanza(stanza),
@@ -462,7 +486,12 @@ async fn run(acc: Account, mut cmds: UnboundedReceiver<Cmd>, ev: UnboundedSender
     // The stream closes only once no handle can send on it.
     sending.abort();
     let _ = sending.await;
-    let _ = client.send_end().await;
+    // Offline, the stream would not close before a login got through (a wrong password: never);
+    // dropping the runtime ends it. Online, a connection that breaks during the goodbye is not
+    // waited for either.
+    if online {
+        let _ = tokio::time::timeout(Duration::from_secs(10), client.send_end()).await;
+    }
 }
 
 fn jid(s: &str) -> Option<BareJid> {
@@ -582,7 +611,7 @@ impl State {
         self.calls.set_bound(bound.clone());
         self.group.set_bound(bound.clone());
         self.files.set_bound(bound.clone());
-        self.net.emit(Ev::Online { jid: bound.to_string() });
+        self.net.emit(Ev::Online { jid: bound.to_string(), resumed: false });
         self.net.send(self.presence());
         let net = self.net.clone();
         let dir = self.dir.clone();
