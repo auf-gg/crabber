@@ -49,7 +49,7 @@ mod imp {
     use windows::Win32::System::Threading::{CreateEventW, SetEvent, WaitForSingleObject};
     use windows::Win32::System::Registry::{HKEY_CURRENT_USER, REG_SZ, RRF_RT_REG_SZ, RegDeleteKeyValueW, RegGetValueW, RegSetKeyValueW};
     use windows::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID;
-    use windows::Win32::UI::WindowsAndMessaging::{ASFW_ANY, AllowSetForegroundWindow, IsIconic, IsWindowVisible, SW_HIDE, SW_RESTORE, SetForegroundWindow, ShowWindow};
+    use windows::Win32::UI::WindowsAndMessaging::{ASFW_ANY, AllowSetForegroundWindow, IsIconic, IsWindowVisible, SW_HIDE, SW_RESTORE, SW_SHOW, SetForegroundWindow, ShowWindow};
     use windows::core::{HSTRING, IInspectable, Interface};
 
     use super::{DesktopEvent, UnboundedSender, app_icon};
@@ -237,10 +237,19 @@ mod imp {
         }
     }
 
+    /// Brings the window back the way it was: SW_RESTORE alone would also turn a maximized
+    /// window back into a normal one, so a hidden window is only shown, and only a minimized
+    /// one is restored (Windows remembers whether it was maximized before). A window already
+    /// on screen keeps its size and place and just comes to the front.
     pub fn show_window(_: &mut gpui_kit::Window) {
         if let Some(h) = hwnd() {
             unsafe {
-                let _ = ShowWindow(h, SW_RESTORE);
+                if !IsWindowVisible(h).as_bool() {
+                    let _ = ShowWindow(h, SW_SHOW);
+                }
+                if IsIconic(h).as_bool() {
+                    let _ = ShowWindow(h, SW_RESTORE);
+                }
                 let _ = SetForegroundWindow(h);
             }
         }
