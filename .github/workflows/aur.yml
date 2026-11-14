@@ -1,6 +1,7 @@
 # Keeps AUR packages in sync with this repository:
-#   crabber-git (dist/PKGBUILD-git) — on pushes to main / v* tags;
-#     the version is computed by pkgver() from the PKGBUILD itself.
+#   crabber-git (dist/PKGBUILD-git) — on v* tag pushes (and manual runs), not
+#     on every commit; the version is computed by pkgver() from the PKGBUILD
+#     itself.
 #   crabber-bin (dist/PKGBUILD-bin) — on v* tag pushes (and manual runs with
 #     a tag input); the version comes from the tag, sha256 checksums are
 #     computed from the release files. Releases are created by build.yml
@@ -16,7 +17,6 @@ name: Update AUR packages
 
 on:
   push:
-    branches: [main]
     tags: ['v*']
   workflow_dispatch:
     inputs:
@@ -33,7 +33,6 @@ concurrency:
 
 jobs:
   git-package:
-    if: github.event_name != 'release'
     runs-on: ubuntu-latest
     container:
       image: archlinux:base-devel  # makepkg is required to generate .SRCINFO
@@ -110,7 +109,6 @@ jobs:
           git push origin HEAD:master
 
   bin-package:
-    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     container:
       image: archlinux:base-devel
