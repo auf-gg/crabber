@@ -7,7 +7,6 @@
 **A fast, GPU-accelerated XMPP messenger written in Rust.**
 Encrypted chats, voice and video calls, screen sharing — on Linux and Windows.
 
-[![Build](https://github.com/auf-gg/crabber/actions/workflows/build.yml/badge.svg)](https://github.com/auf-gg/crabber/actions/workflows/build.yml)
 [![Release](https://img.shields.io/github/v/release/auf-gg/crabber?color=orange)](https://github.com/auf-gg/crabber/releases/latest)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 ![Rust](https://img.shields.io/badge/Rust-2024-b7410e?logo=rust&logoColor=white)
