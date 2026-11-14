@@ -1,0 +1,22 @@
+From 3f2a9c1 Mon Sep 17 00:00:00 2001
+From: Dave <dave@localhost>
+Subject: [PATCH] xmpp: page back through the archive on scroll
+
+---
+ src/xmpp.rs | 6 ++++--
+ 1 file changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/src/xmpp.rs b/src/xmpp.rs
+--- a/src/xmpp.rs
++++ b/src/xmpp.rs
+@@ -1905,8 +1905,10 @@ async fn mam_sync(net: Net, to: Option<Jid>, mut after: Option<String>) {
+     for _ in 0..50 {
+         let set = match &after {
+-            None => SetQuery { max: Some(100), after: None, before: Some(String::new()), index: None },
++            None => SetQuery { max: Some(PAGE), after: None, before: Some(String::new()), index: None },
+             Some(a) => SetQuery { max: Some(100), after: Some(a.clone()), before: None, index: None },
+         };
++        // Older pages are fetched only when the chat is scrolled to the top.
++        const PAGE: usize = 100;
+--
+2.47.0

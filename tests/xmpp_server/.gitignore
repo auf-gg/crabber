@@ -1,0 +1,5 @@
+# ejabberd rebuilds these on every start: the stand itself is the SQLite database and the uploads.
+data/database/*
+!data/database/ejabberd.db
+data/logs/*
+!data/logs/.gitkeep

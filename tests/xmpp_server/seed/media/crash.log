@@ -1,0 +1,10 @@
+2026-11-10T21:14:02.118Z INFO  crabber::xmpp > connecting to localhost:5222 (STARTTLS)
+2026-11-10T21:14:02.231Z INFO  crabber::xmpp > SASL2: SCRAM-SHA-256-PLUS (tls-exporter)
+2026-11-10T21:14:02.240Z INFO  crabber::xmpp > bound alice@localhost/crabber.Xk3f
+2026-11-10T21:14:02.512Z DEBUG crabber::xmpp > MAM: 100 messages, complete=false
+2026-11-10T21:14:07.903Z WARN  crabber::call > ICE: no candidate pair after 5 s, retrying with TURN
+2026-11-10T21:14:12.004Z ERROR crabber::call > ICE failed: all candidate pairs failed
+2026-11-10T21:14:12.005Z INFO  crabber::call > call ended: connectivity-error
+thread 'tokio-runtime-worker' panicked at src/call.rs:812:41:
+called `Option::unwrap()` on a `None` value
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace

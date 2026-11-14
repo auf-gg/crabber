@@ -1,0 +1,50 @@
+# Crabber test stand: ejabberd for the XMPP domain "localhost"; everything it stores is under ./data.
+#   docker compose up -d        start (data/ is used as is)
+#   ./seed.sh                   rebuild data/ from scratch: accounts, chats, rooms, files
+name: crabber-xmpp
+
+services:
+  ejabberd:
+    image: ghcr.io/processone/ejabberd:26.09.1
+    container_name: crabber-xmpp
+    # Runs as the owner of the checkout so data/ stays theirs (UID/GID in the environment or .env
+    # when that is not 1000). The image's HOME belongs to its own uid 9000: the Erlang cookie
+    # goes to /tmp instead.
+    user: "${UID:-1000}:${GID:-1000}"
+    environment:
+      HOME: /tmp
+      ERLANG_COOKIE: crabber-test-stand
+    # Loopback only: registration is open and the passwords are known.
+    ports:
+      - "127.0.0.1:5222:5222"     # c2s, STARTTLS
+      - "127.0.0.1:5223:5223"     # c2s, direct TLS
+      - "127.0.0.1:5280:5280"     # web admin, http://localhost:5280/admin
+      - "127.0.0.1:5443:5443"     # HTTP File Upload
+      - "127.0.0.1:5478:5478/udp" # STUN
+    volumes:
+      - ./conf/ejabberd.yml:/opt/ejabberd/conf/ejabberd.yml:ro
+      - ./conf/server.pem:/opt/ejabberd/conf/server.pem:ro
+      - ./data/database:/opt/ejabberd/database
+      - ./data/upload:/opt/ejabberd/upload
+      - ./data/logs:/opt/ejabberd/logs
+    healthcheck:
+      test: ["CMD", "ejabberdctl", "status"]
+      interval: 3s
+      timeout: 10s
+      retries: 40
+
+  # Fills the server with content; run by seed.sh. Shares ejabberd's network namespace, so the
+  # upload URLs (https://localhost:5443/...) reach it from here as they do from the host.
+  seed:
+    build: ./seed
+    profiles: [seed]
+    user: "${UID:-1000}:${GID:-1000}"
+    network_mode: service:ejabberd
+    depends_on:
+      ejabberd:
+        condition: service_healthy
+    environment:
+      SEED_TZ: ${SEED_TZ:-+0000}
+    volumes:
+      - ./seed:/seed:ro
+      - ./data/database:/db

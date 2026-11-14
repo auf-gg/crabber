@@ -1,0 +1,144 @@
+### Crabber test stand: XMPP domain "localhost", all data in SQLite (data/database/ejabberd.db),
+### uploads in data/upload. Based on the container's default config, trimmed to what a client uses.
+### Options: https://docs.ejabberd.im/admin/configuration/
+
+hosts:
+  - localhost
+
+loglevel: info
+
+# Self-signed for localhost and its subdomains, valid until 2126: log in with "insecure" checked.
+certfiles:
+  - /opt/ejabberd/conf/server.pem
+
+sql_type: sqlite
+sql_database: /opt/ejabberd/database/ejabberd.db
+default_db: sql
+auth_method: sql
+# Plain passwords let the server offer every SCRAM variant, -PLUS included.
+auth_password_format: plain
+
+listen:
+  -
+    port: 5222
+    ip: "::"
+    module: ejabberd_c2s
+    max_stanza_size: 524288
+    access: c2s
+    starttls_required: true
+  -
+    # XEP-0368 direct TLS
+    port: 5223
+    ip: "::"
+    module: ejabberd_c2s
+    max_stanza_size: 524288
+    access: c2s
+    tls: true
+  -
+    port: 5443
+    ip: "::"
+    module: ejabberd_http
+    tls: true
+    request_handlers:
+      /admin: ejabberd_web_admin
+      /upload: mod_http_upload
+  -
+    port: 5280
+    ip: "::"
+    module: ejabberd_http
+    request_handlers:
+      /admin: ejabberd_web_admin
+  -
+    # STUN for calls (XEP-0215); peers on one machine need no TURN relay.
+    port: 5478
+    ip: "::"
+    transport: udp
+    module: ejabberd_stun
+    use_turn: false
+
+acl:
+  local:
+    user_regexp: ""
+  admin:
+    user:
+      - admin@localhost
+
+access_rules:
+  # mod_http_upload's default access
+  local:
+    allow: local
+  c2s:
+    deny: blocked
+    allow: all
+  announce:
+    allow: admin
+  configure:
+    allow: admin
+
+api_permissions:
+  "console commands":
+    from: ejabberd_ctl
+    who: all
+    what: "*"
+  "webadmin commands":
+    from: ejabberd_web_admin
+    who: admin
+    what: "*"
+
+# No c2s shaper: the stock 3 KB/s limit would make Jingle file transfer crawl.
+shaper_rules:
+  max_user_sessions: 10
+  max_user_offline_messages: 5000
+
+modules:
+  mod_adhoc: {}
+  mod_admin_extra: {}
+  mod_auth_fast: {}
+  mod_avatar: {}
+  mod_blocking: {}
+  mod_caps: {}
+  mod_carboncopy: {}
+  mod_client_state: {}
+  mod_configure: {}
+  mod_disco: {}
+  mod_http_upload:
+    put_url: https://@HOST@:5443/upload
+    # Spelled out: the default, @HOME@/upload, follows HOME, which docker-compose.yml moves to /tmp.
+    docroot: /opt/ejabberd/upload
+    max_size: 104857600
+  mod_last: {}
+  mod_mam:
+    assume_mam_usage: true
+    default: always
+  mod_muc:
+    access_mam: all
+    default_room_options:
+      mam: true
+      persistent: true
+  mod_muc_admin: {}
+  mod_muc_occupantid: {}
+  mod_offline:
+    access_max_user_messages: max_user_offline_messages
+  mod_ping: {}
+  mod_privacy: {}
+  mod_private: {}
+  mod_pubsub:
+    plugins:
+      - flat
+      - pep
+    force_node_config:
+      storage:bookmarks:
+        access_model: whitelist
+  # In-band registration from anywhere, without CAPTCHA: sign-up can be tried from the login screen.
+  mod_register:
+    ip_access: all
+  mod_roster:
+    versioning: true
+  mod_stream_mgmt:
+    resend_on_timeout: if_offline
+  mod_stun_disco: {}
+  mod_vcard:
+    search: false
+  mod_vcard_xupdate: {}
+  mod_version:
+    show_os: false
