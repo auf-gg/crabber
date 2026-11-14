@@ -66,6 +66,7 @@
   "update.available": "Update available",
   "update.downloading_banner": "Downloading update... {percent}%",
   "update.banner_version": "Version {version} · click to update",
+  "chat.notes": "Notes",
   "chat.select": "Select a chat to start messaging",
   "room.online": "{n} online",
   "room.label": "group",

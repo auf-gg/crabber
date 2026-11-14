@@ -472,8 +472,10 @@ impl Session {
     }
     /// Our name for the chat, else the name the contact gave themselves (XEP-0172), else the JID's user part.
     pub fn display_name(&self, peer: &str) -> String {
+        let bare = |j: &str| j.split('/').next().unwrap_or(j).to_lowercase();
         match self.chat(peer) {
             Some(c) if !c.name.is_empty() => c.name.clone(),
+            _ if bare(peer) == bare(&self.me) => t!("chat.notes").to_string(),
             _ => self.nicks.get(peer).cloned().unwrap_or_else(|| peer.split('@').next().unwrap_or(peer).to_string()),
         }
     }

@@ -66,6 +66,7 @@
   "update.available": "Доступно обновление",
   "update.downloading_banner": "Загрузка обновления... {percent}%",
   "update.banner_version": "Версия {version} · нажмите, чтобы обновить",
+  "chat.notes": "Заметки",
   "chat.select": "Выберите чат, чтобы начать общение",
   "room.online": "{n} в сети",
   "room.label": "группа",

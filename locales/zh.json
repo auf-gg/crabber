@@ -66,6 +66,7 @@
   "update.available": "有可用更新",
   "update.downloading_banner": "正在下载更新... {percent}%",
   "update.banner_version": "版本 {version} · 点击更新",
+  "chat.notes": "笔记",
   "chat.select": "选择一个聊天开始交流",
   "room.online": "{n} 人在线",
   "room.label": "群组",
