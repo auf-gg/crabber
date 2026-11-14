@@ -68,6 +68,11 @@ resource binding.
    a waker. The client worker that reads the stream then slept for good: the socket went unread
    and no timeout was noticed, so there was no reconnect either. One clean login in five got
    stuck that way on the test stand; the race needs only a send and a receive at the same time.
+7. `src/client/mod.rs`: `ClientHandle` (from `Client::handle`, exported from the crate root)
+   sends from other tasks; `StanzaSender` is `Clone` for it. Upstream sends only through
+   `&mut Client`, so a send waiting for room in the outgoing queue, which fills up while the
+   stream reconnects, held up the task reading the client as well. The stream closes once no
+   handle is left: drop them all before `Client::send_end`.
 
 Its own tests, including the new ones for the patches, run from `vendor/tokio-xmpp`:
 `cargo test --lib --no-default-features --features starttls,ring,rustls-native-certs`.

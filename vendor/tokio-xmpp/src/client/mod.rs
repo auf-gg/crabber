@@ -127,6 +127,14 @@ impl Client {
         token
     }
 
+    /// A [`ClientHandle`] to send from other tasks (crabber patch).
+    pub fn handle(&self) -> ClientHandle {
+        ClientHandle {
+            stream_tx: self.stream_tx.clone(),
+            iq_response_tracker: self.iq_response_tracker.clone(),
+        }
+    }
+
     /// Get the stream features (`<stream:features/>`) of the underlying
     /// stream.
     ///
@@ -177,6 +185,34 @@ impl Client {
 
         let inner = Arc::try_unwrap(receiver.0).expect("Failed to unwrap ClientReceiver Arc");
         inner.into_inner()
+    }
+}
+
+/// Sends on a [`Client`] from other tasks (crabber patch). The outgoing queue fills up while the
+/// stream reconnects, and a send waits for room there: through a handle that wait holds up only
+/// the task that sends, not the one reading the client.
+///
+/// The stream closes once nothing can send on it any more, so drop every handle before
+/// [`Client::send_end`], or it waits for them.
+#[derive(Debug, Clone)]
+pub struct ClientHandle {
+    stream_tx: stanzastream::StanzaSender,
+    iq_response_tracker: iq::IqResponseTracker,
+}
+
+impl ClientHandle {
+    /// Queue a stanza, setting an ID if it has none; the token follows it on its way out.
+    pub async fn send_stanza(&self, mut stanza: Stanza) -> StanzaToken {
+        ensure_stanza_id(&mut stanza);
+        self.stream_tx.send(Box::new(stanza)).await
+    }
+
+    /// Like [`Client::send_iq`].
+    pub async fn send_iq(&self, to: Option<Jid>, req: IqRequest) -> IqResponseToken {
+        let (iq, mut token) = self.iq_response_tracker.allocate_iq_handle(None, to, req);
+        let stanza_token = self.stream_tx.send(Box::new(iq.into())).await;
+        token.set_stanza_token(stanza_token);
+        token
     }
 }
 

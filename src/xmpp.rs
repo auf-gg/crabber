@@ -363,6 +363,23 @@ async fn run(acc: Account, mut cmds: UnboundedReceiver<Cmd>, ev: UnboundedSender
     };
     let mut saved_token = acc.fast.clone();
     let mut client = Client::new_with_login(acc.jid.clone(), acc.password.clone(), connector, timeouts, login);
+    // Stanzas and IQs go out in order from a task of their own: the outgoing queue fills up while
+    // the stream reconnects, and waiting for room there must not hold up this loop.
+    let (wire, mut wire_rx) = unbounded::<Out>();
+    let sender = client.handle();
+    let sending = tokio::spawn(async move {
+        while let Some(out) = wire_rx.next().await {
+            match out {
+                Out::Stanza(s) => {
+                    let _ = sender.send_stanza(*s).await;
+                }
+                Out::Iq(to, req, reply) => {
+                    let _ = reply.send(sender.send_iq(to, req).await);
+                }
+                _ => {}
+            }
+        }
+    });
     let (out_tx, mut out_rx) = unbounded();
     let net = Net { out: out_tx, ev };
     let http = reqwest::Client::builder()
@@ -430,9 +447,7 @@ async fn run(acc: Account, mut cmds: UnboundedReceiver<Cmd>, ev: UnboundedSender
                 Some(Event::Stanza(stanza)) => st.on_stanza(stanza),
             },
             out = out_rx.next() => match out {
-                // The stanza is queued before send_stanza waits for the write; don't let that wait stall the loop.
-                Some(Out::Stanza(s)) => { let _ = tokio::time::timeout(Duration::from_secs(5), client.send_stanza(*s)).await; }
-                Some(Out::Iq(to, req, reply)) => { let _ = reply.send(client.send_iq(to, req).await); }
+                Some(out @ (Out::Stanza(_) | Out::Iq(..))) => { let _ = wire.unbounded_send(out); }
                 Some(Out::Inject(m, archived, enc)) => st.on_message(*m, archived, enc),
                 Some(Out::Muji(room, el)) => st.set_muji(room, el),
                 Some(Out::Presence) => st.send_presences(),
@@ -444,6 +459,9 @@ async fn run(acc: Account, mut cmds: UnboundedReceiver<Cmd>, ev: UnboundedSender
             },
         }
     }
+    // The stream closes only once no handle can send on it.
+    sending.abort();
+    let _ = sending.await;
     let _ = client.send_end().await;
 }
 
