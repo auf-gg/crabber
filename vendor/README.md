@@ -62,6 +62,12 @@ resource binding.
 5. API: `Client::new_with_login`, `StanzaStream::new_c2s_with`, `LoginOptions` and `FastToken`
    exported from the crate root; new `AuthError` variants `Downgrade`, `ServerProof`, `Sasl2`.
    `client_auth` is gone (`client_login` replaces it).
+6. `src/stanzastream/mod.rs` `split`: `StanzaSender` and `StanzaReceiver` each own their end of
+   the channels. Upstream (6.0 and main) kept both halves behind one mutex, and a receiver that
+   found it held, by a send waiting for room in the outgoing queue, returned `Pending` without
+   a waker. The client worker that reads the stream then slept for good: the socket went unread
+   and no timeout was noticed, so there was no reconnect either. One clean login in five got
+   stuck that way on the test stand; the race needs only a send and a receive at the same time.
 
 Its own tests, including the new ones for the patches, run from `vendor/tokio-xmpp`:
 `cargo test --lib --no-default-features --features starttls,ring,rustls-native-certs`.

@@ -30,8 +30,6 @@ use core::time::Duration;
 // meant for that stream, replacing it is racy.
 
 use futures::{SinkExt, Stream};
-use std::sync::Arc;
-use tokio::sync::Mutex;
 use tokio::sync::{mpsc, oneshot};
 use xmpp_parsers::{jid::Jid, stream_features::StreamFeatures};
 
@@ -281,10 +279,14 @@ impl StanzaStream {
 
     /// Split the stream into the [`StanzaSender`] and [`StanzaReceiver`].
     pub fn split(self) -> (StanzaSender, StanzaReceiver) {
-        let stream = Arc::new(Mutex::new(self));
-
-        let tx = StanzaSender(stream.clone());
-        let rx = StanzaReceiver(stream);
+        // crabber patch: each half owns its end of the channels. Both halves used to share one
+        // mutex: a receiver that found it held by a send waiting for queue room returned
+        // `Pending` without a waker, was never polled again, and the socket went unread.
+        let tx = StanzaSender(self.tx.clone());
+        let rx = StanzaReceiver {
+            rx: self.rx,
+            tx: self.tx,
+        };
 
         (tx, rx)
     }
@@ -297,14 +299,14 @@ impl StanzaStream {
     /// the same [`Stream`].
     pub fn reunite(tx: StanzaSender, rx: StanzaReceiver) -> Self {
         assert!(
-            Arc::ptr_eq(&tx.0, &rx.0),
+            tx.0.same_channel(&rx.tx),
             "Unrelated Sender and Receiver passed to reunite."
         );
 
-        drop(tx);
-
-        let inner = Arc::try_unwrap(rx.0).expect("Failed to unwrap Receiver Arc");
-        inner.into_inner()
+        Self {
+            rx: rx.rx,
+            tx: tx.0,
+        }
     }
 }
 
@@ -318,29 +320,34 @@ impl Stream for StanzaStream {
 
 /// Send half of the [`StanzaStream`]
 #[derive(Debug)]
-pub struct StanzaSender(pub(super) Arc<Mutex<StanzaStream>>);
+pub struct StanzaSender(mpsc::Sender<QueueEntry>);
 
 impl StanzaSender {
     /// Send a stanza via the stream.
     ///
     /// See the documentation of [`StanzaStream::send()`].
     pub async fn send(&self, stanza: Box<Stanza>) -> StanzaToken {
-        self.0.lock().await.send(stanza).await
+        let (queue_entry, token) = QueueEntry::tracked(stanza);
+        match self.0.send(queue_entry).await {
+            Ok(()) => token,
+            Err(_) => panic!("Stream closed or the stream's background workers have crashed."),
+        }
     }
 }
 
 /// Receive half of the [`StanzaStream`]
 #[derive(Debug)]
-pub struct StanzaReceiver(pub(super) Arc<Mutex<StanzaStream>>);
+pub struct StanzaReceiver {
+    rx: mpsc::Receiver<Event>,
+    /// Keeps the stream open while the sender half alone is dropped, as with the shared stream
+    /// before, and lets [`StanzaStream::reunite`] tell whether the halves belong together.
+    tx: mpsc::Sender<QueueEntry>,
+}
 
 impl Stream for StanzaReceiver {
     type Item = Event;
 
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
-        let Ok(mut stream) = self.0.try_lock() else {
-            return Poll::Pending;
-        };
-
-        stream.rx.poll_recv(cx)
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
+        self.rx.poll_recv(cx)
     }
 }
