@@ -2098,6 +2098,17 @@ impl App {
                 Button::new(id).small().outline().max_w(dp(280.)).label(label).dropdown_menu(move |menu, _, _| device_items(menu, kind, current.clone(), this.clone())),
             )
         };
+        let ring_row = |title: &'static str, incoming: bool, chosen: usize| {
+            let list = if incoming { &crabber::audio::RINGTONES } else { &crabber::audio::RINGBACKS };
+            v_flex().gap_1().py_1().child(div().text_sm().child(title)).child(h_flex().gap_1().flex_wrap().children(list.iter().enumerate().map(|(i, r)| {
+                Button::new(SharedString::from(format!("ring-{incoming}-{i}")))
+                    .label(crabber::i18n::get(r.1))
+                    .small()
+                    .when(chosen == i, |b| b.primary())
+                    .when(chosen != i, |b| b.outline())
+                    .on_click(cx.listener(move |this, _, w, cx| this.pick_ring(incoming, i, w, cx)))
+            })))
+        };
         let me = sess.localpart();
         let body = v_flex()
             .child(section(t!("settings.account")))
@@ -2225,6 +2236,9 @@ impl App {
                 ),
             )
             .child(div().pt_1().text_xs().text_color(t.muted_foreground).child(t!("settings.devices_hint")))
+            .child(ring_row(t!("settings.ring_in"), true, s.ring_in))
+            .child(ring_row(t!("settings.ring_out"), false, s.ring_out))
+            .child(div().pt_1().text_xs().text_color(t.muted_foreground).child(t!("settings.ring_hint")))
             .child(section(t!("settings.omemo")))
             .child(
                 h_flex().gap_3().py_1().items_center().child(row(t!("settings.btbv"), t!("settings.btbv_desc"))).child(

@@ -166,6 +166,9 @@ pub struct Settings {
     /// Screen share: resolution sent, and whether system audio goes with it.
     pub share_quality: crabber::videocall::Quality,
     pub share_audio: bool,
+    /// Ringtone of incoming calls and ringback of outgoing ones: indexes into `audio::RINGTONES` / `audio::RINGBACKS`.
+    pub ring_in: usize,
+    pub ring_out: usize,
     /// How the last call was watched, brought back once the next one shows the peer's picture.
     pub call_view: CallView,
 }
@@ -227,6 +230,8 @@ impl Settings {
             share_audio: s.get("share_audio").is_some_and(|v| v == "1"),
             mic_volume: volume(s, "mic_volume"),
             speaker_volume: volume(s, "speaker_volume"),
+            ring_in: ring(s, "ring_in", &crabber::audio::RINGTONES),
+            ring_out: ring(s, "ring_out", &crabber::audio::RINGBACKS),
             call_view: CallView::load(s),
         }
     }
@@ -239,6 +244,7 @@ impl Settings {
         crabber::audio::set_volumes(self.mic_volume, self.speaker_volume);
         crabber::videocall::set_screen_quality(self.share_quality);
         crabber::call::set_share_audio(self.share_audio);
+        crabber::audio::set_ringtones(self.ring_in, self.ring_out);
     }
     /// Switches the UI texts to the chosen language; "system" follows the OS.
     fn apply_lang(&self) {
@@ -263,6 +269,8 @@ impl Settings {
         s.set("share_audio", b(self.share_audio));
         s.set("mic_volume", &self.mic_volume.to_string());
         s.set("speaker_volume", &self.speaker_volume.to_string());
+        s.set("ring_in", crabber::audio::RINGTONES[self.ring_in].0);
+        s.set("ring_out", crabber::audio::RINGBACKS[self.ring_out].0);
         self.call_view.save(s);
         for (k, d) in [("mic", &self.mic), ("speaker", &self.speaker), ("camera", &self.camera)] {
             s.set(k, d.as_ref().map_or("", |d| d.id.as_str()));
@@ -299,6 +307,11 @@ impl DeviceKind {
 
 fn volume(s: &Store, key: &str) -> f32 {
     s.get(key).and_then(|v| v.parse().ok()).filter(|v: &f32| (0.0..=2.0).contains(v)).unwrap_or(1.0)
+}
+
+/// Index of the stored sound id in `list`; the first one when unset or unknown.
+fn ring(s: &Store, key: &str, list: &[(&str, &str, crabber::audio::Melody)]) -> usize {
+    s.get(key).and_then(|v| list.iter().position(|r| r.0 == v)).unwrap_or(0)
 }
 
 fn load_device(s: &Store, key: &str) -> Option<MediaDevice> {
@@ -679,6 +692,8 @@ pub struct App {
     pub recording: Option<(crabber::voice::Recorder, Instant)>,
     /// Voice message playing: its URL and the player.
     pub player: Option<(String, crabber::voice::Player)>,
+    /// The ringtone just picked in settings, playing once; a new pick cuts it off.
+    ring_preview: Option<crabber::audio::Tone>,
     /// Voice message lengths in seconds, read once per file.
     pub audio_len: HashMap<PathBuf, f32>,
     /// Right-click menu over the image viewer.
@@ -893,6 +908,7 @@ impl App {
             emoji_picker: None,
             recording: None,
             player: None,
+            ring_preview: None,
             audio_len: HashMap::new(),
             viewer_menu: None,
             animating: false,
@@ -1340,11 +1356,12 @@ impl App {
                     let Some(s) = app.sess.as_mut() else { return false };
                     let call = s.call.as_mut();
                     let mut changed = false;
-                    let (sending, mut targets) = match call {
-                        Some(c) => (c.sending.is_some(), [Some(&mut c.remote), Some(&mut c.local)]),
-                        None => (false, [None, None]),
+                    let (sending, deafened, mut targets) = match call {
+                        Some(c) => (c.sending.is_some(), c.deafened, [Some(&mut c.remote), Some(&mut c.local)]),
+                        None => (false, false, [None, None]),
                     };
                     for (i, slot) in [&FRAMES.remote, &FRAMES.local].into_iter().enumerate() {
+                        let had = targets[i].as_deref().map(Option::is_some);
                         let (frame, live, (w, h)) = {
                             let mut sl = slot.lock().unwrap();
                             let live = sl.at.is_some_and(|t| t.elapsed().as_secs() < 3);
@@ -1371,6 +1388,13 @@ impl App {
                                 cx.drop_image(old, None);
                             }
                             changed = true;
+                        }
+                        // A picture (the peer's or ours) came up or went away during the call.
+                        if let (Some(had), Some(has)) = (had, targets[i].as_deref().map(Option::is_some))
+                            && had != has
+                            && !deafened
+                        {
+                            crabber::audio::cue(has);
                         }
                     }
                     // Who is talking: louder than the threshold, held a moment so words don't flicker.
@@ -1476,9 +1500,13 @@ impl App {
         let lang = self.settings.lang.clone();
         let devices = (self.settings.mic.clone(), self.settings.speaker.clone(), self.settings.camera.clone(), self.settings.denoise);
         let share = (self.settings.share_quality, self.settings.share_audio);
+        let rings = (self.settings.ring_in, self.settings.ring_out);
         f(&mut self.settings);
         self.settings.save(&self.app_store);
-        if devices != (self.settings.mic.clone(), self.settings.speaker.clone(), self.settings.camera.clone(), self.settings.denoise) || share != (self.settings.share_quality, self.settings.share_audio) {
+        if devices != (self.settings.mic.clone(), self.settings.speaker.clone(), self.settings.camera.clone(), self.settings.denoise)
+            || share != (self.settings.share_quality, self.settings.share_audio)
+            || rings != (self.settings.ring_in, self.settings.ring_out)
+        {
             self.settings.apply_devices();
             if devices != (self.settings.mic.clone(), self.settings.speaker.clone(), self.settings.camera.clone(), self.settings.denoise)
                 && let Some(sess) = self.sess.as_ref().filter(|s| s.group_call.is_some())
@@ -1507,6 +1535,12 @@ impl App {
         }
         self.apply_theme(window, cx);
         cx.notify();
+    }
+
+    /// Chooses the ringtone (`incoming`) or the ringback and plays it once to hear it.
+    pub fn pick_ring(&mut self, incoming: bool, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.update_settings(window, cx, |st| *if incoming { &mut st.ring_in } else { &mut st.ring_out } = index);
+        self.ring_preview = Some(crabber::audio::preview(incoming, index));
     }
 
     /// Starts or stops sharing the screen. On Windows the user first picks a monitor or a window;

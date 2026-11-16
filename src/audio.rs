@@ -2,7 +2,7 @@
 //! G.711 needs no native codec library and every WebRTC stack (Conversations, Dino) offers it.
 use crate::t;
 use std::collections::{BTreeMap, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -785,52 +785,173 @@ fn open(playback: &Arc<Mutex<Playback>>, muted: &Arc<AtomicBool>, on_frame: &Arc
 /// Ringing played on the default speaker until dropped.
 pub struct Tone(#[allow(dead_code)] std::sync::mpsc::Sender<()>);
 
+/// A synthesized sound: notes (start s, MIDI note) struck on a timbre, the whole repeated every
+/// `period` s. Each fades out before it repeats.
+pub struct Melody {
+    period: f64,
+    gain: f64,
+    /// Sample of one note `dt` s after it was struck, at `f` Hz.
+    voice: fn(dt: f64, f: f64) -> f64,
+    notes: &'static [(f64, f64)],
+}
+
+impl Melody {
+    fn sample(&self, t: f64) -> f32 {
+        let p = t % self.period;
+        let s: f64 = self.notes.iter().filter(|(a, _)| p >= *a).map(|&(a, n)| (self.voice)(p - a, 440. * 2f64.powf((n - 69.) / 12.))).sum();
+        (self.gain * s) as f32
+    }
+}
+
+/// (id kept in settings, i18n key of the name, sound): the ring for a call to us.
+pub static RINGTONES: [(&str, &str, Melody); 4] = [
+    // G5 C6 D6 G6, D6 G6
+    ("kalimba", "ring.kalimba", Melody { period: 3.0, gain: 0.169, voice: kalimba, notes: &[(0.0, 79.), (0.14, 84.), (0.28, 86.), (0.42, 91.), (0.7, 86.), (0.84, 91.)] }),
+    // C5 E5 G5 C6, G5 C6
+    ("marimba", "ring.marimba", Melody { period: 3.0, gain: 0.2, voice: marimba, notes: &[(0.0, 72.), (0.13, 76.), (0.26, 79.), (0.39, 84.), (0.65, 79.), (0.78, 84.)] }),
+    // C7 G6 E6 C6, E6 G6
+    ("bells", "ring.bells", Melody { period: 3.0, gain: 0.13, voice: glockenspiel, notes: &[(0.0, 96.), (0.18, 91.), (0.36, 88.), (0.54, 84.), (0.9, 88.), (1.08, 91.)] }),
+    // Two trilled rings, as an old desk phone.
+    ("retro", "ring.retro", Melody { period: 3.0, gain: 0.16, voice: trill, notes: &[(0.0, 81.), (0.6, 81.)] }),
+];
+
+/// The same for the ringback heard while calling out.
+pub static RINGBACKS: [(&str, &str, Melody); 4] = [
+    // 425 Hz, 1 s on, 3 s off: the exchange ringback of Russia and most of Europe.
+    ("beeps", "ring.beeps", Melody { period: 4.0, gain: 0.12, voice: beep, notes: &[(0.0, 68.4)] }),
+    // D6, G5
+    ("kalimba", "ring.kalimba", Melody { period: 2.5, gain: 0.17, voice: kalimba, notes: &[(0.0, 86.), (0.25, 79.)] }),
+    // C5 E5 G5 swelling in
+    ("soft", "ring.soft", Melody { period: 3.0, gain: 0.13, voice: pad, notes: &[(0.0, 72.), (0.2, 76.), (0.4, 79.)] }),
+    // Two water drops.
+    ("drops", "ring.drops", Melody { period: 2.5, gain: 0.25, voice: water_drop, notes: &[(0.0, 84.), (0.28, 91.)] }),
+];
+
+/// Video in a call started (G5 D6 going up) or ended (going down).
+static VIDEO_ON: Melody = Melody { period: 0.6, gain: 0.16, voice: pop, notes: &[(0.0, 79.), (0.09, 86.)] };
+static VIDEO_OFF: Melody = Melody { period: 0.6, gain: 0.16, voice: pop, notes: &[(0.0, 86.), (0.09, 79.)] };
+
+/// The chosen ringtone and ringback, as indexes into `RINGTONES` and `RINGBACKS`; read when a call starts.
+static CHOSEN: [AtomicUsize; 2] = [AtomicUsize::new(0), AtomicUsize::new(0)];
+
+pub fn set_ringtones(incoming: usize, outgoing: usize) {
+    CHOSEN[0].store(incoming, Ordering::Relaxed);
+    CHOSEN[1].store(outgoing, Ordering::Relaxed);
+}
+
+fn ring_melody(incoming: bool, index: usize) -> &'static Melody {
+    let list = if incoming { &RINGTONES } else { &RINGBACKS };
+    &list[index.min(list.len() - 1)].2
+}
+
 /// `incoming`: the ring for a call to us; otherwise the ringback heard while calling out.
 pub fn tone(incoming: bool) -> Tone {
     let (tx, rx) = std::sync::mpsc::channel::<()>();
+    // Plays until `Tone` (the sender) is dropped.
+    play(ring_melody(incoming, CHOSEN[!incoming as usize].load(Ordering::Relaxed)), true, move || {
+        let _ = rx.recv();
+    });
+    Tone(tx)
+}
+
+/// One round of a ringtone (`incoming`) or ringback, to hear it in settings; stops early when dropped.
+pub fn preview(incoming: bool, index: usize) -> Tone {
+    let m = ring_melody(incoming, index);
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    play(m, false, move || {
+        let _ = rx.recv_timeout(Duration::from_secs_f64(m.period));
+    });
+    Tone(tx)
+}
+
+/// A short cue: video in a call started (`on`) or ended.
+pub fn cue(on: bool) {
+    let m = if on { &VIDEO_ON } else { &VIDEO_OFF };
+    play(m, false, move || std::thread::sleep(Duration::from_secs_f64(m.period)));
+}
+
+/// Plays `m` on the speaker until `wait` returns; without `repeat` it plays once.
+fn play(m: &'static Melody, repeat: bool, wait: impl FnOnce() + Send + 'static) {
     std::thread::spawn(move || {
         let res = (|| {
             let output = output_device().ok_or(t!("audio.no_output"))?;
             let cfg = output.default_output_config().map_err(|e| e.to_string())?;
             let stream = match cfg.sample_format() {
-                SampleFormat::I16 => build_tone::<i16>(&output, cfg.config(), incoming),
-                SampleFormat::U16 => build_tone::<u16>(&output, cfg.config(), incoming),
-                _ => build_tone::<f32>(&output, cfg.config(), incoming),
+                SampleFormat::I16 => build_tone::<i16>(&output, cfg.config(), m, repeat),
+                SampleFormat::U16 => build_tone::<u16>(&output, cfg.config(), m, repeat),
+                _ => build_tone::<f32>(&output, cfg.config(), m, repeat),
             }?;
             stream.play().map_err(|e| e.to_string())?;
-            // Returns once `Tone` (the sender) is dropped; the stream stops with it.
-            let _ = rx.recv();
+            // The stream stops once dropped here.
+            wait();
             Ok::<_, String>(())
         })();
         if let Err(e) = res {
             eprintln!("ring tone: {e}");
         }
     });
-    Tone(tx)
 }
 
-/// Kalimba motifs: the incoming ring every 3 s, the ringback (two soft notes) every 2.5 s.
-fn ring_sample(incoming: bool, t: f64) -> f32 {
-    use std::f64::consts::TAU;
-    // (start s, MIDI note)
-    const RING: &[(f64, f64)] = &[(0.0, 79.), (0.14, 84.), (0.28, 86.), (0.42, 91.), (0.7, 86.), (0.84, 91.)]; // G5 C6 D6 G6, D6 G6
-    const RINGBACK: &[(f64, f64)] = &[(0.0, 86.), (0.25, 79.)]; // D6, G5
-    let (period, notes, gain) = if incoming { (3.0, RING, 0.169) } else { (2.5, RINGBACK, 0.17) };
-    let p = t % period;
-    let s: f64 = notes
-        .iter()
-        .filter(|(a, _)| p >= *a)
-        .map(|&(a, n)| {
-            let (dt, f) = (p - a, 440. * 2f64.powf((n - 69.) / 12.));
-            let env = |attack: f64, decay: f64| (dt / attack).min(1.) * (-dt / decay).exp();
-            // Metal tine: fundamental + an inharmonic overtone that dies fast.
-            env(0.002, 0.45) * (TAU * f * dt).sin() + 0.5 * env(0.001, 0.05) * (TAU * f * 5.4 * dt).sin()
-        })
-        .sum();
-    (gain * s) as f32
+/// Rises in `attack` s, then dies away with time constant `decay`.
+fn env(dt: f64, attack: f64, decay: f64) -> f64 {
+    (dt / attack).min(1.) * (-dt / decay).exp()
 }
 
-fn build_tone<T>(device: &cpal::Device, config: StreamConfig, incoming: bool) -> Result<cpal::Stream, String>
+/// On for `len` s, with 10 ms edges so it doesn't click.
+fn gate(dt: f64, len: f64) -> f64 {
+    (dt / 0.01).min((len - dt) / 0.01).clamp(0., 1.)
+}
+
+fn sine(f: f64, dt: f64) -> f64 {
+    (std::f64::consts::TAU * f * dt).sin()
+}
+
+/// Metal tine: fundamental + an inharmonic overtone that dies fast.
+fn kalimba(dt: f64, f: f64) -> f64 {
+    env(dt, 0.002, 0.45) * sine(f, dt) + 0.5 * env(dt, 0.001, 0.05) * sine(f * 5.4, dt)
+}
+
+/// Wooden bar: warm and short, its overtone two octaves up.
+fn marimba(dt: f64, f: f64) -> f64 {
+    env(dt, 0.002, 0.3) * sine(f, dt) + 0.3 * env(dt, 0.001, 0.04) * sine(f * 3.93, dt)
+}
+
+/// Metal bar: a free bar's inharmonic partials, the high ones dying first.
+fn glockenspiel(dt: f64, f: f64) -> f64 {
+    env(dt, 0.001, 0.45) * sine(f, dt) + 0.3 * env(dt, 0.001, 0.12) * sine(f * 2.756, dt) + 0.1 * env(dt, 0.001, 0.04) * sine(f * 5.404, dt)
+}
+
+/// A 0.4 s ring trilling between the note and a third above it 20 times a second.
+fn trill(dt: f64, f: f64) -> f64 {
+    let a = 0.5 + 0.5 * sine(20., dt);
+    gate(dt, 0.4) * (a * sine(f, dt) + (1. - a) * sine(f * 1.26, dt))
+}
+
+/// A plain tone held for 1 s.
+fn beep(dt: f64, f: f64) -> f64 {
+    gate(dt, 1.0) * sine(f, dt)
+}
+
+/// Swells in and fades slowly, an octave above for body.
+fn pad(dt: f64, f: f64) -> f64 {
+    env(dt, 0.08, 0.5) * (sine(f, dt) + 0.25 * sine(f * 2., dt))
+}
+
+/// Water drop: the pitch slides up by half within 40 ms.
+fn water_drop(dt: f64, f: f64) -> f64 {
+    const RISE: f64 = 0.5;
+    const SLIDE: f64 = 0.04;
+    // The phase of a frequency going from f to (1 + RISE)·f with time constant SLIDE.
+    let phase = std::f64::consts::TAU * f * ((1. + RISE) * dt - RISE * SLIDE * (1. - (-dt / SLIDE).exp()));
+    env(dt, 0.003, 0.12) * phase.sin()
+}
+
+/// Short soft pop for interface cues.
+fn pop(dt: f64, f: f64) -> f64 {
+    env(dt, 0.004, 0.08) * (sine(f, dt) + 0.2 * sine(f * 2., dt))
+}
+
+fn build_tone<T>(device: &cpal::Device, config: StreamConfig, m: &'static Melody, repeat: bool) -> Result<cpal::Stream, String>
 where
     T: SizedSample + FromSample<f32>,
 {
@@ -842,7 +963,9 @@ where
             config,
             move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
                 for frame in data.chunks_mut(channels) {
-                    let v = T::from_sample(ring_sample(incoming, n as f64 / rate));
+                    let t = n as f64 / rate;
+                    // Played once, the start mustn't come round again in what is buffered past its end.
+                    let v = T::from_sample(if repeat || t < m.period { m.sample(t) } else { 0. });
                     n += 1;
                     frame.iter_mut().for_each(|s| *s = v);
                 }
@@ -1144,12 +1267,19 @@ mod tests {
 
     #[test]
     fn ring_patterns() {
-        let peak = |incoming, from: f64, to: f64| (0..((to - from) * 8000.) as usize).map(|i| ring_sample(incoming, from + i as f64 / 8000.).abs()).fold(0f32, f32::max);
-        for (incoming, period) in [(true, 3.0), (false, 2.5)] {
-            assert!(peak(incoming, 0.0, 0.2) > 0.1, "{incoming}: motif plays");
-            assert!(peak(incoming, 0.0, period) < 0.6, "{incoming}: no clipping");
-            assert!(peak(incoming, period - 0.3, period) < 0.02, "{incoming}: fades out before repeating");
-            assert!(peak(incoming, period, period + 0.2) > 0.1, "{incoming}: repeats");
+        let peak = |m: &Melody, from: f64, to: f64| (0..((to - from) * 48000.) as usize).map(|i| m.sample(from + i as f64 / 48000.).abs()).fold(0f32, f32::max);
+        let rms = |m: &Melody, to: f64| ((0..(to * 48000.) as usize).map(|i| m.sample(i as f64 / 48000.).powi(2)).sum::<f32>() / (to * 48000.) as f32).sqrt();
+        for (id, name, _) in RINGTONES.iter().chain(&RINGBACKS) {
+            assert_ne!(crate::i18n::get(name), *name, "{id}: has a name in settings");
+        }
+        let rings = RINGTONES.iter().chain(&RINGBACKS).map(|(id, _, m)| (*id, m));
+        for (id, m) in rings.chain([("video-on", &VIDEO_ON), ("video-off", &VIDEO_OFF)]) {
+            let p = m.period;
+            println!("{id}: peak {:.3}, rms over 1 s {:.3}", peak(m, 0.0, p), rms(m, 1.0_f64.min(p)));
+            assert!(peak(m, 0.0, 0.2) > 0.1, "{id}: motif plays");
+            assert!(peak(m, 0.0, p) < 0.6, "{id}: no clipping");
+            assert!(peak(m, p - 0.3, p) < 0.02, "{id}: fades out before repeating");
+            assert!(peak(m, p, p + 0.2) > 0.1, "{id}: repeats");
         }
     }
 
