@@ -114,7 +114,9 @@ opt-level = 2
 # TestAppContext for UI tests (gpui-kit re-exports this crate as its gpui).
 gpui-pre = { version = "0.3.11", features = ["test-support"] }
 
+# Our forks with the patches we need: docs/patched-dependencies.md.
 [patch.crates-io]
-gpui-pre-wgpu = { path = "vendor/gpui-pre-wgpu" }
-unsafe-libopus = { path = "vendor/unsafe-libopus" }
-tokio-xmpp = { path = "vendor/tokio-xmpp" }
+gpui-pre-wgpu = { git = "https://github.com/auf-gg/gpui-pre-wgpu", branch = "main" }
+unsafe-libopus = { git = "https://github.com/auf-gg/unsafe-libopus", branch = "crabber" }
+tokio-xmpp = { git = "https://github.com/auf-gg/xmpp-rs", branch = "crabber" }
+sasl = { git = "https://github.com/auf-gg/xmpp-rs", branch = "crabber" }

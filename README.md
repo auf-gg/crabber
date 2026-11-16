@@ -211,7 +211,7 @@ sudo apt install pkg-config clang libxkbcommon-dev libxkbcommon-x11-dev libwayla
 ```
 
 Colour emojis need the Noto Color Emoji font (`fonts-noto-color-emoji` on Debian/Ubuntu).
-gpui's Linux text rendering is patched for it, see [`vendor/README.md`](vendor/README.md).
+gpui's Linux text rendering is patched for it, see [`docs/patched-dependencies.md`](docs/patched-dependencies.md).
 
 On Windows install the Visual Studio Build Tools (MSVC), then on either platform:
 

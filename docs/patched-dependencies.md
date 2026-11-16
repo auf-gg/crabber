@@ -1,8 +1,23 @@
 # Patched dependencies
 
-Wired in through `[patch.crates-io]` in the root `Cargo.toml`. Each copy is the published crate
-with a few lines changed, marked `crabber patch` in the source. On a version bump, copy the new
-release from `~/.cargo/registry/src/*/` and re-apply the changes.
+Wired in through `[patch.crates-io]` in the root `Cargo.toml` as git dependencies on our forks in
+the auf-gg organisation. Each fork branch is the published release with our changes as commits
+on top; `Cargo.lock` pins the commit. After pushing to a fork branch, `cargo update -p <crate>`
+picks it up. On a version bump, rebase the branch onto the new release tag.
+
+| Crate | Fork, branch | Upstream |
+|---|---|---|
+| gpui-pre-wgpu 0.3.11 | [auf-gg/gpui-pre-wgpu](https://github.com/auf-gg/gpui-pre-wgpu) `main` | snapshot of Zed's `gpui_wgpu`; the same change for Zed is on [auf-gg/zed](https://github.com/auf-gg/zed) `gpui-wgpu-linux-color-emoji` |
+| unsafe-libopus 0.2.0 | [auf-gg/unsafe-libopus](https://github.com/auf-gg/unsafe-libopus) `crabber` | [DCNick3/unsafe-libopus](https://github.com/DCNick3/unsafe-libopus); master is fixed in its PR #3 |
+| tokio-xmpp 6.0.0 | [auf-gg/xmpp-rs](https://github.com/auf-gg/xmpp-rs) `crabber` | [xmpp-rs on GitLab](https://gitlab.com/xmpp-rs/xmpp-rs) |
+
+Sending changes upstream: xmpp-rs's `CONTRIBUTING.md` refuses any change made with the aid of AI
+tools, so our tokio-xmpp commits cannot go there as they are. Zed accepts AI-assisted code only
+with a human author who understands it, writes the PR description and replies, and has run Zed
+by hand (screenshots for visual changes, CLA signed).
+
+`sasl` is patched to the same xmpp-rs checkout: tokio-xmpp takes it by path, and its
+`ChannelBinding` crosses into our connector, so both must be one copy.
 
 ## gpui-pre-wgpu 0.3.11
 
@@ -32,8 +47,9 @@ in pauses by libwebrtc, e.g. Conversations) and every FEC recovery decoded to a 
 heard as a thump in calls. With the fix, decoding matches the C libopus 1.3.1 sample for sample,
 with loss, DTX and FEC included.
 
-`src/lib.rs` also allows the lints newer rustc denies in the transpiled code: built from the source
-tree, they are not capped as for a registry crate.
+Built on its own, newer rustc denies `dangerous_implicit_autorefs` in the transpiled code; as a git
+dependency its lints are capped, so it builds. Its own tests run from the fork with
+`RUSTFLAGS="--cap-lints warn" cargo test --release --test opus_api --test opus_decode`.
 
 ## tokio-xmpp 6.0.0
 
@@ -80,5 +96,5 @@ resource binding.
    a wrong password included. A refused FAST token is not reported: the password follows right
    away.
 
-Its own tests, including the new ones for the patches, run from `vendor/tokio-xmpp`:
-`cargo test --lib --no-default-features --features starttls,ring,rustls-native-certs`.
+Its own tests, including the new ones for the patches, run from the fork's workspace:
+`cargo test -p tokio-xmpp --lib --no-default-features --features starttls,ring,rustls-native-certs`.

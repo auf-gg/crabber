@@ -359,7 +359,7 @@ struct State {
 async fn run(acc: Account, mut cmds: UnboundedReceiver<Cmd>, ev: UnboundedSender<Ev>) {
     let connector = Connector { host: acc.host.clone(), port: acc.port, insecure: acc.insecure };
     let timeouts = Timeouts { read_timeout: Duration::from_secs(60), response_timeout: Duration::from_secs(30) };
-    // SASL2 with Bind 2 and FAST tokens where the server has them (vendor/tokio-xmpp).
+    // SASL2 with Bind 2 and FAST tokens where the server has them (docs/patched-dependencies.md).
     let fast = Arc::new(Mutex::new(acc.fast.clone()));
     let login = tokio_xmpp::LoginOptions {
         user_agent: acc.device_id.as_deref().and_then(|id| uuid::Uuid::parse_str(id).ok()).map(|id| (id, "Crabber".into(), std::env::consts::OS.into())),

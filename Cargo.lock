@@ -4097,6 +4097,7 @@ dependencies = [
 [[package]]
 name = "gpui-pre-wgpu"
 version = "0.3.11"
+source = "git+https://github.com/auf-gg/gpui-pre-wgpu?branch=main#f200e0d0e20158fdfbf2cc605ecec0193a87f5b9"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -5006,8 +5007,7 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 [[package]]
 name = "jid"
 version = "0.12.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "01200283c7e9307b1afee820eea16008048b6712ef768617e18f36aadb1ed272"
+source = "git+https://github.com/auf-gg/xmpp-rs?branch=crabber#681ce5e7680be43fd2490da6dc59413ebd046249"
 dependencies = [
  "idna",
  "memchr",
@@ -5633,8 +5633,7 @@ dependencies = [
 [[package]]
 name = "minidom"
 version = "0.19.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "50b47a02dceb0a36b59ebd5971ce47b9db62593527f9e6800d640f3677fc0021"
+source = "git+https://github.com/auf-gg/xmpp-rs?branch=crabber#681ce5e7680be43fd2490da6dc59413ebd046249"
 dependencies = [
  "rxml",
  "thiserror 2.0.21",
@@ -6584,7 +6583,7 @@ dependencies = [
  "md-5",
  "num",
  "num-bigint-dig 0.9.1",
- "pbkdf2",
+ "pbkdf2 0.12.2",
  "serde",
  "serde_bytes",
  "sha2 0.10.9",
@@ -6806,6 +6805,15 @@ checksum = "f8ed6a7761f76e3b9f92dfb0a60a6a6477c61024b775147ff0973a02653abaf2"
 dependencies = [
  "digest 0.10.7",
  "hmac 0.12.1",
+]
+
+[[package]]
+name = "pbkdf2"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "112d82ceb8c5bf524d9af484d4e4970c9fd5a0cc15ba14ad93dccd28873b0629"
+dependencies = [
+ "digest 0.11.3",
 ]
 
 [[package]]
@@ -8792,15 +8800,14 @@ checksum = "c62751faa8bc286982334a082fe125184a29fc89d17775766e4f891b7d726980"
 [[package]]
 name = "sasl"
 version = "0.5.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6777dddc8108d9f36afbb008bc15b18edab2d17a8664ef58380b9398460e4e30"
+source = "git+https://github.com/auf-gg/xmpp-rs?branch=crabber#681ce5e7680be43fd2490da6dc59413ebd046249"
 dependencies = [
  "base64 0.22.1",
- "getrandom 0.2.17",
- "hmac 0.12.1",
- "pbkdf2",
- "sha1 0.10.7",
- "sha2 0.10.9",
+ "getrandom 0.4.3",
+ "hmac 0.13.0",
+ "pbkdf2 0.13.0",
+ "sha1 0.11.0",
+ "sha2 0.11.1",
 ]
 
 [[package]]
@@ -10042,12 +10049,13 @@ dependencies = [
 [[package]]
 name = "tokio-xmpp"
 version = "6.0.0"
+source = "git+https://github.com/auf-gg/xmpp-rs?branch=crabber#681ce5e7680be43fd2490da6dc59413ebd046249"
 dependencies = [
  "base64 0.22.1",
  "bytes",
  "futures",
  "hickory-resolver",
- "hmac 0.12.1",
+ "hmac 0.13.0",
  "idna",
  "log",
  "pin-project-lite",
@@ -10055,8 +10063,8 @@ dependencies = [
  "rustls-native-certs",
  "rxml",
  "sasl",
- "sha1 0.10.7",
- "sha2 0.10.9",
+ "sha1 0.11.0",
+ "sha2 0.11.1",
  "thiserror 2.0.21",
  "tokio",
  "tokio-rustls",
@@ -10766,6 +10774,7 @@ dependencies = [
 [[package]]
 name = "unsafe-libopus"
 version = "0.2.0"
+source = "git+https://github.com/auf-gg/unsafe-libopus?branch=crabber#598b7363f4ccb702033df1014f6c97b635165e4b"
 dependencies = [
  "arrayref",
  "num-complex",
@@ -12278,8 +12287,7 @@ checksum = "ec7a2a501ed189703dba8b08142f057e887dfc4b2cc4db2d343ac6376ba3e0b9"
 [[package]]
 name = "xmpp-parsers"
 version = "0.23.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "92b5d63bbd122ce3b5287d83efdd6916fb88bb274be23f6a9140238e0e1465b0"
+source = "git+https://github.com/auf-gg/xmpp-rs?branch=crabber#681ce5e7680be43fd2490da6dc59413ebd046249"
 dependencies = [
  "base64 0.22.1",
  "blake2",
@@ -12299,8 +12307,7 @@ dependencies = [
 [[package]]
 name = "xso"
 version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e0e57b564328d6826ab1fe8775f45ea062522cc2c345efd6e9de2c9ebcc94a1e"
+source = "git+https://github.com/auf-gg/xmpp-rs?branch=crabber#681ce5e7680be43fd2490da6dc59413ebd046249"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -12315,8 +12322,7 @@ dependencies = [
 [[package]]
 name = "xso_proc"
 version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bd68a7ea9d0463945b441dd8003121da60f2ab07f70f6a7510ac59eedd6ae6aa"
+source = "git+https://github.com/auf-gg/xmpp-rs?branch=crabber#681ce5e7680be43fd2490da6dc59413ebd046249"
 dependencies = [
  "proc-macro2",
  "quote",

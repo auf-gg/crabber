@@ -1111,7 +1111,7 @@ mod tests {
     }
 
     /// Opus' own concealment of quiet audio: a lost frame, and a DTX packet (one byte, sent in
-    /// pauses by libwebrtc). unsafe-libopus 0.2.0 made both full-scale (vendor/README.md).
+    /// pauses by libwebrtc). unsafe-libopus 0.2.0 made both full-scale (docs/patched-dependencies.md).
     #[test]
     fn opus_concealment_stays_quiet() {
         let mut enc = OpusEncoder::new().unwrap();
