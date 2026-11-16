@@ -483,12 +483,16 @@ impl Session {
     fn chat_mut(&mut self, peer: &str) -> Option<&mut ChatRow> {
         self.chats.iter_mut().find(|c| c.peer == peer)
     }
+    /// The chat with ourselves: notes.
+    pub fn is_notes(&self, peer: &str) -> bool {
+        let bare = |j: &str| j.split('/').next().unwrap_or(j).to_lowercase();
+        bare(peer) == bare(&self.me)
+    }
     /// Our name for the chat, else the name the contact gave themselves (XEP-0172), else the JID's user part.
     pub fn display_name(&self, peer: &str) -> String {
-        let bare = |j: &str| j.split('/').next().unwrap_or(j).to_lowercase();
         match self.chat(peer) {
             Some(c) if !c.name.is_empty() => c.name.clone(),
-            _ if bare(peer) == bare(&self.me) => t!("chat.notes").to_string(),
+            _ if self.is_notes(peer) => t!("chat.notes").to_string(),
             _ => self.nicks.get(peer).cloned().unwrap_or_else(|| peer.split('@').next().unwrap_or(peer).to_string()),
         }
     }

@@ -611,6 +611,16 @@ fn call_status(call: &crate::app::CallUi) -> String {
     }
 }
 
+/// Our own status as the sidebar shows it: the notes chat has it instead of a contact's.
+fn my_status(sess: &Session) -> &'static str {
+    match sess.show {
+        _ if !sess.online => t!("status.no_connection"),
+        Some(Show::Away) => t!("status.away"),
+        Some(Show::Dnd) => t!("status.dnd"),
+        _ => t!("status.online"),
+    }
+}
+
 /// Nicks of the occupants of `room` taking part in its group call.
 fn room_callers(sess: &Session, room: &str) -> Vec<String> {
     let mut nicks: Vec<String> = sess.members.get(room).into_iter().flat_map(|m| m.values()).filter(|o| o.call).map(|o| o.nick.clone()).collect();
@@ -1356,6 +1366,8 @@ impl App {
                 Some(n) => t!("room.online", n = n),
                 None => t!("room.label").into(),
             }, false)
+        } else if sess.is_notes(&peer) {
+            (my_status(sess).into(), sess.online)
         } else if online {
             (t!("status.online").into(), true)
         } else if chat.in_roster && (chat.subscription == "none" || chat.subscription == "from") {
@@ -2686,6 +2698,8 @@ impl App {
                 Some(n) => t!("room.online_profile", n = n),
                 None => t!("room.label").into(),
             }
+        } else if sess.is_notes(&peer) {
+            my_status(sess).into()
         } else if sess.presence.contains(&peer) {
             t!("status.online").into()
         } else {
