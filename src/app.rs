@@ -103,6 +103,8 @@ pub enum Modal {
     JoinGroup,
     Invite { room: String },
     ConfirmDelete { peer: String },
+    /// Delete every message of a chat on this device, keeping the chat.
+    ConfirmClear { peer: String },
     /// Delete a message for everyone; `moderate`: someone else's, as a group moderator.
     ConfirmRetract { msg: Msg, moderate: bool },
     /// Contact / group card opened from the chat header.
@@ -471,6 +473,8 @@ pub struct Session {
     pub profiles: HashMap<String, xmpp::Profile>,
     /// XEP-0172 names contacts gave themselves (kept in the database as "nick:<jid>").
     pub nicks: HashMap<String, String>,
+    /// Chats pinned to the top of the list, in their order there (kept in the database as "pinned").
+    pub pinned: Vec<String>,
 }
 
 impl Session {
@@ -525,8 +529,13 @@ impl Session {
             self.store.save_chat(c);
         }
     }
+    /// Pinned chats first in their order, then the rest by their last message, newest first.
     fn sort_chats(&mut self) {
-        self.chats.sort_by_key(|c| std::cmp::Reverse(c.last.as_ref().map_or(0, |m| m.ts)));
+        let pinned = &self.pinned;
+        self.chats.sort_by_key(|c| (pinned.iter().position(|p| *p == c.peer).unwrap_or(usize::MAX), std::cmp::Reverse(c.last.as_ref().map_or(0, |m| m.ts))));
+    }
+    fn save_pinned(&self) {
+        self.store.set("pinned", &serde_json::to_string(&self.pinned).unwrap_or_default());
     }
     /// How we appear as a sender in this chat: our nick in groups, our JID otherwise.
     pub fn my_sender(&self, peer: &str) -> String {
@@ -689,6 +698,8 @@ pub struct App {
     pub logo: Arc<Image>,
     /// Right-click menu: the message and the window position it was opened at.
     pub msg_menu: Option<(Msg, Point<Pixels>)>,
+    /// Right-click menu of a chat in the list: the chat and the window position it was opened at.
+    pub chat_menu: Option<(String, Point<Pixels>)>,
     /// Full reaction picker: message id, where it opened, the shown emoji group.
     /// Emoji picker: message to react to (`None`: insert into the composer), where it opened, the shown group.
     pub emoji_picker: Option<(Option<String>, Point<Pixels>, emojis::Group)>,
@@ -909,6 +920,7 @@ impl App {
             root_focus: cx.focus_handle(),
             logo: Arc::new(Image::from_bytes(ImageFormat::Png, desktop::ICON_PNG.to_vec())),
             msg_menu: None,
+            chat_menu: None,
             emoji_picker: None,
             recording: None,
             player: None,
@@ -1281,8 +1293,8 @@ impl App {
             fast,
         });
         let _ = cmd.unbounded_send(Cmd::E2eBlindTrust(self.settings.blind_trust));
-        let mut chats = store.chats();
-        chats.sort_by_key(|c| std::cmp::Reverse(c.last.as_ref().map_or(0, |m| m.ts)));
+        let chats = store.chats();
+        let pinned = store.get("pinned").and_then(|v| serde_json::from_str(&v).ok()).unwrap_or_default();
         let nicks = chats.iter().filter_map(|c| store.get(&format!("nick:{}", c.peer)).filter(|n| !n.is_empty()).map(|n| (c.peer.clone(), n))).collect();
         let mut sess = Session {
             me: jid.clone(),
@@ -1321,7 +1333,9 @@ impl App {
             members: HashMap::new(),
             profiles: HashMap::new(),
             nicks,
+            pinned,
         };
+        sess.sort_chats();
         for peer in sess.chats.iter().map(|c| c.peer.clone()).chain([jid]).collect::<Vec<_>>() {
             sess.load_avatar(&peer);
         }
@@ -1760,7 +1774,7 @@ impl App {
             self.show_update(false, cx);
             return true;
         }
-        if self.msg_menu.take().is_some() || self.emoji_picker.take().is_some() || self.viewer_menu.take().is_some() {
+        if self.msg_menu.take().is_some() || self.chat_menu.take().is_some() || self.emoji_picker.take().is_some() || self.viewer_menu.take().is_some() {
         } else if self.recording.take().is_some() {
             // Esc throws the recording away.
         } else if self.viewer.take().is_some() {
@@ -3223,12 +3237,63 @@ impl App {
         }
         sess.store.delete_chat(&peer);
         sess.chats.retain(|c| c.peer != peer);
+        if sess.pinned.contains(&peer) {
+            sess.pinned.retain(|p| *p != peer);
+            sess.save_pinned();
+        }
         if sess.selected.as_deref() == Some(&peer) {
             sess.selected = None;
             sess.history.clear();
             self.messages.reset(0);
         }
         self.modal = None;
+        cx.notify();
+    }
+
+    /// Deletes every message of a chat on this device; the chat stays in the list.
+    pub fn clear_chat(&mut self, peer: String, cx: &mut Context<Self>) {
+        let Some(sess) = self.sess.as_mut() else { return };
+        sess.store.clear_chat(&peer);
+        if let Some(c) = sess.chat_mut(&peer) {
+            c.last = None;
+            c.unread = 0;
+        }
+        sess.save(&peer);
+        sess.sort_chats();
+        if sess.selected.as_deref() == Some(&peer) {
+            sess.history.clear();
+            sess.reactions.clear();
+            self.messages.reset(0);
+        }
+        self.modal = None;
+        cx.notify();
+    }
+
+    /// Pins a chat on top of the pinned ones, or unpins it.
+    pub fn pin_chat(&mut self, peer: String, pin: bool, cx: &mut Context<Self>) {
+        self.chat_menu = None;
+        let Some(sess) = self.sess.as_mut() else { return };
+        sess.pinned.retain(|p| *p != peer);
+        if pin {
+            sess.pinned.insert(0, peer);
+        }
+        sess.save_pinned();
+        sess.sort_chats();
+        cx.notify();
+    }
+
+    /// A pinned chat dragged onto another pinned one takes its place.
+    pub fn move_pin(&mut self, peer: &str, onto: &str, cx: &mut Context<Self>) {
+        let Some(sess) = self.sess.as_mut() else { return };
+        let pos = |p: &str| sess.pinned.iter().position(|x| x == p);
+        let (Some(from), Some(to)) = (pos(peer), pos(onto)) else { return };
+        if from == to {
+            return;
+        }
+        let moved = sess.pinned.remove(from);
+        sess.pinned.insert(to, moved);
+        sess.save_pinned();
+        sess.sort_chats();
         cx.notify();
     }
 

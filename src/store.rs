@@ -270,8 +270,12 @@ impl Store {
         path
     }
 
-    /// Returns false when a message with this id was already stored (MAM/carbon/MUC echo duplicates).
+    /// Returns false when a message with this id was already stored (MAM/carbon/MUC echo duplicates),
+    /// or when the chat was cleared after it.
     pub fn insert_msg(&self, peer: &str, m: &Msg) -> bool {
+        if self.cleared(peer).is_some_and(|ts| m.ts <= ts) {
+            return false;
+        }
         self.db
             .execute(
                 "INSERT OR IGNORE INTO messages(peer, msg_id, sender, outgoing, body, url, ts, status, enc, reply_to) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
@@ -476,8 +480,15 @@ impl Store {
         self.history(peer, 1).pop()
     }
 
+    /// Time of the newest message we have; after a clear, catching up starts where the cleared history ended.
     pub fn last_ts(&self, peer: &str) -> Option<i64> {
-        self.db.query_row("SELECT MAX(ts) FROM messages WHERE peer=?1", [peer], |r| r.get(0)).ok().flatten()
+        let newest: Option<i64> = self.db.query_row("SELECT MAX(ts) FROM messages WHERE peer=?1", [peer], |r| r.get(0)).ok().flatten();
+        newest.max(self.cleared(peer))
+    }
+
+    /// Time up to which the chat was cleared.
+    fn cleared(&self, peer: &str) -> Option<i64> {
+        self.get(&format!("cleared:{peer}"))?.parse().ok()
     }
 
     pub fn chats(&self) -> Vec<ChatRow> {
@@ -516,6 +527,16 @@ impl Store {
     pub fn delete_msg(&self, peer: &str, msg_id: &str) {
         let _ = self.db.execute("DELETE FROM messages WHERE peer=?1 AND msg_id=?2", params![peer, msg_id]);
         let _ = self.db.execute("DELETE FROM reactions WHERE peer=?1 AND msg_id=?2", params![peer, msg_id]);
+    }
+
+    /// Deletes the messages of a chat but keeps the chat. An archive or a room's history sending
+    /// them again later doesn't bring them back: nothing up to the newest one deleted is stored.
+    pub fn clear_chat(&self, peer: &str) {
+        if let Some(ts) = self.last_ts(peer) {
+            self.set(&format!("cleared:{peer}"), &ts.to_string());
+        }
+        let _ = self.db.execute("DELETE FROM messages WHERE peer=?1", [peer]);
+        let _ = self.db.execute("DELETE FROM reactions WHERE peer=?1", [peer]);
     }
 
     /// Drops the chat from the list but keeps its messages.
@@ -596,6 +617,26 @@ mod tests {
         let h = s.history("bob", 10);
         assert_eq!(h.iter().map(|m| (m.msg_id.as_str(), m.status)).collect::<Vec<_>>(), [("1", 2), ("2", 2), ("3", 0)]);
         assert_eq!(s.history("bob", 2).first().unwrap().msg_id, "2", "limit keeps the newest");
+    }
+
+    #[test]
+    fn cleared_chat_stays_cleared() {
+        let s = Store::open(Path::new(":memory:")).unwrap();
+        s.insert_msg("bob", &msg("1", 10, false));
+        s.insert_msg("bob", &msg("2", 20, true));
+        s.insert_msg("eve", &msg("3", 15, false));
+        s.clear_chat("bob");
+        assert!(s.history("bob", 10).is_empty());
+        assert_eq!(s.history("eve", 10).len(), 1, "other chats keep theirs");
+        assert_eq!(s.last_ts("bob"), Some(20), "catching up starts after the cleared history");
+        assert!(!s.insert_msg("bob", &msg("1", 10, false)), "the archive can't bring an old one back");
+        assert!(!s.insert_msg("bob", &msg("9", 20, false)));
+        assert!(s.insert_msg("bob", &msg("4", 30, false)), "new messages come in");
+        s.clear_chat("bob");
+        assert!(!s.insert_msg("bob", &msg("4", 30, false)), "a second clear moves the mark");
+        s.clear_chat("eve");
+        s.clear_chat("eve");
+        assert_eq!(s.last_ts("eve"), Some(15), "clearing an empty chat keeps the mark");
     }
 
     #[test]

@@ -611,6 +611,51 @@ fn call_status(call: &crate::app::CallUi) -> String {
     }
 }
 
+/// A row of a right-click menu.
+fn menu_item(id: &'static str, icon: IconName, label: &'static str, danger: bool, p: &style::Palette) -> Stateful<Div> {
+    let hover = p.hover;
+    h_flex()
+        .id(id)
+        .gap_3()
+        .px_3()
+        .py_1p5()
+        .rounded_md()
+        .items_center()
+        .cursor_pointer()
+        .text_sm()
+        .text_color(if danger { p.danger } else { p.text })
+        .hover(move |d| d.bg(hover))
+        .child(Icon::new(icon).small())
+        .child(label)
+}
+
+/// A pinned chat being dragged to another place among the pinned ones; also what follows the mouse.
+#[derive(Clone)]
+struct DraggedChat {
+    peer: String,
+    name: SharedString,
+}
+
+impl Render for DraggedChat {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let p = style::palette(cx);
+        h_flex()
+            .gap_2()
+            .px_3()
+            .py_1p5()
+            .items_center()
+            .rounded_lg()
+            .bg(p.panel)
+            .border_1()
+            .border_color(p.accent)
+            .shadow_lg()
+            .text_sm()
+            .text_color(p.text)
+            .child(Icon::new(IconName::Pin).xsmall().text_color(p.accent))
+            .child(self.name.clone())
+    }
+}
+
 /// Our own status as the sidebar shows it: the notes chat has it instead of a contact's.
 fn my_status(sess: &Session) -> &'static str {
     match sess.show {
@@ -833,6 +878,7 @@ impl Render for App {
             .when(cfg!(windows) && !self.call_fullscreen, |d| d.child(self.render_titlebar(window, cx)))
             .child(content)
             .when_some(self.render_msg_menu(window, cx), |d, m| d.child(m))
+            .when_some(self.render_chat_menu(window, cx), |d, m| d.child(m))
             .when_some(self.render_emoji_picker(window, cx), |d, m| d.child(m))
             .when_some(self.render_viewer_menu(cx), |d, m| d.child(m))
             // Full screen hides the title bar; the mouse at the top edge slides it down over the
@@ -1157,6 +1203,7 @@ impl App {
                 let online = sess.presence.contains(&c.peer);
                 let typing = sess.typing.get(&c.peer).is_some_and(|(_, at)| at.elapsed().as_secs() < 30);
                 let peer = c.peer.clone();
+                let pinned = sess.pinned.contains(&c.peer);
                 let sub = if typing { t!("typing").to_string() } else { preview(sess, c) };
                 let locked = c.last.as_ref().is_some_and(|m| m.enc > 0);
                 // The row is filled with the accent: its text must contrast with it (not always white).
@@ -1189,7 +1236,8 @@ impl App {
                             .child(
                                 h_flex()
                                     .gap_2()
-                                    .child(div().flex_1().min_w_0().truncate().font_weight(FontWeight::SEMIBOLD).text_color(title_c).child(name))
+                                    .child(div().flex_1().min_w_0().truncate().font_weight(FontWeight::SEMIBOLD).text_color(title_c).child(name.clone()))
+                                    .when(pinned, |d| d.child(Icon::new(IconName::Pin).xsmall().text_color(time_c)))
                                     .child(div().text_xs().text_color(time_c).child(c.last.as_ref().map(|m| short_time(m.ts)).unwrap_or_default())),
                             )
                             .child(
@@ -1217,6 +1265,20 @@ impl App {
                                     }),
                             ),
                     )
+                    .on_mouse_down(MouseButton::Right, {
+                        let peer = peer.clone();
+                        cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
+                            this.chat_menu = Some((peer.clone(), ev.position));
+                            cx.notify();
+                        })
+                    })
+                    // Pinned chats are put in order by dragging one onto another.
+                    .when(pinned, |d| {
+                        let onto = peer.clone();
+                        d.on_drag(DraggedChat { peer: peer.clone(), name: name.clone().into() }, |d, _, _, cx| cx.new(|_| d.clone()))
+                            .drag_over::<DraggedChat>(move |s, _, _, _| s.bg(p.accent_soft))
+                            .on_drop(cx.listener(move |this, d: &DraggedChat, _, cx| this.move_pin(&d.peer, &onto, cx)))
+                    })
                     .on_click(cx.listener(move |this, _, window, cx| this.select(peer.clone(), window, cx)));
                 v_flex().child(row).when(divider, |d| d.child(div().h(dp(1.)).ml(dp(78.)).mr_3().bg(p.divider)))
             });
@@ -2420,21 +2482,7 @@ impl App {
         let p = style::palette(cx);
         let sess = self.sess.as_ref()?;
         let file = m.url.as_ref().and_then(|u| sess.store.file_for(u)).filter(|f| f.is_file());
-        let item = |id: &'static str, icon: IconName, label: &'static str, danger: bool| {
-            h_flex()
-                .id(id)
-                .gap_3()
-                .px_3()
-                .py_1p5()
-                .rounded_md()
-                .items_center()
-                .cursor_pointer()
-                .text_sm()
-                .text_color(if danger { p.danger } else { p.text })
-                .hover(|d| d.bg(p.hover))
-                .child(Icon::new(icon).small())
-                .child(label)
-        };
+        let item = |id: &'static str, icon: IconName, label: &'static str, danger: bool| menu_item(id, icon, label, danger, &p);
         let mut items: Vec<AnyElement> = vec![];
         let room = sess.selected.as_deref().filter(|p| sess.chat(p).is_some_and(|c| c.is_room));
         let moderator = room.and_then(|r| my_occupant(sess, r)).is_some_and(|o| o.role == "moderator");
@@ -2562,45 +2610,111 @@ impl App {
                 .on_click(cx.listener(move |this, _, _, cx| this.delete_message(&id, cx)))
                 .into_any_element(),
         );
+        Some(self.context_menu("msg-menu", pos, items, window, cx))
+    }
 
+    /// Right-click menu of a chat in the list: pin, clear, block, report, delete.
+    fn render_chat_menu(&self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let (peer, pos) = self.chat_menu.clone()?;
+        let p = style::palette(cx);
+        let sess = self.sess.as_ref()?;
+        let is_room = sess.chat(&peer)?.is_room;
+        let pinned = sess.pinned.contains(&peer);
+        // Blocking is for contacts, once the server told us it has it.
+        let blocked = sess.blocked.as_ref().filter(|_| !is_room && !sess.is_notes(&peer)).map(|b| b.contains(&peer));
+        let divider = || div().h(px(1.)).my_1().bg(p.divider).into_any_element();
+        let mut items: Vec<AnyElement> = vec![];
+        let pr = peer.clone();
+        items.push(
+            menu_item("cm-pin", if pinned { IconName::PinOff } else { IconName::Pin }, if pinned { t!("chat_menu.unpin") } else { t!("chat_menu.pin") }, false, &p)
+                .on_click(cx.listener(move |this, _, _, cx| this.pin_chat(pr.clone(), !pinned, cx)))
+                .into_any_element(),
+        );
+        let pr = peer.clone();
+        items.push(
+            menu_item("cm-clear", IconName::Eraser, t!("chat_menu.clear"), true, &p)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.chat_menu = None;
+                    this.modal = Some(Modal::ConfirmClear { peer: pr.clone() });
+                    cx.notify();
+                }))
+                .into_any_element(),
+        );
+        if let Some(blocked) = blocked {
+            items.push(divider());
+            let pr = peer.clone();
+            items.push(
+                menu_item("cm-block", IconName::Ban, if blocked { t!("block.unblock") } else { t!("block.block") }, !blocked, &p)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.chat_menu = None;
+                        this.block(pr.clone(), !blocked, false, cx);
+                    }))
+                    .into_any_element(),
+            );
+            if !blocked {
+                let pr = peer.clone();
+                items.push(
+                    menu_item("cm-spam", IconName::TriangleAlert, t!("profile.spam"), true, &p)
+                        .tooltip(|w, cx| Tooltip::new(t!("profile.spam_tip")).build(w, cx))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.chat_menu = None;
+                            this.block(pr.clone(), true, true, cx);
+                        }))
+                        .into_any_element(),
+                );
+            }
+        }
+        items.push(divider());
+        items.push(
+            menu_item("cm-delete", if is_room { IconName::DoorOpen } else { IconName::UserMinus }, if is_room { t!("profile.leave") } else { t!("profile.delete") }, true, &p)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.chat_menu = None;
+                    this.modal = Some(Modal::ConfirmDelete { peer: peer.clone() });
+                    cx.notify();
+                }))
+                .into_any_element(),
+        );
+        Some(self.context_menu("chat-menu", pos, items, window, cx))
+    }
+
+    /// A right-click menu at `pos`, kept inside the window; a click outside closes it.
+    fn context_menu(&self, id: &'static str, pos: Point<Pixels>, items: Vec<AnyElement>, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let p = style::palette(cx);
         let rem = window.rem_size();
         let (w, h) = (rem * 17., rem * (2.3 * items.len() as f32 + 0.5));
         let view = window.viewport_size();
         let x = if pos.x + w > view.width { pos.x - w } else { pos.x };
         let y = if pos.y + h > view.height { (pos.y - h).max(px(0.)) } else { pos.y };
-        Some(
-            div()
-                .id("msg-menu-backdrop")
-                .absolute()
-                .inset_0()
-                .occlude()
-                .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
-                    this.msg_menu = None;
-                    cx.notify();
-                }))
-                .on_mouse_down(MouseButton::Right, cx.listener(|this, _, _, cx| {
-                    this.msg_menu = None;
-                    cx.notify();
-                }))
-                .child(
-                    v_flex()
-                        .id("msg-menu")
-                        .absolute()
-                        .left(x)
-                        .top(y)
-                        .w(w)
-                        .p_1()
-                        .rounded_lg()
-                        .bg(p.panel)
-                        .border_1()
-                        .border_color(p.divider)
-                        .shadow_xl()
-                        // Clicks on items must not reach the backdrop's "close" handler first.
-                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                        .children(items),
-                )
-                .into_any_element(),
-        )
+        let close = |this: &mut App, cx: &mut Context<App>| {
+            this.msg_menu = None;
+            this.chat_menu = None;
+            cx.notify();
+        };
+        div()
+            .id(SharedString::from(format!("{id}-backdrop")))
+            .absolute()
+            .inset_0()
+            .occlude()
+            .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| close(this, cx)))
+            .on_mouse_down(MouseButton::Right, cx.listener(move |this, _, _, cx| close(this, cx)))
+            .child(
+                v_flex()
+                    .id(id)
+                    .absolute()
+                    .left(x)
+                    .top(y)
+                    .w(w)
+                    .p_1()
+                    .rounded_lg()
+                    .bg(p.panel)
+                    .border_1()
+                    .border_color(p.divider)
+                    .shadow_xl()
+                    // Clicks on items must not reach the backdrop's "close" handler first.
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .children(items),
+            )
+            .into_any_element()
     }
 
     /// Every emoji, one group per tab; a click toggles it as our reaction.
@@ -3464,6 +3578,7 @@ impl App {
                 let text = if room { t!("modal.leave_text") } else { t!("modal.delete_text") };
                 (t!("modal.confirm"), div().child(text).into_any_element())
             }
+            Modal::ConfirmClear { .. } => (t!("chat_menu.clear"), div().child(t!("modal.clear_text")).into_any_element()),
             Modal::Settings | Modal::Media { .. } | Modal::Encryption { .. } | Modal::PgpImport { .. } | Modal::Profile { .. } | Modal::EditProfile { .. } => return None,
         };
         let confirm = match modal {
@@ -3475,6 +3590,10 @@ impl App {
             Modal::ConfirmDelete { peer } => {
                 let p = peer.clone();
                 Some(Button::new("modal-ok").danger().label(t!("modal.delete")).on_click(cx.listener(move |this, _, _, cx| this.delete_chat(p.clone(), cx))))
+            }
+            Modal::ConfirmClear { peer } => {
+                let p = peer.clone();
+                Some(Button::new("modal-ok").danger().label(t!("modal.clear")).on_click(cx.listener(move |this, _, _, cx| this.clear_chat(p.clone(), cx))))
             }
             _ => Some(Button::new("modal-ok").primary().label(t!("modal.done")).on_click(cx.listener(|this, _, w, cx| this.submit_modal(w, cx)))),
         };
