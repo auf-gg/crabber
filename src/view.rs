@@ -1517,7 +1517,7 @@ impl App {
             })
             .when(!chat.is_room, |d| {
                 let pr = peer.clone();
-                let secure = matches!(chat.enc.as_str(), "" | "auto" | "omemo") && sess.e2e_devices.get(&peer).is_none_or(|d| !d.is_empty());
+                let secure = matches!(chat.enc.as_str(), "" | "auto" | "omemo" | "omemo2" | "omemo-legacy") && sess.e2e_devices.get(&peer).is_none_or(|d| !d.is_empty());
                 d.child(
                     Button::new("e2e")
                         .ghost()
@@ -2388,6 +2388,9 @@ impl App {
         list.into_iter()
             .map(|d| {
                 let title = if d.own { t!("e2e.this_device", id = d.id) } else { t!("e2e.device", id = d.id) };
+                // Which OMEMO versions the device announces.
+                let versions: Vec<&str> = [(d.v2, "OMEMO 2"), (d.legacy, t!("e2e.proto_legacy"))].into_iter().filter(|v| v.0).map(|v| v.1).collect();
+                let title = if versions.is_empty() { title } else { format!("{title} · {}", versions.join(", ")) };
                 let (j, id) = (jid.to_string(), d.id);
                 h_flex()
                     .gap_3()
@@ -2453,6 +2456,8 @@ impl App {
             .gap_2()
             .child(option("enc-auto", "auto", t!("e2e.auto"), t!("e2e.auto_desc")))
             .child(option("enc-omemo", "omemo", t!("e2e.omemo"), t!("e2e.omemo_desc")))
+            .child(option("enc-omemo2", "omemo2", t!("e2e.omemo2"), t!("e2e.omemo2_desc")))
+            .child(option("enc-omemo-legacy", "omemo-legacy", t!("e2e.omemo_legacy"), t!("e2e.omemo_legacy_desc")))
             .child(option("enc-pgp", "pgp", "OpenPGP (XEP-0027)", t!("e2e.pgp_desc")))
             .child(option("enc-plain", "plain", t!("e2e.plain"), t!("e2e.plain_desc")))
             .child(div().pt_4().pb_1().text_xs().font_weight(FontWeight::SEMIBOLD).text_color(t.muted_foreground).child(t!("e2e.peer_devices")))

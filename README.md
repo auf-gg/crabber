@@ -64,7 +64,7 @@ The chats in the screenshots come from the [test server](tests/xmpp_server/READM
 - Read ticks and unread counters that follow your other devices
 
 ### 🔒 Privacy and security
-- OMEMO end-to-end encryption (libsignal-compatible) and PGP support
+- OMEMO end-to-end encryption (legacy and OMEMO 2) and PGP support
 - Encrypted file transfer
 - STARTTLS/TLS on rustls, SCRAM-SHA-256-PLUS with channel binding
 - Credentials kept in the system keyring
@@ -143,7 +143,7 @@ against the client requirements of the [XMPP Compliance Suites 2023](https://xmp
 | [0368](https://xmpp.org/extensions/xep-0368.html) | SRV records for XMPP over TLS | ✅ | Direct TLS where the domain publishes it (or a manual host on port 5223), STARTTLS otherwise |
 | [0377](https://xmpp.org/extensions/xep-0377.html) | Blocking Command Reports | ✅ | Sent with a block |
 | [0380](https://xmpp.org/extensions/xep-0380.html) | Explicit Message Encryption | ✅ | |
-| [0384](https://xmpp.org/extensions/xep-0384.html) | OMEMO Encryption | ✅ | Legacy v0.3 namespace |
+| [0384](https://xmpp.org/extensions/xep-0384.html) | OMEMO Encryption | ✅ | Legacy v0.3 and OMEMO 2 (`urn:xmpp:omemo:2`) on one identity; a chat uses OMEMO 2 when the contact has it, or a version picked by hand |
 | [0386](https://xmpp.org/extensions/xep-0386.html) | Bind 2 | ✅ | Resource bound at login; a session to resume is resumed instead |
 | [0388](https://xmpp.org/extensions/xep-0388.html) | Extensible SASL Profile (SASL2) | ✅ | SCRAM-SHA-256-PLUS with `tls-exporter` where offered; the server's signature is checked |
 | [0392](https://xmpp.org/extensions/xep-0392.html) | Consistent Color Generation | ✅ | Nick colours by the XEP's HSLuv algorithm, lighter on a dark theme; no switch to turn them off |
@@ -151,6 +151,7 @@ against the client requirements of the [XMPP Compliance Suites 2023](https://xmp
 | [0398](https://xmpp.org/extensions/xep-0398.html) | User Avatar to vCard-Based Avatars Conversion | ✅ | The server's copy is used instead of publishing the vCard avatar ourselves |
 | [0402](https://xmpp.org/extensions/xep-0402.html) | PEP Native Bookmarks | ✅ | Joined rooms sync between devices |
 | [0410](https://xmpp.org/extensions/xep-0410.html) | MUC Self-Ping | ✅ | Every 10 min; rejoins a room we dropped out of |
+| [0420](https://xmpp.org/extensions/xep-0420.html) | Stanza Content Encryption | 🟡 | OMEMO 2 envelopes: the body only |
 | [0421](https://xmpp.org/extensions/xep-0421.html) | Occupant identifiers for semi-anonymous MUCs | ✅ | Only from rooms that advertise them; corrections and retractions must come from the same occupant |
 | [0424](https://xmpp.org/extensions/xep-0424.html) | Message Retraction | ✅ | Delete for everyone, with confirmation |
 | [0425](https://xmpp.org/extensions/xep-0425.html) | Moderated Message Retraction | ✅ | `:1`, falls back to `:0` for older servers |

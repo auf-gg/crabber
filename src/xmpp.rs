@@ -124,7 +124,7 @@ const NS_OCCUPANT_ID: &str = "urn:xmpp:occupant-id:0";
 pub enum Cmd {
     /// Sent by the UI after `Ev::Online`: MAM catch-up point and rooms to rejoin (room, nick, since, after).
     Sync { mam_after: Option<String>, rooms: Vec<(String, String, Option<i64>, Option<String>)> },
-    /// `enc`: chat encryption mode — "auto" | "omemo" | "pgp" | "plain".
+    /// `enc`: chat encryption mode — "auto" | "omemo" | "omemo2" | "omemo-legacy" | "pgp" | "plain".
     Send { to: String, id: String, body: String, groupchat: bool, enc: String, reply: Option<Reply> },
     /// XEP-0490: we read chat `peer` up to the message with stanza-id `sid`.
     MarkDisplayed { peer: String, sid: String, groupchat: bool },
@@ -537,6 +537,8 @@ fn disco_info(node: Option<String>) -> DiscoInfoResult {
         filetransfer::NS_IBB,
         omemo::NS,
         "eu.siacs.conversations.axolotl.devicelist+notify",
+        omemo::NS2,
+        "urn:xmpp:omemo:2:devices+notify",
         e2e::NS_EME,
         ns::MESSAGE_CORRECT,
         ns::REACTIONS,
@@ -790,7 +792,7 @@ impl State {
                                 let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file").to_string();
                                 let https = upload_bytes(&net, &http, upload, ct, name, "application/octet-stream").await?;
                                 let url = format!("{}#{fragment}", https.replacen("https://", "aesgcm://", 1));
-                                let el = e2e::encrypt(&e2e, &net, &to, &url).await?;
+                                let el = encrypt_for(&e2e, &net, &to, &enc, &url).await?.ok_or_else(|| t!("e2e.err_no_devices").to_string())?;
                                 Ok::<_, String>((url, el))
                             }
                             .await;
@@ -1046,7 +1048,7 @@ impl State {
                 let (Some(e2e), net) = (self.e2e.clone(), self.net.clone()) else { return };
                 tokio::spawn(async move {
                     // Refresh from the server before showing the list.
-                    let _ = e2e::has_devices(&e2e, &net, &jid).await;
+                    e2e::refresh(&e2e, &net, &jid).await;
                     let devices = e2e.lock().await.device_info(&jid);
                     net.emit(Ev::E2eDevices { jid, devices });
                 });
@@ -1495,9 +1497,9 @@ impl State {
         let outgoing_carbon = from.to_bare() == self.me;
 
         // OMEMO device list updates (PEP notifications).
-        if let Some(ids) = e2e::devicelist_event(&m.payloads) {
+        if let Some((proto, list)) = e2e::devicelist_event(&m.payloads) {
             if let Some(e2e) = self.e2e.clone() {
-                tokio::spawn(e2e::on_devicelist(e2e, self.net.clone(), from.to_bare().to_string(), ids));
+                tokio::spawn(e2e::on_devicelist(e2e, self.net.clone(), from.to_bare().to_string(), proto, list));
             }
             return;
         }
@@ -1663,9 +1665,9 @@ impl State {
             return;
         }
 
-        // OMEMO: decrypt off the loop, then process the plaintext as a normal message.
+        // OMEMO (either version): decrypt off the loop, then process the plaintext as a normal message.
         if enc == 0
-            && let Some(el) = m.payloads.iter().find(|p| p.is("encrypted", omemo::NS)).cloned()
+            && let Some(el) = m.payloads.iter().find(|p| e2e::Proto::of(p).is_some()).cloned()
         {
             let Some(e2e) = self.e2e.clone() else { return };
             let net = self.net.clone();
@@ -1680,7 +1682,7 @@ impl State {
                 let mut plain = m;
                 plain.bodies.clear();
                 plain.bodies.insert(Lang::default(), text);
-                plain.payloads.retain(|p| !p.is("encrypted", omemo::NS) && !p.is("encryption", e2e::NS_EME));
+                plain.payloads.retain(|p| e2e::Proto::of(p).is_none() && !p.is("encryption", e2e::NS_EME));
                 net.inject(plain, archived, enc);
             });
             return;
@@ -1784,9 +1786,9 @@ fn chat_message(to: &str, id: &str, body: String, url: Option<String>, groupchat
     m
 }
 
-/// OMEMO message: encrypted element + EME + store hint, with the standard fallback body.
+/// OMEMO message (either version): encrypted element + EME + store hint, with the standard fallback body.
 fn encrypted_message(to: &str, id: &str, encrypted: Element) -> Message {
-    let eme = Element::builder("encryption", e2e::NS_EME).attr(nc("namespace"), omemo::NS).attr(nc("name"), "OMEMO").build();
+    let eme = Element::builder("encryption", e2e::NS_EME).attr(nc("namespace"), encrypted.ns()).attr(nc("name"), "OMEMO").build();
     let hint = Element::builder("store", "urn:xmpp:hints").build();
     chat_message(to, id, omemo::FALLBACK_BODY.to_string(), None, false).with_payloads(vec![encrypted, eme, hint])
 }
@@ -1809,17 +1811,19 @@ fn pgp_message(to: &str, id: &str, payload: String) -> Message {
     chat_message(to, id, pgp::FALLBACK_BODY.to_string(), None, false).with_payloads(vec![x, eme, hint])
 }
 
-/// Decides OMEMO for a send. `Ok(None)`: send in plain text (auto mode and the contact has no OMEMO).
+/// Decides OMEMO and its version for a send. `Ok(None)`: send in plain text (auto mode and the
+/// contact has no OMEMO).
 async fn encrypt_for(e2e: &e2e::Shared, net: &Net, to: &str, enc: &str, body: &str) -> Result<Option<Element>, String> {
-    let want = match enc {
-        "omemo" => true,
-        "pgp" => return Err(t!("enc.pgp_no_files").into()),
-        _ => e2e::has_devices(e2e, net, to).await,
-    };
-    if !want {
-        return Ok(None);
+    if enc == "pgp" {
+        return Err(t!("enc.pgp_no_files").into());
     }
-    e2e::encrypt(e2e, net, to, body).await.map(Some)
+    let proto = match e2e::pick(e2e, net, to, enc).await {
+        Some(p) => p,
+        None if matches!(enc, "" | "auto") => return Ok(None),
+        None if enc == "omemo2" => return Err(t!("e2e.err_no_devices2").into()),
+        None => return Err(t!("e2e.err_no_devices").into()),
+    };
+    e2e::encrypt(e2e, net, to, body, proto).await.map(Some)
 }
 
 pub fn nc(s: &str) -> tokio_xmpp::minidom::rxml::NcName {

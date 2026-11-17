@@ -1,19 +1,24 @@
-"""Reference OMEMO peer for interop tests: python-oldmemo via slixmpp-omemo.
+"""Reference OMEMO peer for interop tests: python-oldmemo and python-twomemo via slixmpp-omemo.
 
-Logs in as carol@localhost, decrypts every OMEMO message and answers "echo: <text>" encrypted.
-Run by tests/omemo_interop.rs; needs `pip install slixmpp slixmpp-omemo oldmemo[xml]`.
+Logs in as carol@localhost, decrypts every OMEMO message and answers encrypted with the same
+version: "echo: <text>" for legacy OMEMO, "echo2: <text>" for OMEMO 2.
+Run by tests/omemo_interop.rs; needs `pip install slixmpp slixmpp-omemo oldmemo[xml] twomemo[xml]`.
 """
 import asyncio
 import ssl
 import sys
 from typing import Any, Dict, FrozenSet, Optional
+from xml.etree import ElementTree as ET
 
+import twomemo
 from omemo.storage import Just, Maybe, Nothing, Storage
 from omemo.types import DeviceInformation, JSONType
 from slixmpp import JID, ClientXMPP
 from slixmpp.plugins import register_plugin
 from slixmpp.stanza import Message
 from slixmpp_omemo import XEP_0384, TrustLevel
+
+SCE = "{urn:xmpp:sce:1}"
 
 
 class MemoryStorage(Storage):
@@ -76,7 +81,14 @@ class EchoBot(ClientXMPP):
         if stanza["type"] not in ("chat", "normal"):
             return
         xep_0384: XEP_0384 = self["xep_0384"]
-        if not xep_0384.is_encrypted(stanza):
+        namespaces = xep_0384.is_encrypted(stanza)
+        if not namespaces:
+            return
+        if twomemo.twomemo.NAMESPACE in namespaces:
+            try:
+                await self.echo2(stanza)
+            except Exception as e:  # pylint: disable=broad-exception-caught
+                print("TWOMEMO-FAIL", repr(e), flush=True)
             return
         try:
             decrypted, _ = await xep_0384.decrypt_message(stanza)
@@ -94,6 +106,35 @@ class EchoBot(ClientXMPP):
             print("ENCRYPT-ERRORS", errors, flush=True)
         if encrypted is not None:
             encrypted.send()
+
+    async def echo2(self, stanza: Message) -> None:
+        """OMEMO 2, through the session manager: slixmpp-omemo has no SCE (de)serialisation yet."""
+        sender = stanza["from"].bare
+        session_manager = await self["xep_0384"].get_session_manager()
+        element = stanza.xml.find(f"{{{twomemo.twomemo.NAMESPACE}}}encrypted")
+        plaintext = (await session_manager.decrypt(twomemo.etree.parse_message(element, sender)))[0]
+        if plaintext is None:
+            return  # empty OMEMO message: session housekeeping
+        body = ET.fromstring(plaintext).findtext(f"{SCE}content/{{jabber:client}}body")
+        if not body:
+            return
+        print("GOT2", body, flush=True)
+        envelope = ET.Element(f"{SCE}envelope")
+        ET.SubElement(ET.SubElement(envelope, f"{SCE}content"), "{jabber:client}body").text = "echo2: " + body
+        ET.SubElement(envelope, f"{SCE}rpad").text = "pad"
+        ET.SubElement(envelope, f"{SCE}from", jid=self.boundjid.bare)
+        messages, errors = await session_manager.encrypt(
+            frozenset({ sender }),
+            { twomemo.twomemo.NAMESPACE: ET.tostring(envelope) },
+            backend_priority_order=[ twomemo.twomemo.NAMESPACE ]
+        )
+        if errors:
+            print("ENCRYPT-ERRORS", errors, flush=True)
+        reply = self.make_message(mto=sender, mtype="chat", mbody="OMEMO 2 echo")
+        for message in messages:
+            reply.append(twomemo.etree.serialize_message(message))
+        reply.enable("store")
+        reply.send()
 
 
 def main() -> None:

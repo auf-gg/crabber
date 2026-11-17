@@ -1,5 +1,5 @@
-//! OMEMO interop against python-oldmemo (tests/omemo_echo_bot.py) on the local ejabberd.
-//!   pip install slixmpp slixmpp-omemo "oldmemo[xml]"
+//! OMEMO interop against python-oldmemo and python-twomemo (tests/omemo_echo_bot.py) on the local ejabberd.
+//!   pip install slixmpp slixmpp-omemo "oldmemo[xml]" "twomemo[xml]"
 //!   OMEMO_PY=<python with those packages> cargo test --test omemo_interop -- --ignored --test-threads=1
 use std::io::{BufRead, BufReader};
 use std::process::{Child, Command, Stdio};
@@ -91,15 +91,15 @@ fn start_bot() -> Bot {
     }
 }
 
-fn send(tx: &UnboundedSender<Cmd>, to: &str, body: &str) -> String {
+fn send(tx: &UnboundedSender<Cmd>, to: &str, body: &str, enc: &str) -> String {
     let id = xmpp::new_id();
-    tx.unbounded_send(Cmd::Send { to: to.into(), id: id.clone(), body: body.into(), groupchat: false, enc: "omemo".into(), reply: None }).unwrap();
+    tx.unbounded_send(Cmd::Send { to: to.into(), id: id.clone(), body: body.into(), groupchat: false, enc: enc.into(), reply: None }).unwrap();
     id
 }
 
 #[test]
 #[ignore]
-fn omemo_with_python_oldmemo_and_between_our_clients() {
+fn omemo_with_python_oldmemo_twomemo_and_between_our_clients() {
     reset(&["alice", "bob", "carol"]);
     let _bot = start_bot();
     let (a, mut a_rx) = login("alice");
@@ -108,32 +108,37 @@ fn omemo_with_python_oldmemo_and_between_our_clients() {
     wait(&mut b_rx, 15, |e| matches!(e, Ev::Online { .. }).then_some(()));
     std::thread::sleep(Duration::from_secs(2)); // bundles and device lists published
 
-    // 1. Rust -> python-oldmemo -> Rust, twice (PreKey message, then a normal one).
-    for text in ["Привет, OMEMO!", "второе сообщение"] {
-        let id = send(&a, "carol@localhost", text);
-        wait(&mut a_rx, 20, |e| matches!(e, Ev::SentEncrypted { id: i, enc: 1, .. } if *i == id).then_some(()));
-        let got = wait(&mut a_rx, 20, |e| match e {
-            Ev::Message { peer, msg, .. } if peer == "carol@localhost" && !msg.outgoing => Some(msg.clone()),
-            _ => None,
-        });
-        assert_eq!(got.body, format!("echo: {text}"));
-        assert_eq!(got.enc, 1, "reply was OMEMO-encrypted");
+    // 1. Rust -> python -> Rust, twice per version (key exchange, then a normal message). The bot
+    // has both versions, so "omemo" picks OMEMO 2; the bot answers with the version it got.
+    for (enc, echo) in [("omemo", "echo2"), ("omemo-legacy", "echo")] {
+        for text in ["Привет, OMEMO!", "второе сообщение"] {
+            let id = send(&a, "carol@localhost", text, enc);
+            wait(&mut a_rx, 20, |e| matches!(e, Ev::SentEncrypted { id: i, enc: 1, .. } if *i == id).then_some(()));
+            let got = wait(&mut a_rx, 20, |e| match e {
+                Ev::Message { peer, msg, .. } if peer == "carol@localhost" && !msg.outgoing => Some(msg.clone()),
+                _ => None,
+            });
+            assert_eq!(got.body, format!("{echo}: {text}"));
+            assert_eq!(got.enc, 1, "reply was OMEMO-encrypted");
+        }
     }
 
-    // 2. Between two of our clients, both directions.
-    let id = send(&b, "alice@localhost", "от боба");
+    // 2. Between two of our clients, both directions; OMEMO 2, then legacy.
+    let id = send(&b, "alice@localhost", "от боба", "omemo");
     wait(&mut b_rx, 20, |e| matches!(e, Ev::SentEncrypted { id: i, .. } if *i == id).then_some(()));
     let got = wait(&mut a_rx, 20, |e| match e {
         Ev::Message { peer, msg, .. } if peer == "bob@localhost" && !msg.outgoing => Some(msg.clone()),
         _ => None,
     });
     assert_eq!((got.body.as_str(), got.enc), ("от боба", 1));
-    send(&a, "bob@localhost", "ответ алисы");
-    let got = wait(&mut b_rx, 20, |e| match e {
-        Ev::Message { peer, msg, .. } if peer == "alice@localhost" && !msg.outgoing => Some(msg.clone()),
-        _ => None,
-    });
-    assert_eq!((got.body.as_str(), got.enc), ("ответ алисы", 1));
+    for (text, enc) in [("ответ алисы", "omemo"), ("старый OMEMO", "omemo-legacy")] {
+        send(&a, "bob@localhost", text, enc);
+        let got = wait(&mut b_rx, 20, |e| match e {
+            Ev::Message { peer, msg, .. } if peer == "alice@localhost" && !msg.outgoing => Some(msg.clone()),
+            _ => None,
+        });
+        assert_eq!((got.body.as_str(), got.enc), (text, 1));
+    }
 
     // 3. Encrypted file (XEP-0454 aesgcm://).
     let file = std::env::temp_dir().join("re-omemo-file.txt");

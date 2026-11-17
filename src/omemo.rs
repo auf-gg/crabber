@@ -1,8 +1,11 @@
 //! OMEMO legacy (XEP-0384 v0.3, `eu.siacs.conversations.axolotl`): the libsignal v3 protocol
 //! (X3DH + Double Ratchet + SignalMessage wire format) and the OMEMO payload/key layer.
+//! OMEMO 2 (XEP-0384 v0.8+, `urn:xmpp:omemo:2`) runs on the same keys: the identity key is
+//! published in its Ed25519 form, and sessions use the textbook Double Ratchet with the
+//! OMEMOMessage/OMEMOKeyExchange wire format.
 //!
 //! This module is pure crypto and state; `crate::xmpp` does PEP publishing and stanza plumbing.
-//! Interop is checked against python-oldmemo in `tests/omemo_interop.rs`.
+//! Interop is checked against python-oldmemo and python-twomemo in `tests/omemo_interop.rs`.
 use crate::t;
 use std::collections::BTreeMap;
 
@@ -23,8 +26,15 @@ pub fn node_bundle(device: u32) -> String {
 pub const FALLBACK_BODY: &str =
     "I sent you an OMEMO encrypted message but your client doesn’t seem to support that. Find more information on https://conversations.im/omemo";
 
+pub const NS2: &str = "urn:xmpp:omemo:2";
+pub const NODE_DEVICES2: &str = "urn:xmpp:omemo:2:devices";
+/// One item per device, the item id being the device id.
+pub const NODE_BUNDLES2: &str = "urn:xmpp:omemo:2:bundles";
+
 const VERSION: u8 = 0x33;
 const MAX_SKIP: u32 = 2000;
+const RK_INFO2: &[u8] = b"OMEMO Root Chain";
+const MK_INFO2: &[u8] = b"OMEMO Message Key Material";
 
 pub fn b64(data: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(data)
@@ -111,15 +121,33 @@ pub fn xeddsa_sign(private: &[u8; 32], msg: &[u8]) -> [u8; 64] {
 
 /// Verifies XEdDSA and legacy libsignal signatures (the latter carry A's sign bit in sig[63]).
 pub fn xeddsa_verify(public: &[u8; 32], msg: &[u8], sig: &[u8]) -> bool {
-    let Ok(sig): Result<[u8; 64], _> = sig.try_into() else { return false };
+    let Ok(mut sig): Result<[u8; 64], _> = sig.try_into() else { return false };
     let sign = sig[63] >> 7;
-    let mut s_bytes: [u8; 32] = sig[32..].try_into().unwrap();
-    s_bytes[31] &= 0x7F;
+    sig[63] &= 0x7F;
     let Some(big_a) = MontgomeryPoint(*public).to_edwards(sign) else { return false };
-    let Some(s) = Option::<Scalar>::from(Scalar::from_canonical_bytes(s_bytes)) else { return false };
+    ed25519_verify(&big_a.compress().to_bytes(), msg, &sig)
+}
+
+/// Plain Ed25519 (RFC 8032) verification, as OMEMO 2 signs: XEdDSA signatures pass it too.
+pub fn ed25519_verify(public: &[u8; 32], msg: &[u8], sig: &[u8]) -> bool {
+    let Ok(sig): Result<[u8; 64], _> = sig.try_into() else { return false };
+    let Some(big_a) = CompressedEdwardsY(*public).decompress() else { return false };
+    let Some(s) = Option::<Scalar>::from(Scalar::from_canonical_bytes(sig[32..].try_into().unwrap())) else { return false };
     let Some(big_r) = CompressedEdwardsY(sig[..32].try_into().unwrap()).decompress() else { return false };
-    let k = Scalar::from_bytes_mod_order_wide(&Sha512::new().chain_update(&sig[..32]).chain_update(big_a.compress().as_bytes()).chain_update(msg).finalize().into());
+    let k = Scalar::from_bytes_mod_order_wide(&Sha512::new().chain_update(&sig[..32]).chain_update(public).chain_update(msg).finalize().into());
     EdwardsPoint::mul_base(&s) == big_r + k * big_a
+}
+
+/// Ed25519 form of a Curve25519 key pair's public key, with the sign bit 0 that XEdDSA signs with.
+pub fn ed25519_public(private: &[u8; 32]) -> [u8; 32] {
+    let mut a = EdwardsPoint::mul_base(&Scalar::from_bytes_mod_order(clamp(*private))).compress().to_bytes();
+    a[31] &= 0x7F;
+    a
+}
+
+/// Curve25519 form of an Ed25519 public key (the birational map of RFC 7748).
+pub fn ed25519_to_x25519(public: &[u8; 32]) -> Result<[u8; 32], String> {
+    CompressedEdwardsY(*public).decompress().map(|p| p.to_montgomery().to_bytes()).ok_or_else(|| t!("omemo.bad_pubkey").into())
 }
 
 fn hkdf(salt: &[u8], ikm: &[u8], info: &[u8], len: usize) -> Vec<u8> {
@@ -141,8 +169,8 @@ fn split64(v: &[u8]) -> ([u8; 32], [u8; 32]) {
 }
 
 /// Root-key ratchet step ("createChain" in libsignal).
-fn kdf_rk(root: &[u8; 32], dh_out: &[u8; 32]) -> ([u8; 32], [u8; 32]) {
-    split64(&hkdf(root, dh_out, b"WhisperRatchet", 64))
+fn kdf_rk(root: &[u8; 32], dh_out: &[u8; 32], info: &[u8]) -> ([u8; 32], [u8; 32]) {
+    split64(&hkdf(root, dh_out, info, 64))
 }
 
 struct MessageKeys {
@@ -151,10 +179,14 @@ struct MessageKeys {
     iv: [u8; 16],
 }
 
-fn message_keys(chain_key: &[u8; 32]) -> MessageKeys {
-    let seed = hmac(chain_key, &[&[0x01]]);
-    let k = hkdf(&[0u8; 32], &seed, b"WhisperMessageKeys", 80);
+/// 80 bytes of HKDF output split into an AES key, an HMAC key and an IV.
+fn derive_keys(ikm: &[u8], info: &[u8]) -> MessageKeys {
+    let k = hkdf(&[0u8; 32], ikm, info, 80);
     MessageKeys { cipher: k[..32].try_into().unwrap(), mac: k[32..64].try_into().unwrap(), iv: k[64..80].try_into().unwrap() }
+}
+
+fn message_keys(chain_key: &[u8; 32], info: &[u8]) -> MessageKeys {
+    derive_keys(&hmac(chain_key, &[&[0x01]]), info)
 }
 
 fn next_chain_key(chain_key: &[u8; 32]) -> [u8; 32] {
@@ -304,6 +336,15 @@ impl Identity {
             prekeys: self.prekeys.iter().map(|(id, k)| (*id, k.public)).collect(),
         }
     }
+
+    /// The same keys for OMEMO 2: Ed25519 identity, the signed prekey signed as raw bytes.
+    pub fn bundle2(&self) -> Bundle {
+        Bundle {
+            identity: ed25519_public(&self.identity.private),
+            signature: xeddsa_sign(&self.identity.private, &self.signed_prekey.public).to_vec(),
+            ..self.bundle()
+        }
+    }
 }
 
 /// Human-readable fingerprint of an identity key (as shown by Conversations: hex of the 32 bytes).
@@ -313,6 +354,7 @@ pub fn fingerprint(identity_public: &[u8; 32]) -> String {
 
 #[derive(Clone, Debug)]
 pub struct Bundle {
+    /// Curve25519 in legacy bundles, Ed25519 in OMEMO 2 ones.
     pub identity: [u8; 32],
     pub signed_prekey_id: u32,
     pub signed_prekey: [u8; 32],
@@ -352,9 +394,21 @@ pub struct Session {
     local_registration_id: u32,
     /// Alice's base key when this session was created from a PreKeySignalMessage (dedup).
     pub base_key: Option<[u8; 32]>,
+    /// OMEMO 2: the X3DH associated data, initiator's || responder's Ed25519 identity key.
+    /// Empty in a legacy session.
+    #[serde(default)]
+    ad: Vec<u8>,
 }
 
 impl Session {
+    fn v2(&self) -> bool {
+        !self.ad.is_empty()
+    }
+
+    fn rk_info(&self) -> &'static [u8] {
+        if self.v2() { RK_INFO2 } else { b"WhisperRatchet" }
+    }
+
     /// X3DH as initiator against a fetched bundle.
     pub fn initiate(me: &Identity, bundle: &Bundle) -> Result<Self, String> {
         if !xeddsa_verify(&bundle.identity, &serialize_pub(&bundle.signed_prekey), &bundle.signature) {
@@ -371,7 +425,7 @@ impl Session {
         }
         let (root, chain) = split64(&hkdf(&[0u8; 32], &secret, b"WhisperText", 64));
         let our_ratchet = KeyPair::generate();
-        let (root2, send_chain) = kdf_rk(&root, &dh(&our_ratchet.private, &bundle.signed_prekey));
+        let (root2, send_chain) = kdf_rk(&root, &dh(&our_ratchet.private, &bundle.signed_prekey), b"WhisperRatchet");
         Ok(Self {
             their_identity: bundle.identity,
             root_key: root2,
@@ -385,6 +439,71 @@ impl Session {
             pending: Some(PendingPreKey { prekey_id: prekey.map(|p| p.0), signed_prekey_id: bundle.signed_prekey_id, base_key: base.public }),
             local_registration_id: me.registration_id,
             base_key: None,
+            ad: vec![],
+        })
+    }
+
+    /// OMEMO 2 X3DH as initiator; `bundle` is an OMEMO 2 one (Ed25519 identity key).
+    pub fn initiate2(me: &Identity, bundle: &Bundle) -> Result<Self, String> {
+        if !ed25519_verify(&bundle.identity, &bundle.signed_prekey, &bundle.signature) {
+            return Err(t!("omemo.bad_signature").into());
+        }
+        // The peer rejects key exchanges without a one-time prekey.
+        if bundle.prekeys.is_empty() {
+            return Err(t!("omemo.no_prekeys").into());
+        }
+        let (prekey_id, opk) = bundle.prekeys[u32::from_le_bytes(random()) as usize % bundle.prekeys.len()];
+        let their_identity = ed25519_to_x25519(&bundle.identity)?;
+        let base = KeyPair::generate();
+        let mut secret = vec![0xFFu8; 32];
+        secret.extend(dh(&me.identity.private, &bundle.signed_prekey));
+        secret.extend(dh(&base.private, &their_identity));
+        secret.extend(dh(&base.private, &bundle.signed_prekey));
+        secret.extend(dh(&base.private, &opk));
+        let root: [u8; 32] = hkdf(&[0u8; 32], &secret, b"OMEMO X3DH", 32).try_into().unwrap();
+        // Textbook Double Ratchet: no receiving chain until the peer answers with its own ratchet key.
+        let our_ratchet = KeyPair::generate();
+        let (root_key, send_chain) = kdf_rk(&root, &dh(&our_ratchet.private, &bundle.signed_prekey), RK_INFO2);
+        Ok(Self {
+            their_identity,
+            root_key,
+            our_ratchet,
+            their_ratchet: bundle.signed_prekey,
+            send_chain,
+            send_index: 0,
+            previous_counter: 0,
+            receivers: vec![],
+            skipped: vec![],
+            pending: Some(PendingPreKey { prekey_id: Some(prekey_id), signed_prekey_id: bundle.signed_prekey_id, base_key: base.public }),
+            local_registration_id: me.registration_id,
+            base_key: None,
+            ad: [ed25519_public(&me.identity.private), bundle.identity].concat(),
+        })
+    }
+
+    /// OMEMO 2 X3DH as responder, from the fields of an OMEMOKeyExchange.
+    fn respond2(me: &Identity, their_ik: [u8; 32], base_key: [u8; 32], prekey: &KeyPair) -> Result<Self, String> {
+        let their_identity = ed25519_to_x25519(&their_ik)?;
+        let mut secret = vec![0xFFu8; 32];
+        secret.extend(dh(&me.signed_prekey.private, &their_identity));
+        secret.extend(dh(&me.identity.private, &base_key));
+        secret.extend(dh(&me.signed_prekey.private, &base_key));
+        secret.extend(dh(&prekey.private, &base_key));
+        Ok(Self {
+            their_identity,
+            root_key: hkdf(&[0u8; 32], &secret, b"OMEMO X3DH", 32).try_into().unwrap(),
+            our_ratchet: me.signed_prekey.clone(),
+            their_ratchet: [0u8; 32],
+            // Set by the ratchet step the first message makes.
+            send_chain: [0u8; 32],
+            send_index: 0,
+            previous_counter: 0,
+            receivers: vec![],
+            skipped: vec![],
+            pending: None,
+            local_registration_id: me.registration_id,
+            base_key: Some(base_key),
+            ad: [their_ik, ed25519_public(&me.identity.private)].concat(),
         })
     }
 
@@ -411,6 +530,7 @@ impl Session {
             pending: None,
             local_registration_id: me.registration_id,
             base_key: Some(base_key),
+            ad: vec![],
         }
     }
 
@@ -418,9 +538,12 @@ impl Session {
         self.pending.is_some()
     }
 
-    /// Encrypts with the sending chain; returns (wire bytes, is PreKeySignalMessage).
+    /// Encrypts with the sending chain; returns (wire bytes, is PreKeySignalMessage / OMEMOKeyExchange).
     pub fn encrypt(&mut self, me: &Identity, plaintext: &[u8]) -> (Vec<u8>, bool) {
-        let keys = message_keys(&self.send_chain);
+        if self.v2() {
+            return self.encrypt2(me, plaintext);
+        }
+        let keys = message_keys(&self.send_chain, b"WhisperMessageKeys");
         let ct = aes_cbc_encrypt(&keys.cipher, &keys.iv, plaintext);
         let mut body = vec![VERSION];
         put_bytes(&mut body, 1, &serialize_pub(&self.our_ratchet.public));
@@ -448,8 +571,62 @@ impl Session {
         }
     }
 
-    /// Decrypts a SignalMessage (not the PreKey wrapper).
+    /// OMEMO 2: an OMEMOAuthenticatedMessage, wrapped in an OMEMOKeyExchange until the peer answers.
+    fn encrypt2(&mut self, me: &Identity, plaintext: &[u8]) -> (Vec<u8>, bool) {
+        let keys = message_keys(&self.send_chain, MK_INFO2);
+        // Serialised once: the MAC covers exactly these bytes.
+        let mut msg = vec![];
+        put_uint(&mut msg, 1, self.send_index as u64);
+        put_uint(&mut msg, 2, self.previous_counter as u64);
+        put_bytes(&mut msg, 3, &self.our_ratchet.public);
+        put_bytes(&mut msg, 4, &aes_cbc_encrypt(&keys.cipher, &keys.iv, plaintext));
+        let mac = hmac(&keys.mac, &[&self.ad, &msg]);
+        let mut auth = vec![];
+        put_bytes(&mut auth, 1, &mac[..16]);
+        put_bytes(&mut auth, 2, &msg);
+        self.send_chain = next_chain_key(&self.send_chain);
+        self.send_index += 1;
+        match &self.pending {
+            None => (auth, false),
+            Some(p) => {
+                let mut out = vec![];
+                put_uint(&mut out, 1, p.prekey_id.unwrap_or(0) as u64);
+                put_uint(&mut out, 2, p.signed_prekey_id as u64);
+                put_bytes(&mut out, 3, &ed25519_public(&me.identity.private));
+                put_bytes(&mut out, 4, &p.base_key);
+                put_bytes(&mut out, 5, &auth);
+                (out, true)
+            }
+        }
+    }
+
+    /// OMEMO 2: decrypts an OMEMOAuthenticatedMessage (not the key exchange wrapper).
+    fn decrypt2(&mut self, data: &[u8]) -> Result<Vec<u8>, String> {
+        let auth = parse_pb(data)?;
+        let mac = pb_bytes(&auth, 1).ok_or(t!("omemo.bad_mac"))?;
+        let msg = pb_bytes(&auth, 2).ok_or(t!("omemo.no_ciphertext"))?;
+        let pb = parse_pb(msg)?;
+        let counter = pb_int(&pb, 1).unwrap_or(0) as u32;
+        let their_ratchet = parse_pub(pb_bytes(&pb, 3).ok_or(t!("omemo.no_ratchet"))?)?;
+        let ct = pb_bytes(&pb, 4).ok_or(t!("omemo.no_ciphertext"))?;
+
+        // Work on a copy: a forged message must not advance the real state.
+        let mut s = self.clone();
+        let keys = message_keys(&s.chain_key_for(&their_ratchet, counter)?, MK_INFO2);
+        if hmac(&keys.mac, &[&s.ad, msg])[..16] != *mac {
+            return Err(t!("omemo.bad_mac").into());
+        }
+        let pt = aes_cbc_decrypt(&keys.cipher, &keys.iv, ct)?;
+        s.pending = None; // the peer answered, so it has our session
+        *self = s;
+        Ok(pt)
+    }
+
+    /// Decrypts a SignalMessage / OMEMOAuthenticatedMessage (not the key exchange wrapper).
     fn decrypt_signal(&mut self, me: &Identity, data: &[u8]) -> Result<Vec<u8>, String> {
+        if self.v2() {
+            return self.decrypt2(data);
+        }
         if data.len() < 1 + 8 || data[0] >> 4 != 3 {
             return Err(t!("omemo.bad_version").into());
         }
@@ -462,7 +639,7 @@ impl Session {
         // Work on a copy: a forged message must not advance the real state.
         let mut s = self.clone();
         let chain_key = s.chain_key_for(&their_ratchet, counter)?;
-        let keys = message_keys(&chain_key);
+        let keys = message_keys(&chain_key, b"WhisperMessageKeys");
         let expect = hmac(&keys.mac, &[&serialize_pub(&s.their_identity), &serialize_pub(&me.identity.public), body]);
         if expect[..8] != *mac {
             return Err(t!("omemo.bad_mac").into());
@@ -480,15 +657,16 @@ impl Session {
         }
         if !self.receivers.iter().any(|c| c.their_ratchet == *their_ratchet) {
             // DH ratchet step.
-            let (root, recv) = kdf_rk(&self.root_key, &dh(&self.our_ratchet.private, their_ratchet));
+            let (root, recv) = kdf_rk(&self.root_key, &dh(&self.our_ratchet.private, their_ratchet), self.rk_info());
             let our_new = KeyPair::generate();
-            let (root2, send) = kdf_rk(&root, &dh(&our_new.private, their_ratchet));
+            let (root2, send) = kdf_rk(&root, &dh(&our_new.private, their_ratchet), self.rk_info());
             self.root_key = root2;
             self.receivers.push(ReceiverChain { their_ratchet: *their_ratchet, chain_key: recv, index: 0 });
             if self.receivers.len() > 5 {
                 self.receivers.remove(0);
             }
-            self.previous_counter = self.send_index.saturating_sub(1);
+            // libsignal sends the last index of the previous chain, OMEMO 2 its length.
+            self.previous_counter = if self.v2() { self.send_index } else { self.send_index.saturating_sub(1) };
             self.our_ratchet = our_new;
             self.their_ratchet = *their_ratchet;
             self.send_chain = send;
@@ -559,6 +737,34 @@ pub fn decrypt_key(me: &Identity, existing: Option<&Session>, data: &[u8], preke
     Ok(Decrypted { plaintext, session: s, used_prekey: prekey_id })
 }
 
+/// OMEMO 2 `<key>`: an OMEMOAuthenticatedMessage with an existing session, or an
+/// OMEMOKeyExchange (`kex`) that builds a new one.
+pub fn decrypt_key2(me: &Identity, existing: Option<&Session>, data: &[u8], kex: bool) -> Result<Decrypted, String> {
+    if !kex {
+        let mut s = existing.cloned().ok_or(t!("omemo.no_session"))?;
+        let plaintext = s.decrypt_signal(me, data)?;
+        return Ok(Decrypted { plaintext, session: s, used_prekey: None });
+    }
+    let pb = parse_pb(data)?;
+    let their_ik: [u8; 32] = pb_bytes(&pb, 3).and_then(|k| k.try_into().ok()).ok_or(t!("omemo.no_identity"))?;
+    let base_key = parse_pub(pb_bytes(&pb, 4).ok_or(t!("omemo.no_base_key"))?)?;
+    let inner = pb_bytes(&pb, 5).ok_or(t!("omemo.no_inner"))?;
+    if pb_int(&pb, 2) != Some(me.signed_prekey_id as u64) {
+        return Err(t!("omemo.unknown_spk").into());
+    }
+    // Sent again until we answer: the session is already built from it.
+    if let Some(s) = existing.filter(|s| s.base_key == Some(base_key)) {
+        let mut s = s.clone();
+        let plaintext = s.decrypt_signal(me, inner)?;
+        return Ok(Decrypted { plaintext, session: s, used_prekey: None });
+    }
+    let prekey_id = pb_int(&pb, 1).unwrap_or(0) as u32;
+    let opk = me.prekeys.get(&prekey_id).ok_or(t!("omemo.prekey_used"))?;
+    let mut s = Session::respond2(me, their_ik, base_key, opk)?;
+    let plaintext = s.decrypt_signal(me, inner)?;
+    Ok(Decrypted { plaintext, session: s, used_prekey: Some(prekey_id) })
+}
+
 // ---- OMEMO payload (AES-128-GCM, key||tag transported per device) ----
 
 pub struct Payload {
@@ -590,6 +796,29 @@ pub fn decrypt_payload(key_material: &[u8], iv: &[u8], ciphertext: &[u8]) -> Res
     let iv: [u8; 12] = iv.try_into().map_err(|_| t!("omemo.iv_len").to_string())?;
     let key: [u8; 16] = key.try_into().unwrap();
     aes_gcm::Aes128Gcm::new(&key.into()).decrypt(&iv.into(), data.as_slice()).map_err(|_| t!("omemo.tampered").to_string())
+}
+
+// ---- OMEMO 2 payload (AES-256-CBC + HMAC-SHA-256, key||truncated HMAC transported per device) ----
+
+/// Returns (ciphertext, the 48 bytes of key material to encrypt to each device).
+pub fn encrypt_payload2(plaintext: &[u8]) -> (Vec<u8>, Vec<u8>) {
+    let key: [u8; 32] = random();
+    let keys = derive_keys(&key, b"OMEMO Payload");
+    let ct = aes_cbc_encrypt(&keys.cipher, &keys.iv, plaintext);
+    let mac = hmac(&keys.mac, &[&ct]);
+    (ct, [&key[..], &mac[..16]].concat())
+}
+
+pub fn decrypt_payload2(key_material: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>, String> {
+    if key_material.len() != 48 {
+        return Err(t!("omemo.bad_key_len").into());
+    }
+    let (key, mac) = key_material.split_at(32);
+    let keys = derive_keys(key, b"OMEMO Payload");
+    if hmac(&keys.mac, &[ciphertext])[..16] != *mac {
+        return Err(t!("omemo.tampered").into());
+    }
+    aes_cbc_decrypt(&keys.cipher, &keys.iv, ciphertext)
 }
 
 /// XEP-0454 file encryption: AES-256-GCM, URL fragment = hex(iv(12) || key(32)).
@@ -679,12 +908,79 @@ mod tests {
     }
 
     #[test]
+    fn ed25519_form_of_identity() {
+        let k = KeyPair::generate();
+        let ed = ed25519_public(&k.private);
+        assert_eq!(ed25519_to_x25519(&ed).unwrap(), k.public, "both forms are the same key");
+        let sig = xeddsa_sign(&k.private, b"spk");
+        assert!(ed25519_verify(&ed, b"spk", &sig), "XEdDSA signatures are plain Ed25519 ones");
+        assert!(!ed25519_verify(&ed, b"spj", &sig));
+        let me = Identity::generate();
+        let b = me.bundle2();
+        assert!(ed25519_verify(&b.identity, &b.signed_prekey, &b.signature));
+    }
+
+    #[test]
+    fn omemo2_conversation() {
+        let alice = Identity::generate();
+        let mut bob = Identity::generate();
+        let mut a = Session::initiate2(&alice, &bob.bundle2()).unwrap();
+        assert_eq!(a.their_identity, bob.identity.public, "trust is keyed by the Curve25519 form");
+
+        // Key exchanges until Bob answers; the second one reuses the session built from the first.
+        let (m1, k1) = a.encrypt(&alice, b"one");
+        let (m2, k2) = a.encrypt(&alice, b"two");
+        assert!(k1 && k2);
+        let d1 = decrypt_key2(&bob, None, &m1, true).unwrap();
+        assert_eq!(d1.plaintext, b"one");
+        assert_eq!(d1.session.their_identity, alice.identity.public);
+        bob.prekeys.remove(&d1.used_prekey.unwrap());
+        let mut b = d1.session;
+        let d2 = decrypt_key2(&bob, Some(&b), &m2, true).unwrap();
+        assert_eq!((d2.plaintext.as_slice(), d2.used_prekey), (&b"two"[..], None));
+        b = d2.session;
+
+        let (r1, kex) = b.encrypt(&bob, b"hi alice");
+        assert!(!kex);
+        let d = decrypt_key2(&alice, Some(&a), &r1, false).unwrap();
+        assert_eq!(d.plaintext, b"hi alice");
+        a = d.session;
+        let (m3, k3) = a.encrypt(&alice, b"three");
+        assert!(!k3, "no key exchange after the first reply");
+
+        // Out of order, replay, tampering.
+        let (r2, _) = b.encrypt(&bob, b"r2");
+        let (r3, _) = b.encrypt(&bob, b"r3");
+        a = decrypt_key2(&alice, Some(&a), &r3, false).unwrap().session;
+        let d = decrypt_key2(&alice, Some(&a), &r2, false).unwrap();
+        assert_eq!(d.plaintext, b"r2");
+        a = d.session;
+        assert!(decrypt_key2(&alice, Some(&a), &r2, false).is_err(), "replay is rejected");
+        let d = decrypt_key2(&bob, Some(&b), &m3, false).unwrap();
+        assert_eq!(d.plaintext, b"three");
+        let (mut bad, _) = d.session.clone().encrypt(&bob, b"x");
+        let last = bad.len() - 1;
+        bad[last] ^= 1;
+        assert!(decrypt_key2(&alice, Some(&a), &bad, false).is_err());
+
+        // A legacy session can't read OMEMO 2 and vice versa.
+        assert!(decrypt_key(&bob, None, &m1, true).is_err());
+    }
+
+    #[test]
     fn payload_and_file_encryption() {
         let p = encrypt_payload("привет".as_bytes());
         assert_eq!(decrypt_payload(&p.key_material, &p.iv, &p.ciphertext).unwrap(), "привет".as_bytes());
         let mut wrong = p.key_material;
         wrong[20] ^= 1;
         assert!(decrypt_payload(&wrong, &p.iv, &p.ciphertext).is_err());
+
+        let (ct, km) = encrypt_payload2("привет".as_bytes());
+        assert_eq!(km.len(), 48);
+        assert_eq!(decrypt_payload2(&km, &ct).unwrap(), "привет".as_bytes());
+        let mut wrong = km.clone();
+        wrong[40] ^= 1;
+        assert!(decrypt_payload2(&wrong, &ct).is_err());
 
         let (ct, frag) = encrypt_file(b"file data");
         assert_eq!(frag.len(), 88);
