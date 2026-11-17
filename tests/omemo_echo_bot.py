@@ -1,7 +1,9 @@
 """Reference OMEMO peer for interop tests: python-oldmemo and python-twomemo via slixmpp-omemo.
 
 Logs in as carol@localhost, decrypts every OMEMO message and answers encrypted with the same
-version: "echo: <text>" for legacy OMEMO, "echo2: <text>" for OMEMO 2.
+version: "echo: <text>" for legacy OMEMO, "echo2: <text>" for OMEMO 2. A plain "kex2" / "kex"
+makes it start a session itself; an empty OMEMO message it decrypts is answered in plain text,
+"empty2" / "empty".
 Run by tests/omemo_interop.rs; needs `pip install slixmpp slixmpp-omemo oldmemo[xml] twomemo[xml]`.
 """
 import asyncio
@@ -10,12 +12,15 @@ import sys
 from typing import Any, Dict, FrozenSet, Optional
 from xml.etree import ElementTree as ET
 
+import oldmemo
 import twomemo
 from omemo.storage import Just, Maybe, Nothing, Storage
 from omemo.types import DeviceInformation, JSONType
 from slixmpp import JID, ClientXMPP
 from slixmpp.plugins import register_plugin
 from slixmpp.stanza import Message
+from slixmpp.xmlstream.handler import CoroutineCallback
+from slixmpp.xmlstream.matcher import MatchXPath
 from slixmpp_omemo import XEP_0384, TrustLevel
 
 SCE = "{urn:xmpp:sce:1}"
@@ -72,6 +77,17 @@ class EchoBot(ClientXMPP):
         self.add_event_handler("session_start", self.start)
         self.add_event_handler("omemo_initialized", lambda _: print("READY", flush=True))
         self.add_event_handler("message", self.message)
+        # The "message" event needs a <body>: empty OMEMO messages come without one.
+        for namespace in (twomemo.twomemo.NAMESPACE, oldmemo.oldmemo.NAMESPACE):
+            self.register_handler(CoroutineCallback(
+                f"OMEMO without body ({namespace})",
+                MatchXPath(f"{{jabber:client}}message/{{{namespace}}}encrypted"),
+                self.bodyless
+            ))
+
+    async def bodyless(self, stanza: Message) -> None:
+        if not stanza["body"]:
+            await self.message(stanza)
 
     async def start(self, _: Any) -> None:
         self.send_presence()
@@ -83,6 +99,13 @@ class EchoBot(ClientXMPP):
         xep_0384: XEP_0384 = self["xep_0384"]
         namespaces = xep_0384.is_encrypted(stanza)
         if not namespaces:
+            # Plain "kex2" / "kex": start a session ourselves, with OMEMO 2 / legacy OMEMO.
+            command = { "kex2": twomemo.twomemo.NAMESPACE, "kex": oldmemo.oldmemo.NAMESPACE }.get(stanza["body"])
+            if command is not None:
+                try:
+                    await self.initiate(stanza["from"].bare, command)
+                except Exception as e:  # pylint: disable=broad-exception-caught
+                    print("INITIATE-FAIL", repr(e), flush=True)
             return
         if twomemo.twomemo.NAMESPACE in namespaces:
             try:
@@ -97,6 +120,7 @@ class EchoBot(ClientXMPP):
             return
         body = decrypted["body"]
         if not body:
+            self.got_empty(stanza["from"].bare, "empty")
             return
         print("GOT", body, flush=True)
         reply = self.make_message(mto=stanza["from"].bare, mtype="chat")
@@ -114,27 +138,48 @@ class EchoBot(ClientXMPP):
         element = stanza.xml.find(f"{{{twomemo.twomemo.NAMESPACE}}}encrypted")
         plaintext = (await session_manager.decrypt(twomemo.etree.parse_message(element, sender)))[0]
         if plaintext is None:
-            return  # empty OMEMO message: session housekeeping
+            self.got_empty(sender, "empty2")
+            return
         body = ET.fromstring(plaintext).findtext(f"{SCE}content/{{jabber:client}}body")
         if not body:
             return
         print("GOT2", body, flush=True)
-        envelope = ET.Element(f"{SCE}envelope")
-        ET.SubElement(ET.SubElement(envelope, f"{SCE}content"), "{jabber:client}body").text = "echo2: " + body
-        ET.SubElement(envelope, f"{SCE}rpad").text = "pad"
-        ET.SubElement(envelope, f"{SCE}from", jid=self.boundjid.bare)
+        await self.send_encrypted(sender, twomemo.twomemo.NAMESPACE, "echo2: " + body)
+
+    def got_empty(self, sender: str, reply: str) -> None:
+        """An empty OMEMO message decrypted: say so in plain text, for the test to see."""
+        print("EMPTY", reply, flush=True)
+        self.make_message(mto=sender, mtype="chat", mbody=reply).send()
+
+    async def initiate(self, jid: str, namespace: str) -> None:
+        await self["xep_0384"].refresh_device_lists({ JID(jid) })
+        greeting = "привет от бота 2" if namespace == twomemo.twomemo.NAMESPACE else "привет от бота"
+        await self.send_encrypted(jid, namespace, greeting)
+
+    async def send_encrypted(self, jid: str, namespace: str, body: str) -> None:
+        """`body` with one OMEMO version: OMEMO 2 in an SCE envelope, legacy as is."""
+        if namespace == twomemo.twomemo.NAMESPACE:
+            envelope = ET.Element(f"{SCE}envelope")
+            ET.SubElement(ET.SubElement(envelope, f"{SCE}content"), "{jabber:client}body").text = body
+            ET.SubElement(envelope, f"{SCE}rpad").text = "pad"
+            ET.SubElement(envelope, f"{SCE}from", jid=self.boundjid.bare)
+            plaintext = ET.tostring(envelope)
+        else:
+            plaintext = body.encode("utf-8")
+        session_manager = await self["xep_0384"].get_session_manager()
         messages, errors = await session_manager.encrypt(
-            frozenset({ sender }),
-            { twomemo.twomemo.NAMESPACE: ET.tostring(envelope) },
-            backend_priority_order=[ twomemo.twomemo.NAMESPACE ]
+            frozenset({ jid }),
+            { namespace: plaintext },
+            backend_priority_order=[ namespace ]
         )
         if errors:
             print("ENCRYPT-ERRORS", errors, flush=True)
-        reply = self.make_message(mto=sender, mtype="chat", mbody="OMEMO 2 echo")
-        for message in messages:
-            reply.append(twomemo.etree.serialize_message(message))
-        reply.enable("store")
-        reply.send()
+        message = self.make_message(mto=jid, mtype="chat", mbody="OMEMO")
+        etree = twomemo.etree if namespace == twomemo.twomemo.NAMESPACE else oldmemo.etree
+        for encrypted in messages:
+            message.append(etree.serialize_message(encrypted))
+        message.enable("store")
+        message.send()
 
 
 def main() -> None:

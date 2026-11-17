@@ -140,7 +140,23 @@ fn omemo_with_python_oldmemo_twomemo_and_between_our_clients() {
         assert_eq!((got.body.as_str(), got.enc), (text, 1));
     }
 
-    // 3. Encrypted file (XEP-0454 aesgcm://).
+    // 3. python starts the session (key exchange) with each version; we answer with an empty OMEMO
+    // message, which the bot decrypts and reports in plain text.
+    for (cmd, greeting, empty) in [("kex2", "привет от бота 2", "empty2"), ("kex", "привет от бота", "empty")] {
+        send(&b, "carol@localhost", cmd, "plain");
+        let mut next = || {
+            wait(&mut b_rx, 20, |e| match e {
+                Ev::Message { peer, msg, .. } if peer == "carol@localhost" && !msg.outgoing => Some(msg.clone()),
+                _ => None,
+            })
+        };
+        let got = next();
+        assert_eq!((got.body.as_str(), got.enc), (greeting, 1));
+        let got = next();
+        assert_eq!((got.body.as_str(), got.enc), (empty, 0), "the bot decrypted our empty OMEMO message");
+    }
+
+    // 4. Encrypted file (XEP-0454 aesgcm://).
     let file = std::env::temp_dir().join("re-omemo-file.txt");
     std::fs::write(&file, "секретный файл").unwrap();
     let fid = xmpp::new_id();

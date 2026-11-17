@@ -13,6 +13,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use tokio_xmpp::IqRequest;
 use tokio_xmpp::jid::Jid;
 use tokio_xmpp::minidom::Element;
+use tokio_xmpp::parsers::message::{Id, Message};
 
 use crate::omemo::{self, Bundle, Identity, NODE_BUNDLES2, NODE_DEVICES, NODE_DEVICES2, NS, NS2, Session, b64, node_bundle, parse_pub, serialize_pub, unb64};
 use crate::pgp;
@@ -181,6 +182,19 @@ impl E2e {
         let sql = format!("INSERT OR REPLACE INTO {}(jid, device, state) VALUES(?1, ?2, ?3)", p.table("sessions"));
         let _ = self.db.execute(&sql, params![jid, device, serde_json::to_string(&s).unwrap()]);
         self.sessions.insert((jid.to_string(), device, p), s);
+    }
+
+    /// `<key/>` for `jid`'s device `device`: `key_material` encrypted with our session to it.
+    fn key_for(&mut self, jid: &str, device: u32, p: Proto, key_material: &[u8]) -> Option<Element> {
+        let mut s = self.session(jid, device, p)?;
+        let me = self.me.clone();
+        let (data, kex) = s.encrypt(&me, key_material);
+        self.put_session(jid, device, p, s);
+        let mut key = Element::builder("key", p.ns()).attr(nc("rid"), device.to_string());
+        if kex {
+            key = key.attr(nc(if p == Proto::V2 { "kex" } else { "prekey" }), "true");
+        }
+        Some(key.append(b64(&data)).build())
     }
 
     pub fn devices(&mut self, jid: &str, p: Proto) -> Option<Vec<u32>> {
@@ -555,22 +569,22 @@ pub async fn encrypt(shared: &Shared, net: &Net, to: &str, plaintext: &str, p: P
         if !e.trusted(jid, *dev) {
             continue;
         }
-        let Some(mut s) = e.session(jid, *dev, p) else { continue };
-        let me = e.me.clone();
-        let (data, kex) = s.encrypt(&me, &key_material);
-        e.put_session(jid, *dev, p, s);
-        let mut key = Element::builder("key", p.ns()).attr(nc("rid"), dev.to_string());
-        if kex {
-            key = key.attr(nc(if p == Proto::V2 { "kex" } else { "prekey" }), "true");
+        if let Some(key) = e.key_for(jid, *dev, p, &key_material) {
+            keys.push((jid, key));
         }
-        keys.push((jid, key.append(b64(&data)).build()));
     }
     if !keys.iter().any(|(jid, _)| *jid == to) {
         return Err(t!("e2e.err_no_trusted").into());
     }
-    let mut header = Element::builder("header", p.ns()).attr(nc("sid"), my_id.to_string());
+    Ok(encrypted_element(p, my_id, &keys, iv, Some(&ciphertext)))
+}
+
+/// `<encrypted/>` of version `p` from the `<key/>`s per recipient JID; no `payload`: an empty
+/// OMEMO message, which only moves the sessions on.
+fn encrypted_element(p: Proto, sid: u32, keys: &[(&str, Element)], iv: Option<Element>, payload: Option<&[u8]>) -> Element {
+    let mut header = Element::builder("header", p.ns()).attr(nc("sid"), sid.to_string());
     match p {
-        Proto::Legacy => header = header.append_all(keys.into_iter().map(|(_, k)| k)),
+        Proto::Legacy => header = header.append_all(keys.iter().map(|(_, k)| k.clone())),
         // OMEMO 2 groups the keys by recipient JID.
         Proto::V2 => {
             let mut jids: Vec<&str> = keys.iter().map(|(j, _)| *j).collect();
@@ -581,8 +595,25 @@ pub async fn encrypt(shared: &Shared, net: &Net, to: &str, plaintext: &str, p: P
             }
         }
     }
-    let header = header.append_all(iv);
-    Ok(Element::builder("encrypted", p.ns()).append(header).append(Element::builder("payload", p.ns()).append(b64(&ciphertext))).build())
+    Element::builder("encrypted", p.ns())
+        .append(header.append_all(iv))
+        .append_all(payload.map(|ct| Element::builder("payload", p.ns()).append(b64(ct))))
+        .build()
+}
+
+/// Sends `jid`'s device `dev` an empty OMEMO message over the session it just started with a key
+/// exchange: having an answer, it stops repeating the key exchange (XEP-0384 §6). Goes out
+/// whether the device is trusted or not: it carries no content.
+fn send_empty(e: &mut E2e, net: &Net, jid: &str, dev: u32, p: Proto) {
+    // OMEMO 2 encrypts 32 zero bytes; legacy a key with nothing behind it (a key transport element).
+    let iv = (p == Proto::Legacy).then(|| Element::builder("iv", NS).append(b64(&omemo::random::<12>())).build());
+    let (Some(key), Ok(to)) = (e.key_for(jid, dev, p, &[0; 32]), Jid::from_str(jid)) else { return };
+    let mut m = Message::chat(Some(to));
+    m.id = Some(Id(crate::xmpp::new_id()));
+    m.payloads.push(encrypted_element(p, e.me.device_id, &[(jid, key)], iv, None));
+    // Kept for the device if it is offline.
+    m.payloads.push(Element::builder("store", "urn:xmpp:hints").build());
+    net.send(m);
 }
 
 /// Decrypts an `<encrypted/>` of either version from `from` (bare JID). `Ok(None)`: key-transport element, nothing to show.
@@ -602,8 +633,11 @@ pub async fn decrypt(shared: &Shared, net: &Net, from: &str, enc: &Element) -> R
         Proto::Legacy => header.children().find(for_me),
         // OMEMO 2 groups the keys by recipient: ours are under our JID.
         Proto::V2 => header.children().filter(|k| k.is("keys", ns) && k.attr("jid") == Some(my_jid.as_str())).flat_map(|k| k.children()).find(for_me),
-    }
-    .ok_or(NOT_FOR_THIS_DEVICE)?;
+    };
+    let Some(key) = key else {
+        // An empty OMEMO message between other devices (copies, the archive) is not worth a notice.
+        return if enc.get_child("payload", ns).is_none() { Ok(None) } else { Err(NOT_FOR_THIS_DEVICE.into()) };
+    };
     let kex = matches!(key.attr(if p == Proto::V2 { "kex" } else { "prekey" }), Some("true" | "1"));
     let data = unb64(&key.text())?;
     let existing = e.session(from, sid, p);
@@ -615,7 +649,13 @@ pub async fn decrypt(shared: &Shared, net: &Net, from: &str, enc: &Element) -> R
     if !e.check_identity(from, sid, &d.session.their_identity) {
         return Err(t!("e2e.err_key_changed").into());
     }
+    // A key exchange that built a new session, not a repeat of the one we already have.
+    let started = kex && existing.and_then(|s| s.base_key) != d.session.base_key;
     e.put_session(from, sid, p, d.session);
+    // Our own device has nothing to be told.
+    if started && !(from == my_jid && sid == my_id) {
+        send_empty(&mut e, net, from, sid, p);
+    }
     if let Some(id) = d.used_prekey {
         // Never reuse a one-time prekey: replace it and republish the bundles.
         e.me.prekeys.remove(&id);
@@ -643,5 +683,38 @@ pub fn eme_name(ns: &str) -> &str {
         "jabber:x:encrypted" => "OpenPGP",
         "urn:xmpp:otr:0" => "OTR",
         _ => t!("e2e.unknown_protocol"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn open(name: &str) -> Shared {
+        let dir = std::env::temp_dir().join(format!("crabber-e2e-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        Arc::new(tokio::sync::Mutex::new(E2e::open(&dir, &format!("{name}@x")).unwrap()))
+    }
+
+    #[tokio::test]
+    async fn empty_messages_show_nothing() {
+        let net = Net::for_tests();
+        let (alice, bob, carol) = (open("alice"), open("bob"), open("carol"));
+        let alice_id = alice.lock().await.me.device_id;
+        // Bob starts a session with Alice by an empty OMEMO 2 message (a key exchange).
+        let empty = {
+            let mut b = bob.lock().await;
+            let s = Session::initiate2(&b.me, &alice.lock().await.me.bundle2()).unwrap();
+            b.put_session("alice@x", alice_id, Proto::V2, s);
+            let key = b.key_for("alice@x", alice_id, Proto::V2, &[0; 32]).unwrap();
+            encrypted_element(Proto::V2, b.me.device_id, &[("alice@x", key)], None, None)
+        };
+        assert_eq!(decrypt(&alice, &net, "bob@x", &empty).await, Ok(None));
+        // A copy that reaches another device is dropped quietly, unless it has content.
+        assert_eq!(decrypt(&carol, &net, "bob@x", &empty).await, Ok(None));
+        let mut full = empty.clone();
+        full.append_child(Element::builder("payload", NS2).append("AAAA").build());
+        assert_eq!(decrypt(&carol, &net, "bob@x", &full).await, Err(NOT_FOR_THIS_DEVICE.to_string()));
     }
 }
