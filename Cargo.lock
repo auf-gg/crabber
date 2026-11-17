@@ -1480,6 +1480,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "cmake"
+version = "0.1.58"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c0f78a02292a74a88ac736019ab962ece0bc380e3f977bf72e376c5d78ff0678"
+dependencies = [
+ "cc",
+]
+
+[[package]]
 name = "cmov"
 version = "0.5.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1868,6 +1877,7 @@ dependencies = [
  "nnnoiseless",
  "notify-rust",
  "ogg",
+ "opus",
  "pgp",
  "pipewire",
  "rand 0.8.8",
@@ -1885,7 +1895,6 @@ dependencies = [
  "tokio-rustls",
  "tokio-xmpp",
  "tray-icon",
- "unsafe-libopus",
  "uuid",
  "webrtc",
  "windows 0.62.2",
@@ -6668,6 +6677,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"
 
 [[package]]
+name = "opus"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "33718946cc77d4032911d4efe03a66dbcbfbd2bb16c3da06aaeadcc637c32216"
+dependencies = [
+ "opusic-sys",
+]
+
+[[package]]
+name = "opusic-sys"
+version = "0.7.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "986d749e9dc12035f11bf3ecc83a2a696ff7534d4143be9469a4a0faa25b9fd1"
+dependencies = [
+ "cmake",
+]
+
+[[package]]
 name = "ordered-float"
 version = "5.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -10773,16 +10800,6 @@ checksum = "f4987bdc12753382e0bec4a65c50738ffaabc998b9cdd1f952fb5f39b0048a96"
 dependencies = [
  "crypto-common 0.2.2",
  "ctutils",
-]
-
-[[package]]
-name = "unsafe-libopus"
-version = "0.2.0"
-source = "git+https://github.com/auf-gg/unsafe-libopus?branch=crabber#598b7363f4ccb702033df1014f6c97b635165e4b"
-dependencies = [
- "arrayref",
- "num-complex",
- "num-traits",
 ]
 
 [[package]]

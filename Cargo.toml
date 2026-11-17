@@ -65,7 +65,7 @@ serde_json = "1"
 pgp = "0.21"
 rand = "0.8"
 emojis = "0.9.1"
-unsafe-libopus = "0.2.0"
+opus = "0.4"
 ogg = "0.9.2"
 sys-locale = "0.3"
 nnnoiseless = { version = "0.5", default-features = false }
@@ -117,6 +117,5 @@ gpui-pre = { version = "0.3.12", features = ["test-support"] }
 # Our forks with the patches we need: docs/patched-dependencies.md.
 [patch.crates-io]
 gpui-pre-wgpu = { git = "https://github.com/auf-gg/gpui-pre-wgpu", branch = "main" }
-unsafe-libopus = { git = "https://github.com/auf-gg/unsafe-libopus", branch = "crabber" }
 tokio-xmpp = { git = "https://github.com/auf-gg/xmpp-rs", branch = "crabber" }
 sasl = { git = "https://github.com/auf-gg/xmpp-rs", branch = "crabber" }

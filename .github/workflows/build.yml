@@ -47,7 +47,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            pkg-config clang libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
+            pkg-config clang cmake libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
             libx11-xcb-dev libxcb1-dev libfontconfig-dev libfreetype-dev \
             libasound2-dev libvulkan-dev libdbus-1-dev libpipewire-0.3-dev
 

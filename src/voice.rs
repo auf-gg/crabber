@@ -8,7 +8,6 @@ use std::sync::{Arc, Mutex};
 use cpal::traits::{DeviceTrait, StreamTrait};
 use cpal::{FromSample, Sample as _, SampleFormat, SizedSample, StreamConfig};
 use ogg::{PacketReader, PacketWriteEndInfo, PacketWriter};
-use unsafe_libopus as opus;
 
 use crate::audio::{Mic, Up};
 
@@ -122,11 +121,7 @@ pub fn encode(pcm: &[i16]) -> Result<Vec<u8>, String> {
     w.write_packet(head, SERIAL, PacketWriteEndInfo::EndPage, 0).map_err(io)?;
     w.write_packet(tags, SERIAL, PacketWriteEndInfo::EndPage, 0).map_err(io)?;
 
-    let mut err = 0;
-    let enc = unsafe { opus::opus_encoder_create(RATE as i32, 1, opus::OPUS_APPLICATION_VOIP, &mut err) };
-    if enc.is_null() || err != opus::OPUS_OK {
-        return Err(t!("audio.opus_error", code = err));
-    }
+    let mut enc = opus::Encoder::new(RATE, opus::Channels::Mono, opus::Application::Voip).map_err(|e| t!("audio.opus_error", code = e))?;
     let frames = pcm.len().div_ceil(FRAME);
     // The last page's granule trims the zero padding of the final frame.
     let end = pcm.len() as u64 * 3 + PRE_SKIP as u64;
@@ -135,11 +130,13 @@ pub fn encode(pcm: &[i16]) -> Result<Vec<u8>, String> {
         let mut frame = [0i16; FRAME];
         frame[..chunk.len()].copy_from_slice(chunk);
         let mut packet = [0u8; 1500];
-        let n = unsafe { opus::opus_encode(enc, frame.as_ptr(), FRAME as i32, packet.as_mut_ptr(), packet.len() as i32) };
-        if n < 0 {
-            res = Err(t!("audio.opus_error", code = n));
-            break;
-        }
+        let n = match enc.encode(&frame, &mut packet) {
+            Ok(n) => n,
+            Err(e) => {
+                res = Err(t!("audio.opus_error", code = e));
+                break;
+            }
+        };
         let last = i + 1 == frames;
         let info = if last {
             PacketWriteEndInfo::EndStream
@@ -149,12 +146,11 @@ pub fn encode(pcm: &[i16]) -> Result<Vec<u8>, String> {
             PacketWriteEndInfo::NormalPacket
         };
         let granule = ((i as u64 + 1) * GRANULE_PER_FRAME).min(end);
-        if let Err(e) = w.write_packet(packet[..n as usize].to_vec(), SERIAL, info, granule) {
+        if let Err(e) = w.write_packet(packet[..n].to_vec(), SERIAL, info, granule) {
             res = Err(e.to_string());
             break;
         }
     }
-    unsafe { opus::opus_encoder_destroy(enc) };
     drop(w);
     res.map(|_| out)
 }
@@ -170,20 +166,16 @@ pub fn decode(bytes: &[u8]) -> Result<Vec<f32>, String> {
     let channels = head[9].clamp(1, 2) as usize;
     let pre_skip = u16::from_le_bytes([head[10], head[11]]) as usize;
     next(&mut r)?; // OpusTags
-    let mut err = 0;
-    let dec = unsafe { opus::opus_decoder_create(48000, channels as i32, &mut err) };
-    if dec.is_null() || err != opus::OPUS_OK {
-        return Err(t!("audio.opus_error", code = err));
-    }
+    let layout = if channels == 2 { opus::Channels::Stereo } else { opus::Channels::Mono };
+    let mut dec = opus::Decoder::new(48000, layout).map_err(|e| t!("audio.opus_error", code = e))?;
     let mut out = Vec::new();
     let mut buf = vec![0i16; 5760 * channels]; // 120 ms, the longest Opus packet
     while let Ok(Some(p)) = r.read_packet() {
-        let n = unsafe { opus::opus_decode(dec, p.data.as_ptr(), p.data.len() as i32, buf.as_mut_ptr(), 5760, 0) };
+        let n = dec.decode(&p.data, &mut buf, false).unwrap_or(0);
         if n > 0 {
-            out.extend(buf[..n as usize * channels].chunks(channels).map(|f| f.iter().map(|&s| s as f32).sum::<f32>() / channels as f32 / 32768.0));
+            out.extend(buf[..n * channels].chunks(channels).map(|f| f.iter().map(|&s| s as f32).sum::<f32>() / channels as f32 / 32768.0));
         }
     }
-    unsafe { opus::opus_decoder_destroy(dec) };
     out.drain(..pre_skip.min(out.len()));
     Ok(out)
 }
@@ -293,5 +285,12 @@ mod tests {
         let energy = out[4800..43200].iter().map(|x| x * x).sum::<f32>() / 38400.0;
         assert!(energy > 0.01, "the tone survives: {energy}");
         assert!(super::encode(&[]).is_err());
+    }
+
+    /// The pre-skip written into OpusHead is the encoder's delay, so a player trims exactly it.
+    #[test]
+    fn pre_skip_is_the_encoder_lookahead() {
+        let mut enc = opus::Encoder::new(super::RATE, opus::Channels::Mono, opus::Application::Voip).unwrap();
+        assert_eq!(enc.get_lookahead().unwrap() as u32 * (48000 / super::RATE), super::PRE_SKIP as u32);
     }
 }

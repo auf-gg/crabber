@@ -205,7 +205,7 @@ Requires Rust as pinned in [`rust-toolchain.toml`](rust-toolchain.toml) (1.97+).
 Linux system dependencies (Debian/Ubuntu package names):
 
 ```sh
-sudo apt install pkg-config clang libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
+sudo apt install pkg-config clang cmake libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
   libx11-xcb-dev libxcb1-dev libfontconfig-dev libfreetype-dev \
   libasound2-dev libvulkan-dev libdbus-1-dev
 ```
@@ -213,7 +213,7 @@ sudo apt install pkg-config clang libxkbcommon-dev libxkbcommon-x11-dev libwayla
 Colour emojis need the Noto Color Emoji font (`fonts-noto-color-emoji` on Debian/Ubuntu).
 gpui's Linux text rendering is patched for it, see [`docs/patched-dependencies.md`](docs/patched-dependencies.md).
 
-On Windows install the Visual Studio Build Tools (MSVC), then on either platform:
+On Windows install the Visual Studio Build Tools (MSVC) and CMake, then on either platform:
 
 ```sh
 cargo build --release

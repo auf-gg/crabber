@@ -197,47 +197,48 @@ pub fn ulaw_samples(payload: &[u8]) -> Vec<f32> {
     payload.iter().map(|&b| ulaw_decode(b) as f32 / 32768.0).collect()
 }
 
-/// Opus for calls: 48 kHz mono, 20 ms frames, through the pure-Rust libopus port.
-pub struct OpusEncoder(*mut unsafe_libopus::OpusEncoder);
-pub struct OpusDecoder(*mut unsafe_libopus::OpusDecoder);
+/// Opus for calls: 48 kHz mono, 20 ms frames, through libopus itself (1.6.1, built from source).
+/// The pure-Rust options fell short when compared in November 2026: unsafe-libopus (libopus 1.3.1
+/// put through c2rust) is unmaintained and needed a fix of ours for full-scale bursts; ropus fades
+/// a lost packet of speech to silence; the other ports fail RFC 8251 test vectors.
+pub struct OpusEncoder(opus::Encoder);
+pub struct OpusDecoder(opus::Decoder);
 
-// SAFETY: the codec state is plain memory owned by the value, with no thread affinity.
-unsafe impl Send for OpusEncoder {}
-unsafe impl Send for OpusDecoder {}
+/// What our voice goes out at: what libwebrtc sends for mono speech. Left to itself the encoder
+/// takes 72 kb/s.
+const CALL_BITRATE: i32 = 32_000;
+/// The loss the encoder plans for: at this rate it spends part of the bitrate on in-band FEC,
+/// from which the peer rebuilds a lost packet out of the next one (we offer useinbandfec=1).
+const CALL_LOSS_PERCENT: i32 = 10;
 
 impl OpusEncoder {
     pub fn new() -> Result<Self, String> {
-        let mut err = 0;
-        let enc = unsafe { unsafe_libopus::opus_encoder_create(CALL_RATE as i32, 1, unsafe_libopus::OPUS_APPLICATION_VOIP, &mut err) };
-        if enc.is_null() || err != unsafe_libopus::OPUS_OK {
-            return Err(t!("audio.opus_error", code = err));
-        }
+        let err = |e: opus::Error| t!("audio.opus_error", code = e);
+        let mut enc = opus::Encoder::new(CALL_RATE, opus::Channels::Mono, opus::Application::Voip).map_err(err)?;
+        enc.set_bitrate(opus::Bitrate::Bits(CALL_BITRATE)).map_err(err)?;
+        enc.set_inband_fec(true).map_err(err)?;
+        enc.set_packet_loss_perc(CALL_LOSS_PERCENT).map_err(err)?;
         Ok(Self(enc))
     }
 
     /// One packet for one 20 ms frame.
     pub fn encode(&mut self, pcm: &[f32]) -> Option<Vec<u8>> {
         let mut packet = [0u8; 1500];
-        let n = unsafe { unsafe_libopus::opus_encode_float(self.0, pcm.as_ptr(), pcm.len() as i32, packet.as_mut_ptr(), packet.len() as i32) };
-        (n > 0).then(|| packet[..n as usize].to_vec())
+        let n = self.0.encode_float(pcm, &mut packet).ok()?;
+        (n > 0).then(|| packet[..n].to_vec())
     }
 }
 
 impl OpusDecoder {
     pub fn new() -> Result<Self, String> {
-        let mut err = 0;
-        let dec = unsafe { unsafe_libopus::opus_decoder_create(CALL_RATE as i32, 1, &mut err) };
-        if dec.is_null() || err != unsafe_libopus::OPUS_OK {
-            return Err(t!("audio.opus_error", code = err));
-        }
-        Ok(Self(dec))
+        opus::Decoder::new(CALL_RATE, opus::Channels::Mono).map(Self).map_err(|e| t!("audio.opus_error", code = e))
     }
 
     /// 48 kHz mono samples (a stereo stream is mixed down by the decoder).
     pub fn decode(&mut self, packet: &[u8]) -> Vec<f32> {
         let mut pcm = vec![0f32; 5760]; // 120 ms, the longest Opus packet
-        let n = unsafe { unsafe_libopus::opus_decode_float(self.0, packet.as_ptr(), packet.len() as i32, pcm.as_mut_ptr(), 5760, 0) };
-        pcm.truncate(n.max(0) as usize);
+        let n = self.0.decode_float(packet, &mut pcm, false).unwrap_or(0);
+        pcm.truncate(n);
         pcm
     }
 
@@ -245,25 +246,10 @@ impl OpusDecoder {
     /// `next`, the packet after it, when it has some; otherwise continued from what came before.
     pub fn conceal(&mut self, next: Option<&[u8]>, samples: usize) -> Vec<f32> {
         let mut pcm = vec![0f32; samples];
-        let (data, len, fec) = match next {
-            Some(p) => (p.as_ptr(), p.len() as i32, 1),
-            None => (std::ptr::null(), 0, 0),
-        };
-        let n = unsafe { unsafe_libopus::opus_decode_float(self.0, data, len, pcm.as_mut_ptr(), samples as i32, fec) };
-        pcm.truncate(n.max(0) as usize);
+        // An empty packet is a lost one: libopus continues from what came before.
+        let n = self.0.decode_float(next.unwrap_or(&[]), &mut pcm, next.is_some()).unwrap_or(0);
+        pcm.truncate(n);
         pcm
-    }
-}
-
-impl Drop for OpusEncoder {
-    fn drop(&mut self) {
-        unsafe { unsafe_libopus::opus_encoder_destroy(self.0) };
-    }
-}
-
-impl Drop for OpusDecoder {
-    fn drop(&mut self) {
-        unsafe { unsafe_libopus::opus_decoder_destroy(self.0) };
     }
 }
 
@@ -1110,8 +1096,44 @@ mod tests {
         assert!((p.mix()[CALL_FRAME / 2] - 0.3).abs() < 0.02);
     }
 
+    /// Our packets carry in-band FEC: a word that starts in a lost frame cannot be guessed from the
+    /// silence before it, but comes back from the redundancy in the next packet.
+    #[test]
+    fn lost_packet_is_rebuilt_from_fec() {
+        let mut enc = OpusEncoder::new().unwrap();
+        let lost = 30;
+        // Silence, then from the lost frame on a voice-like glide: harmonics of a moving pitch.
+        let mut phase = 0f32;
+        let packets: Vec<Vec<u8>> = (0..40usize).map(|i| {
+            let pcm: Vec<f32> = (0..CALL_FRAME).map(|k| {
+                if i < lost {
+                    return 0.0;
+                }
+                let pitch = 120.0 + 80.0 * ((i * CALL_FRAME + k) as f32 / 48000.0 * 3.0).sin();
+                phase += std::f32::consts::TAU * pitch / 48000.0;
+                (1..6).map(|h| (phase * h as f32).sin() / h as f32).sum::<f32>() * 0.2
+            }).collect();
+            enc.encode(&pcm).unwrap()
+        }).collect();
+        // What the decoder makes of frame 30 when it arrives, and in its place when it is lost.
+        let frame = |next: Option<Option<&[u8]>>| {
+            let mut dec = OpusDecoder::new().unwrap();
+            for p in &packets[..lost] {
+                dec.decode(p);
+            }
+            match next {
+                None => dec.decode(&packets[lost]),
+                Some(next) => dec.conceal(next, CALL_FRAME),
+            }
+        };
+        let sent = frame(None);
+        let err = |pcm: Vec<f32>| rms(&pcm.iter().zip(&sent).map(|(a, b)| a - b).collect::<Vec<_>>());
+        let (fec, guess) = (err(frame(Some(Some(&packets[lost + 1])))), err(frame(Some(None))));
+        assert!(fec * 3.0 < guess, "FEC error {fec}, concealment error {guess}");
+    }
+
     /// Opus' own concealment of quiet audio: a lost frame, and a DTX packet (one byte, sent in
-    /// pauses by libwebrtc). unsafe-libopus 0.2.0 made both full-scale (docs/patched-dependencies.md).
+    /// pauses by libwebrtc). unsafe-libopus 0.2.0, our earlier codec, made both full-scale.
     #[test]
     fn opus_concealment_stays_quiet() {
         let mut enc = OpusEncoder::new().unwrap();
@@ -1184,9 +1206,11 @@ mod tests {
             }
             out.extend(pcm);
         }
-        // The tone's rms is 0.21; a fade to silence would leave under 0.09 in the second half.
+        // The tone's rms is 0.21. At 32 kb/s it goes out hybrid (SILK + CELT), whose concealment
+        // keeps about two thirds of it (0.14); a fade to silence would leave under 0.09 in the
+        // second half.
         let late = rms(&lost_frame[CALL_FRAME / 2..]);
-        assert!(late > 0.15, "the gap is filled: rms {late}");
+        assert!(late > 0.12, "the gap is filled: rms {late}");
         let step = out.windows(2).map(|w| (w[1] - w[0]).abs()).fold(0f32, f32::max);
         // A 180 Hz tone at 0.3 moves by up to 0.007 a sample.
         assert!(step < 0.05, "step {step}");

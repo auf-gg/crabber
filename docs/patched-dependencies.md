@@ -9,7 +9,6 @@ git history: import the new crate as published in a commit of its own, keeping t
 | Crate | Fork, branch | Upstream |
 |---|---|---|
 | gpui-pre-wgpu 0.3.12 | [auf-gg/gpui-pre-wgpu](https://github.com/auf-gg/gpui-pre-wgpu) `main` | snapshot of Zed's `gpui_wgpu`; the same change for Zed is on [auf-gg/zed](https://github.com/auf-gg/zed) `gpui-wgpu-linux-color-emoji` |
-| unsafe-libopus 0.2.0 | [auf-gg/unsafe-libopus](https://github.com/auf-gg/unsafe-libopus) `crabber` | [DCNick3/unsafe-libopus](https://github.com/DCNick3/unsafe-libopus); master is fixed in its PR #3 |
 | tokio-xmpp 6.0.0 | [auf-gg/xmpp-rs](https://github.com/auf-gg/xmpp-rs) `crabber` | [xmpp-rs on GitLab](https://gitlab.com/xmpp-rs/xmpp-rs) |
 
 Sending changes upstream: xmpp-rs's `CONTRIBUTING.md` refuses any change made with the aid of AI
@@ -37,20 +36,6 @@ uses the plain glyph of the UI font.
 
 Windows is not affected: it renders text through DirectWrite (`gpui-pre-windows`).
 
-
-## unsafe-libopus 0.2.0
-
-libopus 1.3.1 transpiled to Rust. The transpiler dropped the cast in `silk_SAT16`'s lower bound:
-C's `silk_int16_MIN` is `(opus_int16)0x8000` (-32768), the Rust had `0x8000` (+32768), so every
-clamped sample came out as 32767. That is the SILK packet loss concealment (`src/silk/PLC.rs`) and
-its comfort noise (`src/silk/CNG.rs`), three places each. Every lost frame, every DTX packet (sent
-in pauses by libwebrtc, e.g. Conversations) and every FEC recovery decoded to a full-scale burst,
-heard as a thump in calls. With the fix, decoding matches the C libopus 1.3.1 sample for sample,
-with loss, DTX and FEC included.
-
-Built on its own, newer rustc denies `dangerous_implicit_autorefs` in the transpiled code; as a git
-dependency its lints are capped, so it builds. Its own tests run from the fork with
-`RUSTFLAGS="--cap-lints warn" cargo test --release --test opus_api --test opus_decode`.
 
 ## tokio-xmpp 6.0.0
 
