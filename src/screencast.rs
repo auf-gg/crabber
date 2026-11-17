@@ -45,9 +45,9 @@ pub fn start(on_frame: impl FnMut(Frame) + Send + 'static) -> Result<Screencast,
     let mut capture = Screencast { stop: None, thread: None, session };
     let (fd, node) = block_on(async {
         portal.select_sources(&capture.session, SelectSourcesOptions::default()
-            .set_sources(SourceType::Monitor | SourceType::Window)
+            .set_sources(SourceType::MONITOR | SourceType::WINDOW)
             .set_multiple(false)
-            .set_cursor_mode(CursorMode::Embedded)
+            .set_cursor_mode(CursorMode::EMBEDDED)
             .set_persist_mode(PersistMode::DoNot)).await?.response()?;
         let streams = portal.start(&capture.session, None, Default::default()).await?.response()?;
         let node = streams.streams().first().map(|stream| stream.pipe_wire_node_id())

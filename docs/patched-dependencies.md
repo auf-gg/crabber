@@ -3,11 +3,12 @@
 Wired in through `[patch.crates-io]` in the root `Cargo.toml` as git dependencies on our forks in
 the auf-gg organisation. Each fork branch is the published release with our changes as commits
 on top; `Cargo.lock` pins the commit. After pushing to a fork branch, `cargo update -p <crate>`
-picks it up. On a version bump, rebase the branch onto the new release tag.
+picks it up. On a version bump, rebase the branch onto the new release tag (gpui-pre-wgpu has no
+git history: import the new crate as published in a commit of its own, keeping the patched file).
 
 | Crate | Fork, branch | Upstream |
 |---|---|---|
-| gpui-pre-wgpu 0.3.11 | [auf-gg/gpui-pre-wgpu](https://github.com/auf-gg/gpui-pre-wgpu) `main` | snapshot of Zed's `gpui_wgpu`; the same change for Zed is on [auf-gg/zed](https://github.com/auf-gg/zed) `gpui-wgpu-linux-color-emoji` |
+| gpui-pre-wgpu 0.3.12 | [auf-gg/gpui-pre-wgpu](https://github.com/auf-gg/gpui-pre-wgpu) `main` | snapshot of Zed's `gpui_wgpu`; the same change for Zed is on [auf-gg/zed](https://github.com/auf-gg/zed) `gpui-wgpu-linux-color-emoji` |
 | unsafe-libopus 0.2.0 | [auf-gg/unsafe-libopus](https://github.com/auf-gg/unsafe-libopus) `crabber` | [DCNick3/unsafe-libopus](https://github.com/DCNick3/unsafe-libopus); master is fixed in its PR #3 |
 | tokio-xmpp 6.0.0 | [auf-gg/xmpp-rs](https://github.com/auf-gg/xmpp-rs) `crabber` | [xmpp-rs on GitLab](https://gitlab.com/xmpp-rs/xmpp-rs) |
 
@@ -19,7 +20,7 @@ by hand (screenshots for visual changes, CLA signed).
 `sasl` is patched to the same xmpp-rs checkout: tokio-xmpp takes it by path, and its
 `ChannelBinding` crosses into our connector, so both must be one copy.
 
-## gpui-pre-wgpu 0.3.11
+## gpui-pre-wgpu 0.3.12
 
 Linux text rendering (`src/cosmic_text_system.rs`): colour emoji from Noto Color Emoji when it is
 installed. Without the patch emoji come out black and white whenever another installed font has

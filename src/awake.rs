@@ -11,17 +11,18 @@ pub fn keep_awake(reason: &str) -> Option<Awake> {
 #[cfg(target_os = "linux")]
 mod imp {
     pub fn keep_awake(reason: &str) -> Option<impl Send + 'static> {
-        // On a plain thread: zbus's blocking API panics on one that drives a tokio runtime
+        // On a plain thread: zbus::block_on must not run on one that drives a tokio runtime
         // (where the call actor runs).
         let reason = reason.to_string();
-        std::thread::spawn(move || inhibit(&reason)).join().ok().flatten()
+        std::thread::spawn(move || zbus::block_on(inhibit(&reason))).join().ok().flatten()
     }
 
-    fn inhibit(reason: &str) -> Option<std::os::fd::OwnedFd> {
-        let bus = zbus::blocking::Connection::system().ok()?;
-        let manager = zbus::blocking::Proxy::new(&bus, "org.freedesktop.login1",
-            "/org/freedesktop/login1", "org.freedesktop.login1.Manager").ok()?;
-        let fd: zbus::zvariant::OwnedFd = manager.call("Inhibit", &("sleep:idle", "Crabber", reason, "block")).ok()?;
+    async fn inhibit(reason: &str) -> Option<std::os::fd::OwnedFd> {
+        let bus = zbus::Connection::system().await.ok()?;
+        let manager = zbus::Proxy::new(&bus, "org.freedesktop.login1",
+            "/org/freedesktop/login1", "org.freedesktop.login1.Manager").await.ok()?;
+        let fd: zbus::OwnedFd =
+            manager.call("Inhibit", &("sleep:idle", "Crabber", reason, "block")).await.ok()?;
         Some(std::os::fd::OwnedFd::from(fd))
     }
 }
