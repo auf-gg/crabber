@@ -155,7 +155,7 @@ against the client requirements of the [XMPP Compliance Suites 2023](https://xmp
 | [0421](https://xmpp.org/extensions/xep-0421.html) | Occupant identifiers for semi-anonymous MUCs | ✅ | Only from rooms that advertise them; corrections and retractions must come from the same occupant |
 | [0424](https://xmpp.org/extensions/xep-0424.html) | Message Retraction | ✅ | Delete for everyone, with confirmation |
 | [0425](https://xmpp.org/extensions/xep-0425.html) | Moderated Message Retraction | ✅ | `:1`, falls back to `:0` for older servers |
-| [0428](https://xmpp.org/extensions/xep-0428.html) | Fallback Indication | 🟡 | Reply quotes only |
+| [0428](https://xmpp.org/extensions/xep-0428.html) | Fallback Indication | ✅ | Reply quotes cut from the text and kept for when the original is missing; sent with replies (corrections included) and retractions |
 | [0440](https://xmpp.org/extensions/xep-0440.html) | SASL Channel-Binding Type Capability | ✅ | `tls-exporter` binding where the server lists it; the list also feeds XEP-0474 |
 | [0444](https://xmpp.org/extensions/xep-0444.html) | Message Reactions | ✅ | Quick set in the message menu; groups use the room's stanza-id |
 | [0454](https://xmpp.org/extensions/xep-0454.html) | OMEMO Media Sharing | ✅ | `aesgcm://` links |

@@ -238,6 +238,34 @@ fn jingle_file_transfer() {
     wait(&mut a_rx, |e| matches!(e, Ev::Receipt { id: i, .. } if *i == id).then_some(()));
 }
 
+/// XEP-0461 with XEP-0428: alice answers a message bob never had. Bob gets her text without the
+/// fallback quote, and the quote apart; her correction keeps the reply, and its quote is cut too.
+#[test]
+#[ignore]
+fn reply_fallback_roundtrip() {
+    reset_accounts();
+    let (a, mut a_rx) = login("alice");
+    let (_b, mut b_rx) = login("bob");
+    wait(&mut a_rx, |e| matches!(e, Ev::Online { .. }).then_some(()));
+    wait(&mut b_rx, |e| matches!(e, Ev::Online { .. }).then_some(()));
+    let reply = || Some(xmpp::Reply { id: "lost".into(), to: "bob@localhost".into(), quote: "> Боб: старое\n".into() });
+    let id = xmpp::new_id();
+    a.unbounded_send(Cmd::Send { to: "bob@localhost".into(), id: id.clone(), body: "ответ".into(), groupchat: false, enc: "plain".into(), reply: reply() }).unwrap();
+    let (msg, quote) = wait(&mut b_rx, |e| match e {
+        Ev::Message { msg, quote, .. } if msg.msg_id == id => Some((msg.clone(), quote.clone())),
+        _ => None,
+    });
+    assert_eq!((msg.body.as_str(), msg.reply_to.as_deref()), ("ответ", Some("lost")));
+    assert_eq!(quote.as_deref(), Some("> Боб: старое\n"));
+
+    a.unbounded_send(Cmd::Correct { to: "bob@localhost".into(), replace: id.clone(), body: "исправлено".into(), groupchat: false, enc: "plain".into(), reply: reply() }).unwrap();
+    let body = wait(&mut b_rx, |e| match e {
+        Ev::Correct { id: i, body, .. } if *i == id => Some(body.clone()),
+        _ => None,
+    });
+    assert_eq!(body, "исправлено");
+}
+
 /// XEP-0421: bob writes as "x" and leaves; carol takes the nick "x" and tries to correct his
 /// message. The room's occupant-ids differ, so the correction is refused. Needs
 /// mod_muc_occupantid on the server.
@@ -273,7 +301,7 @@ fn occupant_id_guards_corrections() {
     wait(&mut c_rx, |e| matches!(e, Ev::Online { .. }).then_some(()));
     c.unbounded_send(Cmd::Join { room: room.clone(), nick: "x".into(), since: None, after: None, create_name: None }).unwrap();
     wait(&mut c_rx, |e| matches!(e, Ev::RoomJoined { room: r, .. } if *r == room).then_some(()));
-    c.unbounded_send(Cmd::Correct { to: room.clone(), replace: id.clone(), body: "подделка".into(), groupchat: true, enc: "plain".into() }).unwrap();
+    c.unbounded_send(Cmd::Correct { to: room.clone(), replace: id.clone(), body: "подделка".into(), groupchat: true, enc: "plain".into(), reply: None }).unwrap();
     let (sender, forged) = wait(&mut a_rx, |e| match e {
         Ev::Correct { id: i, sender, occupant, .. } if *i == id => Some((sender.clone(), occupant.clone())),
         _ => None,

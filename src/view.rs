@@ -1795,7 +1795,13 @@ impl App {
                 Some(o) if o.retracted => t!("msg.deleted").to_string(),
                 Some(o) if o.url.is_some() => t!("media.file").to_string(),
                 Some(o) => o.body.replace('\n', " "),
-                None => t!("msg.unavailable").to_string(),
+                // The sender's XEP-0428 quote is all we have of it.
+                None => sess
+                    .store
+                    .reply_quote(sess.selected.as_deref().unwrap_or_default(), &m.msg_id)
+                    .map(|q| q.lines().map(|l| l.trim_start_matches('>').trim()).filter(|l| !l.is_empty()).collect::<Vec<_>>().join(" "))
+                    .filter(|q| !q.is_empty())
+                    .unwrap_or_else(|| t!("msg.unavailable").to_string()),
             };
             (id.clone(), orig.map(|o| o.ts), who, text, sess.selected.clone().unwrap_or_default())
         });

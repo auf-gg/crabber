@@ -2040,7 +2040,7 @@ impl App {
                         sess.requests.push(jid);
                     }
                 }
-                Ev::Message { peer, groupchat, mut msg, archive_id, live, sid, occupant } => {
+                Ev::Message { peer, groupchat, mut msg, archive_id, live, sid, occupant, quote } => {
                     if let Some(id) = archive_id {
                         sess.store.set("mam_last", &id);
                     }
@@ -2054,6 +2054,9 @@ impl App {
                     }
                     if let Some(o) = &occupant {
                         sess.store.set_occupant(&peer, &msg.msg_id, &msg.sender, o);
+                    }
+                    if inserted && let Some(q) = &quote {
+                        sess.store.set_reply_quote(&peer, &msg.msg_id, q);
                     }
                     if !inserted {
                         // Duplicate: MUC echo / carbon of something we sent confirms delivery.
@@ -2588,7 +2591,10 @@ impl App {
         let groupchat = sess.chat(peer).is_some_and(|c| c.is_room);
         let enc = sess.chat(peer).map(|c| c.enc.clone()).unwrap_or_default();
         let sender = sess.my_sender(peer);
-        sess.send(Cmd::Correct { to: peer.to_string(), replace: id.clone(), body: body.clone(), groupchat, enc });
+        // A corrected reply answers the same message: the new text needs its quote too.
+        let replied = sess.store.msg(peer, &id).and_then(|m| m.reply_to).and_then(|r| sess.store.msg(peer, &r));
+        let reply = replied.map(|r| reply_for(sess, peer, groupchat, &r));
+        sess.send(Cmd::Correct { to: peer.to_string(), replace: id.clone(), body: body.clone(), groupchat, enc, reply });
         apply_correction(sess, peer, &id, &sender, &body, None);
     }
 

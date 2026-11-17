@@ -214,6 +214,8 @@ impl Store {
         let _ = db.execute_batch("ALTER TABLE messages ADD COLUMN retracted INTEGER NOT NULL DEFAULT 0");
         // XEP-0421 occupant-id of the author in a room: what corrections and retractions must match.
         let _ = db.execute_batch("ALTER TABLE messages ADD COLUMN occupant TEXT");
+        // XEP-0428 quote a reply came with: all we show of an original we do not have.
+        let _ = db.execute_batch("ALTER TABLE messages ADD COLUMN reply_quote TEXT");
         // SQLite's LOWER/LIKE only fold ASCII; search needs Cyrillic too.
         db.create_scalar_function("ulower", 1, rusqlite::functions::FunctionFlags::SQLITE_UTF8 | rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC, |ctx| {
             Ok(ctx.get::<String>(0)?.to_lowercase())
@@ -365,6 +367,14 @@ impl Store {
 
     pub fn sid(&self, peer: &str, msg_id: &str) -> Option<String> {
         self.db.query_row("SELECT sid FROM messages WHERE peer=?1 AND msg_id=?2", [peer, msg_id], |r| r.get(0)).optional().ok().flatten().flatten()
+    }
+
+    pub fn set_reply_quote(&self, peer: &str, msg_id: &str, quote: &str) {
+        let _ = self.db.execute("UPDATE messages SET reply_quote=?3 WHERE peer=?1 AND msg_id=?2", params![peer, msg_id, quote]);
+    }
+
+    pub fn reply_quote(&self, peer: &str, msg_id: &str) -> Option<String> {
+        self.db.query_row("SELECT reply_quote FROM messages WHERE peer=?1 AND msg_id=?2", [peer, msg_id], |r| r.get(0)).optional().ok().flatten().flatten()
     }
 
     /// Local id of the message that `id` (our id or the MUC stanza-id) refers to.

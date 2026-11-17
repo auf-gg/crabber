@@ -136,8 +136,9 @@ pub enum Cmd {
     MucAdmin { room: String, nick: Option<String>, jid: Option<String>, role: Option<String>, affiliation: Option<String> },
     /// XEP-0191 (un)block; `spam` adds an XEP-0377 spam report.
     Block { jid: String, block: bool, spam: bool },
-    /// XEP-0308: new text for our message `replace` (its msg_id).
-    Correct { to: String, replace: String, body: String, groupchat: bool, enc: String },
+    /// XEP-0308: new text for our message `replace` (its msg_id); `reply`: what it answers, so
+    /// the corrected text keeps its quote.
+    Correct { to: String, replace: String, body: String, groupchat: bool, enc: String, reply: Option<Reply> },
     /// XEP-0444: our full set of reactions to message `id` (MUC stanza-id in groups).
     React { to: String, id: String, emojis: Vec<String>, groupchat: bool },
     /// XEP-0402: store the room on the server so other devices join it too.
@@ -198,7 +199,8 @@ pub enum Ev {
     /// `live`: arrived just now (not from MAM, offline storage or MUC history) — worth a notification.
     /// `sid`: stanza-id the room (groups) or our archive (1:1) assigned.
     /// `occupant`: XEP-0421 id of the sender in a room that stamps them.
-    Message { peer: String, groupchat: bool, msg: Msg, archive_id: Option<String>, live: bool, sid: Option<String>, occupant: Option<String> },
+    /// `quote`: the reply's XEP-0428 fallback quote, cut from the body; shown when we lack the original.
+    Message { peer: String, groupchat: bool, msg: Msg, archive_id: Option<String>, live: bool, sid: Option<String>, occupant: Option<String>, quote: Option<String> },
     /// XEP-0308: `sender` replaced the text of their message `id`.
     Correct { peer: String, id: String, sender: String, body: String, occupant: Option<String> },
     /// XEP-0444: `sender`'s full reaction set for message `id`.
@@ -548,6 +550,7 @@ fn disco_info(node: Option<String>) -> DiscoInfoResult {
         "http://jabber.org/protocol/nick+notify",
         NS_REPLY,
         NS_RETRACT,
+        NS_FALLBACK,
         groupcall::NS_MUJI,
         // XEP-0393: we render *bold*, _italic_, ~strike~ and code.
         "urn:xmpp:styling:0",
@@ -681,7 +684,7 @@ impl State {
             }
             Cmd::Send { to, id, body, groupchat, enc, reply } => self.send_text(to, id, body, groupchat, enc, None, reply),
             // The correction gets its own stanza id; errors about it then match no stored message.
-            Cmd::Correct { to, replace, body, groupchat, enc } => self.send_text(to, new_id(), body, groupchat, enc, Some(replace), None),
+            Cmd::Correct { to, replace, body, groupchat, enc, reply } => self.send_text(to, new_id(), body, groupchat, enc, Some(replace), reply),
             Cmd::MarkDisplayed { peer, sid, groupchat } => {
                 let by = if groupchat { peer.clone() } else { self.me.to_string() };
                 let el = Element::builder("displayed", ns::MDS).append(Element::builder("stanza-id", NS_SID).attr(nc("id"), sid).attr(nc("by"), by)).build();
@@ -1712,14 +1715,17 @@ impl State {
         }
         let Some(mut body) = msg_body(&m) else { return };
         let reply_to = m.payloads.iter().find(|p| p.is("reply", NS_REPLY)).and_then(|p| p.attr("id")).map(String::from);
-        if reply_to.is_some() {
-            body = strip_fallback(&body, &m.payloads, NS_REPLY);
-        }
+        let mut quote = None;
         // Encrypted with something we cannot read: show that instead of the fallback text.
         if enc == 0
             && let Some(ns) = m.payloads.iter().find(|p| p.is("encryption", e2e::NS_EME)).and_then(|p| p.attr("namespace"))
         {
             body = t!("enc.unsupported", protocol = e2e::eme_name(ns));
+        } else if enc != 3 && reply_to.is_some() {
+            // XEP-0428 offsets count in the sender's text, not in a decryption error of ours.
+            let (rest, cut) = split_fallback(&body, &m.payloads, NS_REPLY);
+            body = rest;
+            quote = (!cut.is_empty()).then_some(cut);
         }
         let mut url = m.payloads.iter().find_map(|p| Oob::try_from(p.clone()).ok()).map(|o| o.url);
         if url.is_none() && body.starts_with("aesgcm://") && !body.contains(char::is_whitespace) {
@@ -1766,6 +1772,7 @@ impl State {
             live: live && delay_ts.is_none(),
             sid,
             occupant,
+            quote,
         });
     }
 }
@@ -1890,21 +1897,26 @@ fn mds_item(item: &Element) -> Option<(String, String)> {
     Some((peer.to_string(), sid.to_string()))
 }
 
-/// XEP-0428: `body` without the code points another XEP marked as fallback for `for_ns`.
-fn strip_fallback(body: &str, payloads: &[Element], for_ns: &str) -> String {
+/// XEP-0428: `body` without the code points another XEP marked as fallback for `for_ns`, and
+/// those code points.
+fn split_fallback(body: &str, payloads: &[Element], for_ns: &str) -> (String, String) {
     let mut drop = vec![false; body.chars().count()];
     for f in payloads.iter().filter(|p| p.is("fallback", NS_FALLBACK) && p.attr("for") == Some(for_ns)) {
-        let ranges: Vec<&Element> = f.children().filter(|c| c.is("body", NS_FALLBACK)).collect();
-        if ranges.is_empty() {
-            return String::new(); // the whole body is fallback
+        // No children: the whole body; only <subject/> ones: none of it.
+        if f.children().next().is_none() {
+            drop.fill(true);
         }
-        for r in ranges {
+        for r in f.children().filter(|c| c.is("body", NS_FALLBACK)) {
             let start = r.attr("start").and_then(|v| v.parse().ok()).unwrap_or(0usize);
             let end = r.attr("end").and_then(|v| v.parse().ok()).unwrap_or(drop.len()).min(drop.len());
             drop.iter_mut().take(end).skip(start).for_each(|d| *d = true);
         }
     }
-    body.chars().zip(drop).filter(|(_, d)| !d).map(|(c, _)| c).collect::<String>().trim_start_matches('\n').to_string()
+    let (mut kept, mut cut) = (String::new(), String::new());
+    for (c, d) in body.chars().zip(drop) {
+        if d { cut.push(c) } else { kept.push(c) }
+    }
+    (kept.trim_start_matches('\n').to_string(), cut)
 }
 
 /// XEP-0084: downloads the avatar `hash` of `who` and stores it if it matches.
@@ -2151,8 +2163,13 @@ mod caps_tests {
     #[test]
     fn reply_fallback_is_cut() {
         let fb: super::Element = "<fallback xmlns='urn:xmpp:fallback:0' for='urn:xmpp:reply:0'><body start='0' end='9'/></fallback>".parse().unwrap();
-        assert_eq!(super::strip_fallback("> Боб: hi\nответ", &[fb.clone()], super::NS_REPLY), "ответ", "offsets count code points");
-        assert_eq!(super::strip_fallback("> Боб: hi\nответ", &[fb], "urn:other"), "> Боб: hi\nответ");
+        let split = |fb: &super::Element, for_ns| super::split_fallback("> Боб: hi\nответ", std::slice::from_ref(fb), for_ns);
+        assert_eq!(split(&fb, super::NS_REPLY), ("ответ".into(), "> Боб: hi".into()), "offsets count code points");
+        assert_eq!(split(&fb, "urn:other"), ("> Боб: hi\nответ".into(), String::new()));
+        let whole: super::Element = "<fallback xmlns='urn:xmpp:fallback:0' for='urn:xmpp:reply:0'/>".parse().unwrap();
+        assert_eq!(split(&whole, super::NS_REPLY).0, "");
+        let subject: super::Element = "<fallback xmlns='urn:xmpp:fallback:0' for='urn:xmpp:reply:0'><subject/></fallback>".parse().unwrap();
+        assert_eq!(split(&subject, super::NS_REPLY).0, "> Боб: hi\nответ", "a subject fallback leaves the body");
         let mds: super::Element = "<item xmlns='http://jabber.org/protocol/pubsub' id='bob@x'><displayed xmlns='urn:xmpp:mds:displayed:0'><stanza-id xmlns='urn:xmpp:sid:0' id='S1' by='me@x'/></displayed></item>".parse().unwrap();
         assert_eq!(super::mds_item(&mds), Some(("bob@x".into(), "S1".into())));
     }
