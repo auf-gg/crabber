@@ -460,9 +460,8 @@ fn vcard_profile_survives_avatar_change() {
     });
 
     // 1×1 PNG.
-    let png = std::env::temp_dir().join("re-avatar.png");
-    std::fs::write(&png, b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR\0\0\0\x01\0\0\0\x01\x08\x06\0\0\0\x1f\x15\xc4\x89\0\0\0\nIDATx\x9cc\0\x01\0\0\x05\0\x01\r\n-\xb4\0\0\0\0IEND\xaeB`\x82").unwrap();
-    a.unbounded_send(Cmd::SetAvatar(png)).unwrap();
+    let png = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR\0\0\0\x01\0\0\0\x01\x08\x06\0\0\0\x1f\x15\xc4\x89\0\0\0\nIDATx\x9cc\0\x01\0\0\x05\0\x01\r\n-\xb4\0\0\0\0IEND\xaeB`\x82";
+    a.unbounded_send(Cmd::SetAvatar { data: png.to_vec(), mime: "image/png" }).unwrap();
     wait(&mut a_rx, |e| match e {
         Ev::Avatar { jid } if jid == "alice@localhost" => Some(()),
         Ev::Error(e) => panic!("{e}"),

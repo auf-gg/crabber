@@ -294,6 +294,8 @@
   "voice.save_failed": "Couldn't save the recording: {e}",
   "play.failed": "Couldn't play: {e}",
   "avatar.prompt": "Avatar",
+  "avatar.crop_title": "New avatar",
+  "avatar.crop_hint": "Drag the circle; the mouse wheel zooms",
   "video.open_failed": "Couldn't open the video: {e}",
   "save.dialog_failed": "Couldn't open the save dialog: {e}",
   "save.failed": "Couldn't save: {e}",

@@ -849,6 +849,7 @@ impl Render for App {
             .when_some(self.render_pgp_import(cx), |d, m| d.child(m))
             .when_some(self.render_profile(cx), |d, m| d.child(m))
             .when_some(self.render_profile_editor(cx), |d, m| d.child(m))
+            .when_some(self.render_crop_avatar(cx), |d, m| d.child(m))
             .when_some(self.render_call(cx), |d, c| d.child(c))
             .when_some(self.render_viewer(cx), |d, v| d.child(v))
             .when_some(self.render_update(cx), |d, u| d.child(u));
@@ -1122,7 +1123,7 @@ impl App {
                     .id("my-avatar")
                     .cursor_pointer()
                     .child(avatar(sess, &sess.me, &me_name, 42.))
-                    .on_click(cx.listener(|this, _, _, cx| this.change_avatar(cx))),
+                    .on_click(cx.listener(|this, _, w, cx| this.change_avatar(w, cx))),
             )
             .child(
                 v_flex()
@@ -2199,7 +2200,7 @@ impl App {
                     .child(avatar(sess, &sess.me, &me, 56.))
                     .child(v_flex().flex_1().min_w_0().child(div().font_weight(FontWeight::SEMIBOLD).child(me)).child(div().text_xs().text_color(t.muted_foreground).truncate().child(sess.me.clone())))
                     .child(Button::new("set-profile").small().outline().label(t!("settings.edit_profile")).on_click(cx.listener(|this, _, _, cx| this.open_profile_editor(cx))))
-                    .child(Button::new("set-avatar").small().outline().label(t!("settings.change_avatar")).on_click(cx.listener(|this, _, _, cx| this.change_avatar(cx))))
+                    .child(Button::new("set-avatar").small().outline().label(t!("settings.change_avatar")).on_click(cx.listener(|this, _, w, cx| this.change_avatar(w, cx))))
                     .child(Button::new("set-logout").small().danger().icon(IconName::LogOut).label(t!("settings.logout")).on_click(cx.listener(|this, _, _, cx| this.logout(cx)))),
             )
             .child(section(t!("settings.theme")))
@@ -3018,6 +3019,78 @@ impl App {
         Some(self.panel("pgp-import", title, body.into_any_element(), cx))
     }
 
+    /// Cropping the picture for our avatar: the square kept is dragged around and zoomed with the wheel.
+    fn render_crop_avatar(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let Some(Modal::CropAvatar { pic, shown, crop: (x, y, side), drag, .. }) = self.modal.as_ref() else { return None };
+        let t = cx.theme().clone();
+        // In dp: the picture fits a 360 square.
+        let (w, h) = (pic.width() as f32, pic.height() as f32);
+        let k = 360. / w.max(h);
+        let (pw, ph, cl, ct, cs) = (w * k, h * k, x * k, y * k, side * k);
+        let shade = |left: f32, top: f32, width: f32, height: f32| div().absolute().left(dp(left)).top(dp(top)).w(dp(width)).h(dp(height)).bg(hsla(0., 0., 0., 0.6));
+        // Moves are followed outside the picture too, until the button is let go.
+        let entity = cx.entity().downgrade();
+        let track = canvas(
+            |_, _, _| {},
+            move |b, _, window, _| {
+                let e = entity.clone();
+                window.on_mouse_event(move |ev: &MouseMoveEvent, phase, _, cx| {
+                    if phase == DispatchPhase::Bubble && ev.pressed_button == Some(MouseButton::Left) {
+                        let _ = e.update(cx, |app, cx| app.crop_drag(ev.position, b.size, cx));
+                    }
+                });
+                window.on_mouse_event(move |ev: &MouseUpEvent, phase, _, cx| {
+                    if phase == DispatchPhase::Bubble && ev.button == MouseButton::Left {
+                        let _ = entity.update(cx, |app, cx| app.crop_release(cx));
+                    }
+                });
+            },
+        )
+        .absolute()
+        .inset_0();
+        let picture = div()
+            .id("crop-picture")
+            .relative()
+            .w(dp(pw))
+            .h(dp(ph))
+            .map(|d| if drag.is_some() { d.cursor_grabbing() } else { d.cursor_grab() })
+            .child(img(shown.clone()).size_full())
+            .child(shade(0., 0., pw, ct))
+            .child(shade(0., ct + cs, pw, ph - ct - cs))
+            .child(shade(0., ct, cl, cs))
+            .child(shade(cl + cs, ct, pw - cl - cs, cs))
+            // Avatars are shown round.
+            .child(div().absolute().left(dp(cl)).top(dp(ct)).size(dp(cs)).rounded_full().border_2().border_color(white()))
+            .child(track)
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, ev: &MouseDownEvent, _, cx| {
+                    // Not a click on the backdrop when let go there.
+                    cx.stop_propagation();
+                    this.crop_grab(ev.position, cx);
+                }),
+            )
+            .on_scroll(cx.listener(|this, ev: &ScrollEvent, window, cx| {
+                cx.stop_propagation();
+                let line = window.line_height();
+                this.crop_zoom(ev.delta.pixel_delta(line).y / line, cx);
+            }));
+        let body = v_flex()
+            .gap_3()
+            .items_center()
+            .child(picture)
+            .child(div().text_xs().text_color(t.muted_foreground).child(t!("avatar.crop_hint")))
+            .child(
+                h_flex()
+                    .w_full()
+                    .gap_2()
+                    .justify_end()
+                    .child(Button::new("crop-cancel").ghost().label(t!("modal.cancel")).on_click(cx.listener(|this, _, _, cx| this.close_modal(cx))))
+                    .child(Button::new("crop-save").primary().label(t!("profile.save")).on_click(cx.listener(|this, _, w, cx| this.save_avatar(w, cx)))),
+            );
+        Some(self.panel("crop-avatar", t!("avatar.crop_title"), body.into_any_element(), cx))
+    }
+
     /// Centered card over a dimmed, click-to-close backdrop.
     fn panel(&self, id: &'static str, title: &str, body: AnyElement, cx: &mut Context<Self>) -> AnyElement {
         let t = cx.theme().clone();
@@ -3504,7 +3577,7 @@ impl App {
     }
 
     fn render_modal(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let modal = self.modal.as_ref().filter(|m| !matches!(m, Modal::Settings | Modal::Media { .. } | Modal::Encryption { .. } | Modal::PgpImport { .. } | Modal::Profile { .. } | Modal::EditProfile { .. }))?;
+        let modal = self.modal.as_ref().filter(|m| !matches!(m, Modal::Settings | Modal::Media { .. } | Modal::Encryption { .. } | Modal::PgpImport { .. } | Modal::Profile { .. } | Modal::EditProfile { .. } | Modal::CropAvatar { .. }))?;
         let t = cx.theme().clone();
         let sess = self.sess.as_ref()?;
         let (title, body): (&str, AnyElement) = match modal {
@@ -3590,7 +3663,7 @@ impl App {
                 (t!("modal.confirm"), div().child(text).into_any_element())
             }
             Modal::ConfirmClear { .. } => (t!("chat_menu.clear"), div().child(t!("modal.clear_text")).into_any_element()),
-            Modal::Settings | Modal::Media { .. } | Modal::Encryption { .. } | Modal::PgpImport { .. } | Modal::Profile { .. } | Modal::EditProfile { .. } => return None,
+            Modal::Settings | Modal::Media { .. } | Modal::Encryption { .. } | Modal::PgpImport { .. } | Modal::Profile { .. } | Modal::EditProfile { .. } | Modal::CropAvatar { .. } => return None,
         };
         let confirm = match modal {
             Modal::Invite { .. } | Modal::ScreenPicker { .. } => None,

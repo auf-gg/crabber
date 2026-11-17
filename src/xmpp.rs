@@ -156,7 +156,8 @@ pub enum Cmd {
     Leave { room: String },
     Invite { room: String, jid: String },
     SetShow(Option<Show>),
-    SetAvatar(PathBuf),
+    /// The picture, already cropped and compressed, and its MIME type.
+    SetAvatar { data: Vec<u8>, mime: &'static str },
     /// XEP-0054: asks for `Ev::Profile` of a JID (our own JID: our vCard).
     GetProfile { jid: String },
     /// XEP-0054: new values of our vCard fields; the rest of the vCard stays.
@@ -959,17 +960,16 @@ impl State {
                 self.show = show;
                 self.send_presences();
             }
-            Cmd::SetAvatar(path) => {
+            Cmd::SetAvatar { data, mime } => {
                 let (net, dir, me) = (self.net.clone(), self.dir.clone(), self.me.to_string());
                 let (photo_hash, converts) = (self.photo_hash.clone(), self.vcard_conversion.load(Ordering::Relaxed));
                 tokio::spawn(async move {
-                    let Ok(data) = tokio::fs::read(&path).await else { return };
-                    let photo: Element = Photo { type_: PhotoType { data: mime(&path).into() }, binval: Binval { data: data.clone() } }.into();
+                    let photo: Element = Photo { type_: PhotoType { data: mime.into() }, binval: Binval { data: data.clone() } }.into();
                     let hash = sha1_hex(&data);
                     let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &data);
                     let mut pep = publish(&net, ns::AVATAR_DATA, &hash, Element::builder("data", ns::AVATAR_DATA).append(b64).build()).await;
                     if pep.is_ok() {
-                        let info = Element::builder("info", ns::AVATAR_METADATA).attr(nc("id"), hash.as_str()).attr(nc("bytes"), data.len().to_string()).attr(nc("type"), mime(&path));
+                        let info = Element::builder("info", ns::AVATAR_METADATA).attr(nc("id"), hash.as_str()).attr(nc("bytes"), data.len().to_string()).attr(nc("type"), mime);
                         pep = publish(&net, ns::AVATAR_METADATA, &hash, Element::builder("metadata", ns::AVATAR_METADATA).append(info).build()).await;
                     }
                     let set = if converts {

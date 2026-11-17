@@ -113,6 +113,10 @@ pub enum Modal {
     EditProfile { loaded: bool },
     /// What to share: monitors and windows (Windows has no system picker).
     ScreenPicker { targets: Vec<crabber::screens::ScreenTarget> },
+    /// The picture for our new avatar, to crop: `pic` upright, `shown` a smaller copy on screen,
+    /// `crop` the square kept (left, top, side in `pic` pixels), `drag` where moving it began
+    /// (mouse, crop left and top). `settings`: opened from the settings, which come back after.
+    CropAvatar { pic: Arc<::image::DynamicImage>, shown: Arc<RenderImage>, crop: (f32, f32, f32), drag: Option<(Point<Pixels>, f32, f32)>, settings: bool },
 }
 
 /// Full-window preview of an attachment.
@@ -568,6 +572,39 @@ pub fn image_format(b: &[u8]) -> Option<ImageFormat> {
         [b'B', b'M', ..] => ImageFormat::Bmp,
         _ => return None,
     })
+}
+
+/// A picture for our avatar, turned upright as its EXIF says, and a copy small enough to show.
+fn open_picture(path: &Path) -> Result<(::image::DynamicImage, Arc<RenderImage>), String> {
+    use ::image::ImageDecoder as _;
+    let mut decoder = ::image::ImageReader::open(path).and_then(|r| r.with_guessed_format()).map_err(|e| e.to_string())?.into_decoder().map_err(|e| e.to_string())?;
+    let orientation = decoder.orientation().unwrap_or(::image::metadata::Orientation::NoTransforms);
+    let mut pic = ::image::DynamicImage::from_decoder(decoder).map_err(|e| e.to_string())?;
+    pic.apply_orientation(orientation);
+    let mut shown = if pic.width().max(pic.height()) > 1024 { pic.thumbnail(1024, 1024) } else { pic.clone() }.into_rgba8();
+    // GPUI draws BGRA.
+    shown.pixels_mut().for_each(|p| p.0.swap(0, 2));
+    Ok((pic, Arc::new(RenderImage::new(vec![::image::Frame::new(shown)]))))
+}
+
+/// Our avatar's side at most, in pixels: sharp in the 120 px profile card at 2x, a few dozen KB.
+const AVATAR_PX: u32 = 256;
+
+/// The `crop` square (left, top, side) of `pic` as our avatar: at most `AVATAR_PX` wide, JPEG
+/// unless it is see-through somewhere. Unshrunk, a photo outgrows what servers take in one
+/// stanza: past their limit (often 256 KB) they close the stream.
+fn avatar_bytes(pic: &::image::DynamicImage, (x, y, side): (f32, f32, f32)) -> Result<(Vec<u8>, &'static str), String> {
+    let side = (side.round() as u32).max(1);
+    let size = side.min(AVATAR_PX);
+    let square = pic.crop_imm(x.round() as u32, y.round() as u32, side, side).resize_exact(size, size, ::image::imageops::FilterType::Lanczos3);
+    let mut out = vec![];
+    let rgba = square.to_rgba8();
+    if rgba.pixels().any(|p| p.0[3] < 255) {
+        rgba.write_to(&mut std::io::Cursor::new(&mut out), ::image::ImageFormat::Png).map_err(|e| e.to_string())?;
+        return Ok((out, "image/png"));
+    }
+    ::image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 85).encode_image(&square.to_rgb8()).map_err(|e| e.to_string())?;
+    Ok((out, "image/jpeg"))
 }
 
 /// Writes a pasted image to a temp file so it can be attached like any other file.
@@ -1779,7 +1816,8 @@ impl App {
             // Esc throws the recording away.
         } else if self.viewer.take().is_some() {
             // Back to whatever was under the viewer (e.g. the media panel).
-        } else if self.modal.take().is_some() {
+        } else if self.modal.is_some() {
+            self.close_modal(cx);
         } else if let Some(sess) = self.sess.as_mut().filter(|s| s.editing.is_some()) {
             sess.editing = None;
             self.compose.update(cx, |s, cx| s.set_value("", window, cx));
@@ -2862,15 +2900,84 @@ impl App {
         cx.notify();
     }
 
-    pub fn change_avatar(&mut self, cx: &mut Context<Self>) {
+    /// Picks a picture and opens it for cropping.
+    pub fn change_avatar(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let settings = matches!(self.modal, Some(Modal::Settings));
         let paths = cx.prompt_for_paths(PathPromptOptions { files: true, directories: false, multiple: false, prompt: Some(t!("avatar.prompt").into()) });
-        cx.spawn(async move |this, cx| {
-            let Ok(Ok(Some(mut paths))) = paths.await else { return };
-            let Some(path) = paths.pop() else { return };
-            let _ = this.update(cx, |app, _| {
-                if let Some(sess) = &app.sess {
-                    sess.send(Cmd::SetAvatar(path));
+        cx.spawn_in(window, async move |this, cx| {
+            let path = match paths.await {
+                Ok(Ok(Some(mut paths))) => paths.pop(),
+                // Linux without xdg-desktop-portal: no dialog at all, so say why.
+                Ok(Err(e)) => {
+                    let _ = this.update_in(cx, |_, window, cx| window.push_notification(t!("err.avatar_failed", e = e), cx));
+                    return;
                 }
+                _ => None,
+            };
+            let Some(path) = path else { return };
+            let opened = cx.background_spawn(async move { open_picture(&path) }).await;
+            let _ = this.update_in(cx, |app, window, cx| match opened {
+                Ok((pic, shown)) => {
+                    let side = pic.width().min(pic.height()) as f32;
+                    let crop = ((pic.width() as f32 - side) / 2., (pic.height() as f32 - side) / 2., side);
+                    app.modal = Some(Modal::CropAvatar { pic: Arc::new(pic), shown, crop, drag: None, settings });
+                    cx.notify();
+                }
+                Err(e) => window.push_notification(t!("err.avatar_failed", e = e), cx),
+            });
+        })
+        .detach();
+    }
+
+    /// Starts moving the avatar crop.
+    pub fn crop_grab(&mut self, pos: Point<Pixels>, cx: &mut Context<Self>) {
+        if let Some(Modal::CropAvatar { crop, drag, .. }) = self.modal.as_mut() {
+            *drag = Some((pos, crop.0, crop.1));
+            cx.notify();
+        }
+    }
+
+    /// Moves the avatar crop after the mouse; `shown`: the picture's size on screen.
+    pub fn crop_drag(&mut self, pos: Point<Pixels>, shown: Size<Pixels>, cx: &mut Context<Self>) {
+        let Some(Modal::CropAvatar { pic, crop, drag: Some((from, x0, y0)), .. }) = self.modal.as_mut() else { return };
+        let (w, h) = (pic.width() as f32, pic.height() as f32);
+        crop.0 = (*x0 + (pos.x - from.x) / shown.width * w).clamp(0., w - crop.2);
+        crop.1 = (*y0 + (pos.y - from.y) / shown.height * h).clamp(0., h - crop.2);
+        cx.notify();
+    }
+
+    pub fn crop_release(&mut self, cx: &mut Context<Self>) {
+        if let Some(Modal::CropAvatar { drag: drag @ Some(_), .. }) = self.modal.as_mut() {
+            *drag = None;
+            cx.notify();
+        }
+    }
+
+    /// Zooms the avatar crop in (`lines` > 0) or out, around its centre; a wheel notch (3 lines) by about a tenth.
+    pub fn crop_zoom(&mut self, lines: f32, cx: &mut Context<Self>) {
+        let Some(Modal::CropAvatar { pic, crop, .. }) = self.modal.as_mut() else { return };
+        let (w, h) = (pic.width() as f32, pic.height() as f32);
+        let max = w.min(h);
+        let side = (crop.2 * 0.965f32.powf(lines)).clamp(max.min(64.), max);
+        let (mid_x, mid_y) = (crop.0 + crop.2 / 2., crop.1 + crop.2 / 2.);
+        *crop = ((mid_x - side / 2.).clamp(0., w - side), (mid_y - side / 2.).clamp(0., h - side), side);
+        cx.notify();
+    }
+
+    /// Compresses the cropped square and sends it out as our avatar.
+    pub fn save_avatar(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(Modal::CropAvatar { pic, crop, .. }) = &self.modal else { return };
+        let (pic, crop) = (pic.clone(), *crop);
+        self.close_modal(cx);
+        cx.spawn_in(window, async move |this, cx| {
+            let out = cx.background_spawn(async move { avatar_bytes(&pic, crop) }).await;
+            let _ = this.update_in(cx, |app, window, cx| match out {
+                Ok((data, mime)) => {
+                    if let Some(sess) = &app.sess {
+                        sess.send(Cmd::SetAvatar { data, mime });
+                    }
+                }
+                Err(e) => window.push_notification(t!("err.avatar_failed", e = e), cx),
             });
         })
         .detach();
@@ -3140,7 +3247,14 @@ impl App {
     }
 
     pub fn close_modal(&mut self, cx: &mut Context<Self>) {
-        self.modal = None;
+        self.modal = match self.modal.take() {
+            // Its picture leaves the GPU once no window is being drawn; the settings it came from return.
+            Some(Modal::CropAvatar { shown, settings, .. }) => {
+                cx.defer(move |cx| cx.drop_image(shown, None));
+                settings.then_some(Modal::Settings)
+            }
+            _ => None,
+        };
         cx.notify();
     }
 
@@ -3614,6 +3728,31 @@ mod tests {
         }
         let _ = std::fs::remove_file(&a);
         let _ = std::fs::remove_file(&b);
+    }
+
+    /// A big noisy photo (the worst case for size) comes out a small JPEG; see-through stays PNG.
+    #[test]
+    fn avatar_is_cropped_and_compressed() {
+        let noise = |x: u32, y: u32| (x.wrapping_mul(2654435761) ^ y.wrapping_mul(40503)).wrapping_mul(2246822519).to_le_bytes();
+        let photo = ::image::RgbImage::from_fn(3000, 2000, |x, y| ::image::Rgb(noise(x, y)[..3].try_into().unwrap()));
+        let path = std::env::temp_dir().join(format!("crabber-avatar-{}.jpg", std::process::id()));
+        photo.save(&path).unwrap();
+        let (pic, shown) = super::open_picture(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!((pic.width(), pic.height()), (3000, 2000));
+        assert_eq!(shown.size(0).width.0, 1024);
+
+        let (data, mime) = super::avatar_bytes(&pic, (500., 0., 2000.)).unwrap();
+        assert_eq!(mime, "image/jpeg");
+        assert!(data.len() < 64 * 1024, "{} bytes", data.len());
+        let out = ::image::load_from_memory(&data).unwrap();
+        assert_eq!((out.width(), out.height()), (super::AVATAR_PX, super::AVATAR_PX));
+
+        // Smaller than the limit: kept at its size.
+        let clear = ::image::DynamicImage::ImageRgba8(::image::RgbaImage::from_pixel(100, 80, ::image::Rgba([1, 2, 3, 0])));
+        let (data, mime) = super::avatar_bytes(&clear, (10., 0., 80.)).unwrap();
+        assert_eq!(mime, "image/png");
+        assert_eq!(::image::load_from_memory(&data).unwrap().width(), 80);
     }
 
     #[test]

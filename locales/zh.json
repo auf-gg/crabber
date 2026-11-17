@@ -294,6 +294,8 @@
   "voice.save_failed": "无法保存录音：{e}",
   "play.failed": "无法播放：{e}",
   "avatar.prompt": "头像",
+  "avatar.crop_title": "新头像",
+  "avatar.crop_hint": "拖动圆圈，滚动鼠标滚轮缩放",
   "video.open_failed": "无法打开视频：{e}",
   "save.dialog_failed": "无法打开保存对话框：{e}",
   "save.failed": "保存失败：{e}",
