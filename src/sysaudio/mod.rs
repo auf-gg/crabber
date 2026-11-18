@@ -15,7 +15,10 @@ pub fn start(on_frame: impl FnMut(Vec<f32>) + Send + 'static) -> Result<SystemAu
     return linux::start(on_frame).map(|h| SystemAudio(Box::new(h)));
     #[cfg(windows)]
     return windows::start(on_frame).map(|h| SystemAudio(Box::new(h)));
-    #[cfg(not(any(target_os = "linux", windows)))]
+    // ScreenCaptureKit, on what the running screen share shows.
+    #[cfg(target_os = "macos")]
+    return crate::sck::start_audio(on_frame).map(|h| SystemAudio(Box::new(h)));
+    #[cfg(not(any(target_os = "linux", windows, target_os = "macos")))]
     {
         drop(on_frame);
         Err("system audio capture is not supported here".into())

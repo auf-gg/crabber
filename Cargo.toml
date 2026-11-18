@@ -84,6 +84,17 @@ zbus = { version = "6", default-features = false, features = ["default-rt"] }
 ksni = { version = "0.3", features = ["blocking"] }
 notify-rust = "4"
 
+[target.'cfg(target_os = "macos")'.dependencies]
+# ScreenCaptureKit for screen sharing and its system audio (src/sck.rs); the versions gpui uses.
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSError", "NSString"] }
+objc2-screen-capture-kit = { version = "0.3", default-features = false, features = ["std", "bitflags", "block2", "dispatch2", "objc2-core-foundation", "objc2-core-media", "SCContentSharingPicker", "SCShareableContent", "SCStream"] }
+objc2-core-media = { version = "0.3", default-features = false, features = ["std", "CMBase", "CMBlockBuffer", "CMFormatDescription", "CMSampleBuffer", "CMTime", "objc2-core-audio-types", "objc2-core-video"] }
+objc2-core-video = { version = "0.3", default-features = false, features = ["std", "bitflags", "CVBase", "CVBuffer", "CVImageBuffer", "CVPixelBuffer", "CVReturn"] }
+objc2-core-audio-types = { version = "0.3", default-features = false, features = ["std", "CoreAudioBaseTypes"] }
+block2 = "0.6"
+dispatch2 = "0.3"
+
 # Packages built by build.yml (cargo-deb / cargo-generate-rpm, binary built beforehand).
 # Shared-library dependencies are detected automatically from the binary.
 [package.metadata.deb]

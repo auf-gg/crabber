@@ -1599,7 +1599,8 @@ impl App {
     }
 
     /// Starts or stops sharing the screen. On Windows the user first picks a monitor or a window;
-    /// elsewhere the system decides (the portal picker on Wayland, the whole desktop on X11).
+    /// elsewhere the system decides (the portal picker on Wayland, the system picker on macOS, the
+    /// whole desktop on X11).
     pub fn share_screen(&mut self, on: bool, window: &mut Window, cx: &mut Context<Self>) {
         if on && cfg!(windows) {
             return self.pick_screen(window, cx);
@@ -1608,7 +1609,7 @@ impl App {
     }
 
     /// Another monitor or window: our picker on Windows; elsewhere the system's (a new portal
-    /// session on Wayland).
+    /// session on Wayland, the system picker again on macOS).
     pub fn change_screen(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if cfg!(windows) {
             return self.pick_screen(window, cx);
@@ -3504,13 +3505,13 @@ impl App {
     }
 }
 
-/// Whether the user can pick what to share: our picker on Windows, the portal on Wayland
-/// (X11 shares the whole desktop).
+/// Whether the user can pick what to share: our picker on Windows, the portal on Wayland, the
+/// system picker on macOS (X11 shares the whole desktop).
 pub fn can_pick_screen() -> bool {
     #[cfg(target_os = "linux")]
     return crabber::screencast::wayland();
     #[cfg(not(target_os = "linux"))]
-    return cfg!(windows);
+    return cfg!(any(windows, target_os = "macos"));
 }
 
 /// Id prefix of local call lines: they are never sent, ticked or marked read.

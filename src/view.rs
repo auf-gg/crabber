@@ -4229,7 +4229,7 @@ impl App {
                     }
                     m
                 });
-                if cfg!(any(target_os = "linux", windows)) {
+                if cfg!(any(target_os = "linux", windows, target_os = "macos")) {
                     let this = this.clone();
                     menu = menu.item(check_item(t!("call.share_audio"), audio).on_click(move |_, w, cx| {
                         let _ = this.update(cx, |app, cx| app.update_settings(w, cx, |st| st.share_audio = !audio));

@@ -15,6 +15,15 @@ gpui_kit::assets::icon_assets!(
 );
 
 fn main() {
+    // Finder starts apps with PATH=/usr/bin:/bin:/usr/sbin:/sbin, without the ffmpeg of Homebrew
+    // (Apple silicon, Intel) or MacPorts.
+    #[cfg(target_os = "macos")]
+    {
+        let path = std::env::var("PATH").unwrap_or_default();
+        // SAFETY: no other thread runs yet.
+        unsafe { std::env::set_var("PATH", format!("{path}:/opt/homebrew/bin:/usr/local/bin:/opt/local/bin")) };
+    }
+
     tokio_xmpp::rustls::crypto::ring::default_provider()
         .install_default()
         .expect("failed to install rustls crypto provider");

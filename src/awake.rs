@@ -61,7 +61,34 @@ mod imp {
     }
 }
 
-#[cfg(not(any(target_os = "linux", windows)))]
+#[cfg(target_os = "macos")]
+mod imp {
+    use std::process::{Child, Command, Stdio};
+
+    /// `caffeinate` holds the power assertions while it runs.
+    struct Caffeinate(Child);
+
+    impl Drop for Caffeinate {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    pub fn keep_awake(_: &str) -> Option<impl Send + 'static> {
+        // No idle or display sleep; `-w` ends it with us should we crash.
+        Command::new("/usr/bin/caffeinate")
+            .args(["-d", "-i", "-w", &std::process::id().to_string()])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .ok()
+            .map(Caffeinate)
+    }
+}
+
+#[cfg(not(any(target_os = "linux", windows, target_os = "macos")))]
 mod imp {
     pub fn keep_awake(_: &str) -> Option<()> {
         None

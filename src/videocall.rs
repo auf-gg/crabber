@@ -13,7 +13,8 @@ pub enum Source {
     Screen,
 }
 
-/// Chosen camera (a /dev/videoN path, or a DirectShow name on Windows); None = the first one.
+/// Chosen camera (a /dev/videoN path, a DirectShow name on Windows, an AVFoundation name on
+/// macOS); None = the first one.
 static CAMERA: Mutex<Option<String>> = Mutex::new(None);
 
 pub fn set_camera(id: Option<String>) {
@@ -45,7 +46,12 @@ pub fn cameras() -> Vec<crate::audio::MediaDevice> {
     {
         dshow_cameras().into_iter().map(|n| MediaDevice { id: n.clone(), name: n }).collect()
     }
-    #[cfg(not(any(target_os = "linux", windows)))]
+    #[cfg(target_os = "macos")]
+    {
+        let Ok(out) = cmd("ffmpeg").args(["-hide_banner", "-f", "avfoundation", "-list_devices", "true", "-i", ""]).stderr(Stdio::piped()).output() else { return vec![] };
+        avfoundation_cameras(&String::from_utf8_lossy(&out.stderr)).into_iter().map(|n| MediaDevice { id: n.clone(), name: n }).collect()
+    }
+    #[cfg(not(any(target_os = "linux", windows, target_os = "macos")))]
     {
         vec![]
     }
@@ -221,7 +227,7 @@ pub(crate) fn encode_args(src: Source, capture_height: Option<u32>) -> Vec<Strin
 const FEED_FPS: u32 = 30;
 
 /// How a source is captured: by ffmpeg itself (its input options), or by us, frames arriving on
-/// the receiver while the handle lives (Wayland portal, Windows Graphics Capture).
+/// the receiver while the handle lives (Wayland portal, Windows Graphics Capture, ScreenCaptureKit).
 enum Capture {
     Ffmpeg(Vec<String>),
     Fed(std::sync::mpsc::Receiver<RawFrame>, Box<dyn Send>),
@@ -263,9 +269,46 @@ fn capture(src: Source) -> Result<Capture, String> {
                 Err(_) => Ok(Capture::Ffmpeg(crate::screens::gdigrab_input(&target))),
             }
         }
-        #[cfg(not(any(target_os = "linux", windows)))]
+        // A camera at 30 fps: AVFoundation refuses ffmpeg's default of 29.97.
+        #[cfg(target_os = "macos")]
+        Source::Camera => {
+            let name = camera().ok_or(crate::t!("call.no_camera"))?;
+            ffmpeg(&["-f", "avfoundation", "-framerate", "30", "-i", &name])
+        }
+        // Blocks while the system picker is open.
+        #[cfg(target_os = "macos")]
+        Source::Screen => {
+            let pick = crate::sck::pick()?;
+            let (tx, rx) = sync_channel::<RawFrame>(2);
+            let cap = crate::sck::start_video(&pick, FEED_FPS, move |f| {
+                let _ = tx.try_send(f);
+            })?;
+            Ok(Capture::Fed(rx, Box::new(cap)))
+        }
+        #[cfg(not(any(target_os = "linux", windows, target_os = "macos")))]
         _ => Err(crate::t!("call.no_camera").into()),
     }
+}
+
+/// Cameras in ffmpeg's AVFoundation device listing: its video devices, without the screens.
+#[cfg(any(target_os = "macos", test))]
+fn avfoundation_cameras(listing: &str) -> Vec<String> {
+    let mut video = false;
+    let mut out = vec![];
+    for line in listing.lines() {
+        if line.ends_with("video devices:") {
+            video = true;
+        } else if line.ends_with("audio devices:") {
+            video = false;
+        } else if video
+            && let Some((_, item)) = line.split_once("] [")
+            && let Some((_, name)) = item.split_once("] ")
+            && !name.starts_with("Capture screen")
+        {
+            out.push(name.to_string());
+        }
+    }
+    out
 }
 
 /// DirectShow video devices, from ffmpeg's device listing.
@@ -303,7 +346,7 @@ pub(crate) fn spawn_encoder(input: &[String], sink: Sink) -> Result<Child, Strin
 }
 
 impl Encoder {
-    /// Blocks while the screen picker is open (Wayland). `on_frame` gets each encoded VP8 frame.
+    /// Blocks while the screen picker is open (Wayland, macOS). `on_frame` gets each encoded VP8 frame.
     pub fn start(src: Source, on_frame: impl FnMut(Vec<u8>) + Send + 'static) -> Result<Self, String> {
         if !crate::video::available() {
             return Err(crate::t!("call.no_ffmpeg").into());
@@ -570,6 +613,19 @@ mod tests {
         std::thread::sleep(Duration::from_millis(800));
         assert_eq!(keys.lock().unwrap().len(), 2);
         drop(tx);
+    }
+
+    #[test]
+    fn avfoundation_listing() {
+        let listing = "[AVFoundation indev @ 0x7f8] AVFoundation video devices:\n\
+            [AVFoundation indev @ 0x7f8] [0] FaceTime HD Camera\n\
+            [AVFoundation indev @ 0x7f8] [1] iPhone [Continuity] Camera\n\
+            [AVFoundation indev @ 0x7f8] [2] Capture screen 0\n\
+            [AVFoundation indev @ 0x7f8] AVFoundation audio devices:\n\
+            [AVFoundation indev @ 0x7f8] [0] MacBook Pro Microphone\n\
+            : Input/output error";
+        assert_eq!(avfoundation_cameras(listing), ["FaceTime HD Camera", "iPhone [Continuity] Camera"]);
+        assert!(avfoundation_cameras("").is_empty());
     }
 
     #[test]
