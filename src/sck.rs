@@ -75,6 +75,11 @@ mod imp {
         error.localizedDescription().to_string()
     }
 
+    /// Takes the app out of the system's screen sharing menu once nothing is picked or shared.
+    fn deactivate() {
+        DispatchQueue::main().exec_async(|| unsafe { SCContentSharingPicker::sharedPicker().setActive(false) });
+    }
+
     define_class!(
         // SAFETY: NSObject has no subclassing requirements and the class has no Drop.
         #[unsafe(super(NSObject))]
@@ -86,6 +91,7 @@ mod imp {
         unsafe impl SCContentSharingPickerObserver for PickerObserver {
             #[unsafe(method(contentSharingPicker:didCancelForStream:))]
             fn did_cancel(&self, _picker: &SCContentSharingPicker, _stream: Option<&SCStream>) {
+                deactivate();
                 answer(Err("Screen sharing cancelled".into()));
             }
 
@@ -96,6 +102,7 @@ mod imp {
 
             #[unsafe(method(contentSharingPickerStartDidFailWithError:))]
             fn did_fail(&self, error: &NSError) {
+                deactivate();
                 answer(Err(describe(error)));
             }
         }
@@ -195,7 +202,7 @@ mod imp {
             }
             if self.kind == SCStreamOutputType::Screen {
                 *SHARED.lock().unwrap() = None;
-                DispatchQueue::main().exec_async(|| unsafe { SCContentSharingPicker::sharedPicker().setActive(false) });
+                deactivate();
             }
         }
     }
