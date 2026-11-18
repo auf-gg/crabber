@@ -206,7 +206,7 @@ On Linux, emoji are drawn with Noto Color Emoji when it is installed (`noto-font
 
 ## Building from source
 
-Requires Rust as pinned in [`rust-toolchain.toml`](rust-toolchain.toml) (1.97+).
+Requires Rust as pinned in [`rust-toolchain.toml`](rust-toolchain.toml) (1.98+).
 
 Linux system dependencies (Debian/Ubuntu package names):
 
