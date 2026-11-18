@@ -109,8 +109,9 @@ fn omemo_with_python_oldmemo_twomemo_and_between_our_clients() {
     std::thread::sleep(Duration::from_secs(2)); // bundles and device lists published
 
     // 1. Rust -> python -> Rust, twice per version (key exchange, then a normal message). The bot
-    // has both versions, so "omemo" picks OMEMO 2; the bot answers with the version it got.
-    for (enc, echo) in [("omemo", "echo2"), ("omemo-legacy", "echo")] {
+    // has both versions, so "auto" picks OMEMO 2, and a chat never set ("") uses legacy; the bot
+    // answers with the version it got.
+    for (enc, echo) in [("auto", "echo2"), ("", "echo")] {
         for text in ["Привет, OMEMO!", "второе сообщение"] {
             let id = send(&a, "carol@localhost", text, enc);
             wait(&mut a_rx, 20, |e| matches!(e, Ev::SentEncrypted { id: i, enc: 1, .. } if *i == id).then_some(()));
@@ -124,14 +125,14 @@ fn omemo_with_python_oldmemo_twomemo_and_between_our_clients() {
     }
 
     // 2. Between two of our clients, both directions; OMEMO 2, then legacy.
-    let id = send(&b, "alice@localhost", "от боба", "omemo");
+    let id = send(&b, "alice@localhost", "от боба", "omemo2");
     wait(&mut b_rx, 20, |e| matches!(e, Ev::SentEncrypted { id: i, .. } if *i == id).then_some(()));
     let got = wait(&mut a_rx, 20, |e| match e {
         Ev::Message { peer, msg, .. } if peer == "bob@localhost" && !msg.outgoing => Some(msg.clone()),
         _ => None,
     });
     assert_eq!((got.body.as_str(), got.enc), ("от боба", 1));
-    for (text, enc) in [("ответ алисы", "omemo"), ("старый OMEMO", "omemo-legacy")] {
+    for (text, enc) in [("ответ алисы", "auto"), ("старый OMEMO", "omemo-legacy")] {
         send(&a, "bob@localhost", text, enc);
         let got = wait(&mut b_rx, 20, |e| match e {
             Ev::Message { peer, msg, .. } if peer == "alice@localhost" && !msg.outgoing => Some(msg.clone()),
@@ -160,7 +161,7 @@ fn omemo_with_python_oldmemo_twomemo_and_between_our_clients() {
     let file = std::env::temp_dir().join("re-omemo-file.txt");
     std::fs::write(&file, "секретный файл").unwrap();
     let fid = xmpp::new_id();
-    a.unbounded_send(Cmd::Upload { to: "bob@localhost".into(), id: fid.clone(), path: file, groupchat: false, enc: "omemo".into() }).unwrap();
+    a.unbounded_send(Cmd::Upload { to: "bob@localhost".into(), id: fid.clone(), path: file, groupchat: false, enc: "omemo-legacy".into() }).unwrap();
     let url = wait(&mut b_rx, 30, |e| match e {
         Ev::Message { msg, .. } if msg.msg_id == fid => msg.url.clone(),
         _ => None,

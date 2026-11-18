@@ -124,7 +124,7 @@ const NS_OCCUPANT_ID: &str = "urn:xmpp:occupant-id:0";
 pub enum Cmd {
     /// Sent by the UI after `Ev::Online`: MAM catch-up point and rooms to rejoin (room, nick, since, after).
     Sync { mam_after: Option<String>, rooms: Vec<(String, String, Option<i64>, Option<String>)> },
-    /// `enc`: chat encryption mode — "auto" | "omemo" | "omemo2" | "omemo-legacy" | "pgp" | "plain".
+    /// `enc`: chat encryption mode — "auto" | "omemo2" | "omemo-legacy" (also "" and the former "omemo") | "pgp" | "plain".
     Send { to: String, id: String, body: String, groupchat: bool, enc: String, reply: Option<Reply> },
     /// XEP-0490: we read chat `peer` up to the message with stanza-id `sid`.
     MarkDisplayed { peer: String, sid: String, groupchat: bool },
@@ -1826,7 +1826,7 @@ async fn encrypt_for(e2e: &e2e::Shared, net: &Net, to: &str, enc: &str, body: &s
     }
     let proto = match e2e::pick(e2e, net, to, enc).await {
         Some(p) => p,
-        None if matches!(enc, "" | "auto") => return Ok(None),
+        None if enc == "auto" => return Ok(None),
         None if enc == "omemo2" => return Err(t!("e2e.err_no_devices2").into()),
         None => return Err(t!("e2e.err_no_devices").into()),
     };

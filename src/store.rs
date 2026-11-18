@@ -175,8 +175,8 @@ pub struct ChatRow {
     pub in_roster: bool,
     pub subscription: String,
     pub last: Option<Msg>,
-    /// "" / "auto" (OMEMO when the contact supports it), "omemo" (either version), "omemo2",
-    /// "omemo-legacy", "pgp" or "plain".
+    /// "auto" (OMEMO 2 or legacy OMEMO when the contact supports it), "omemo2", "omemo-legacy",
+    /// "pgp" or "plain". "" (never chosen) and the former "omemo" mean "omemo-legacy".
     pub enc: String,
 }
 

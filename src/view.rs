@@ -2430,7 +2430,8 @@ impl App {
         let t = cx.theme().clone();
         let sess = self.sess.as_ref()?;
         let mode = sess.chat(&peer).map(|c| c.enc.clone()).unwrap_or_default();
-        let mode = if mode.is_empty() { "auto".to_string() } else { mode };
+        // Legacy OMEMO until a chat is set otherwise; the former "omemo" mode is shown as it too.
+        let mode = if matches!(mode.as_str(), "" | "omemo") { "omemo-legacy".to_string() } else { mode };
         let option = |id: &'static str, value: &'static str, title: &'static str, desc: &'static str| {
             let p = peer.clone();
             let active = mode == value;
@@ -2463,7 +2464,6 @@ impl App {
         let body = v_flex()
             .gap_2()
             .child(option("enc-auto", "auto", t!("e2e.auto"), t!("e2e.auto_desc")))
-            .child(option("enc-omemo", "omemo", t!("e2e.omemo"), t!("e2e.omemo_desc")))
             .child(option("enc-omemo2", "omemo2", t!("e2e.omemo2"), t!("e2e.omemo2_desc")))
             .child(option("enc-omemo-legacy", "omemo-legacy", t!("e2e.omemo_legacy"), t!("e2e.omemo_legacy_desc")))
             .child(option("enc-pgp", "pgp", "OpenPGP (XEP-0027)", t!("e2e.pgp_desc")))

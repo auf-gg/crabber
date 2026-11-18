@@ -144,7 +144,7 @@ against the client requirements of the [XMPP Compliance Suites 2023](https://xmp
 | [0368](https://xmpp.org/extensions/xep-0368.html) | SRV records for XMPP over TLS | ✅ | Direct TLS where the domain publishes it (or a manual host on port 5223), STARTTLS otherwise |
 | [0377](https://xmpp.org/extensions/xep-0377.html) | Blocking Command Reports | ✅ | Sent with a block |
 | [0380](https://xmpp.org/extensions/xep-0380.html) | Explicit Message Encryption | ✅ | |
-| [0384](https://xmpp.org/extensions/xep-0384.html) | OMEMO Encryption | ✅ | Legacy v0.3 and OMEMO 2 (`urn:xmpp:omemo:2`) on one identity; a chat uses OMEMO 2 when the contact has it, or a version picked by hand |
+| [0384](https://xmpp.org/extensions/xep-0384.html) | OMEMO Encryption | ✅ | Legacy v0.3 and OMEMO 2 (`urn:xmpp:omemo:2`) on one identity; chats use legacy OMEMO by default, OMEMO 2 (experimental) or the version the contact supports when chosen per chat |
 | [0386](https://xmpp.org/extensions/xep-0386.html) | Bind 2 | ✅ | Resource bound at login; a session to resume is resumed instead |
 | [0388](https://xmpp.org/extensions/xep-0388.html) | Extensible SASL Profile (SASL2) | ✅ | SCRAM-SHA-256-PLUS with `tls-exporter` where offered; the server's signature is checked |
 | [0392](https://xmpp.org/extensions/xep-0392.html) | Consistent Color Generation | ✅ | Nick colours by the XEP's HSLuv algorithm, lighter on a dark theme; no switch to turn them off |
