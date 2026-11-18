@@ -492,13 +492,14 @@ pub async fn refresh(shared: &Shared, net: &Net, jid: &str) {
     }
 }
 
-/// OMEMO version for a message to `jid` in chat mode `mode`: OMEMO 2 when any of the contact's
-/// devices has it, else legacy; "omemo2" / "omemo-legacy" allow only that one. `None`: no devices.
+/// OMEMO version for a message to `jid` in chat mode `mode`. "auto": OMEMO 2 when any of the
+/// contact's devices has it, else legacy; "omemo2": only OMEMO 2; any other mode (the default "",
+/// "omemo-legacy" and the former "omemo"): only legacy. `None`: no devices.
 pub async fn pick(shared: &Shared, net: &Net, jid: &str, mode: &str) -> Option<Proto> {
     let allowed: &[Proto] = match mode {
+        "auto" => &[Proto::V2, Proto::Legacy],
         "omemo2" => &[Proto::V2],
-        "omemo-legacy" => &[Proto::Legacy],
-        _ => &[Proto::V2, Proto::Legacy],
+        _ => &[Proto::Legacy],
     };
     for &p in allowed {
         if !device_list(shared, net, jid, p).await.is_empty() {

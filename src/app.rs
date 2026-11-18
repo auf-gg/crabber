@@ -1930,7 +1930,7 @@ impl App {
         cx.notify();
     }
 
-    /// "auto" | "omemo" | "omemo2" | "omemo-legacy" | "plain" (| "pgp")
+    /// "auto" | "omemo2" | "omemo-legacy" | "plain" (| "pgp")
     pub fn set_chat_enc(&mut self, peer: &str, mode: &str, cx: &mut Context<Self>) {
         let Some(sess) = self.sess.as_mut() else { return };
         if let Some(c) = sess.chat_mut(peer) {
