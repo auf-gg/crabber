@@ -2456,7 +2456,8 @@ impl App {
                         .justify_center()
                         .when(active, |d| d.child(div().size(dp(8.)).rounded_full().bg(pal.accent))),
                 )
-                .child(v_flex().flex_1().child(div().text_sm().font_weight(FontWeight::MEDIUM).child(title)).child(div().text_xs().text_color(t.muted_foreground).child(desc)))
+                // min_w_0: without it the column takes its text's full width and the description doesn't wrap.
+                .child(v_flex().flex_1().min_w_0().child(div().text_sm().font_weight(FontWeight::MEDIUM).child(title)).child(div().text_xs().text_color(t.muted_foreground).child(desc)))
                 .on_click(cx.listener(move |this, _, _, cx| this.set_chat_enc(&p, value, cx)))
         };
         let body = v_flex()
