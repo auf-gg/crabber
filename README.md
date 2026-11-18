@@ -5,12 +5,12 @@
 # Crabber
 
 **A fast, GPU-accelerated XMPP messenger written in Rust.**
-Encrypted chats, voice and video calls, screen sharing — on Linux and Windows.
+Encrypted chats, voice and video calls, screen sharing — on Linux, Windows and macOS.
 
 [![Release](https://img.shields.io/github/v/release/auf-gg/crabber?color=orange)](https://github.com/auf-gg/crabber/releases/latest)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 ![Rust](https://img.shields.io/badge/Rust-2024-b7410e?logo=rust&logoColor=white)
-![Platforms](https://img.shields.io/badge/Linux%20%7C%20Windows-blue)
+![Platforms](https://img.shields.io/badge/Linux%20%7C%20Windows%20%7C%20macOS-blue)
 [![AUR](https://img.shields.io/aur/version/crabber-bin?logo=archlinux&logoColor=white)](https://aur.archlinux.org/packages/crabber-bin)
 
 [Features](#features) · [Installation](#installation) · [XEP support](#xep-support) · [Building](#building-from-source)
@@ -73,8 +73,8 @@ The chats in the screenshots come from the [test server](tests/xmpp_server/READM
 - Voice and video calls over WebRTC (Jingle), ringing on all your devices
 - Screen sharing of a chosen monitor or window, up to its full resolution, with system audio
   (other apps only, never the call itself); the computer stays awake during a call. Video needs
-  ffmpeg on PATH; capture goes through the desktop portal and PipeWire on Wayland and
-  Windows.Graphics.Capture on Windows
+  ffmpeg on PATH; capture goes through the desktop portal and PipeWire on Wayland,
+  Windows.Graphics.Capture on Windows and ScreenCaptureKit with the system picker on macOS 14+
 - Group audio calls in rooms: everyone in the room sees the call going on and can join
 - Microphone, speaker and camera chosen in settings, switched on the fly during a call
 - Noise suppression for the microphone ([nnnoiseless](https://github.com/jneem/nnnoiseless), RNNoise in Rust)
@@ -85,7 +85,8 @@ The chats in the screenshots come from the [test server](tests/xmpp_server/READM
 - Light/dark themes following the system, color schemes with a custom color editor,
   and Material You colors on Linux from [matugen](https://github.com/InioX/matugen) or
   [dux-shell](https://github.com/duxlabs-dev/dux-shell)
-- Linux (X11/Wayland, Vulkan) and Windows (x64/ARM64)
+- Linux (X11/Wayland, Vulkan), Windows (x64/ARM64) and macOS 13+ (Apple silicon and Intel;
+  no tray icon or notifications there yet)
 
 ## XEP support
 
@@ -195,6 +196,10 @@ Grab them from [GitHub Releases](https://github.com/auf-gg/crabber/releases):
 - **Linux** — `.deb` (Debian, Ubuntu), `.rpm` (Fedora, openSUSE) or a `tar.gz` archive
   (x86_64 and aarch64) with an `install.sh` script that installs the app to `~/.local`
   for the current user
+- **macOS** — `.dmg` (Apple silicon `aarch64` and Intel `x86_64`): drag Crabber to Applications.
+  The app is not notarized, so macOS refuses the first start; allow it in System Settings →
+  Privacy & Security → Open Anyway, or run `xattr -dr com.apple.quarantine /Applications/Crabber.app`.
+  Video calls and screen sharing need ffmpeg: `brew install ffmpeg`
 
 On Linux, emoji are drawn with Noto Color Emoji when it is installed (`noto-fonts-emoji` on Arch,
 `fonts-noto-color-emoji` on Debian/Ubuntu); the AUR packages depend on it.
@@ -214,7 +219,8 @@ sudo apt install pkg-config clang cmake libxkbcommon-dev libxkbcommon-x11-dev li
 Colour emojis need the Noto Color Emoji font (`fonts-noto-color-emoji` on Debian/Ubuntu).
 gpui's Linux text rendering is patched for it, see [`docs/patched-dependencies.md`](docs/patched-dependencies.md).
 
-On Windows install the Visual Studio Build Tools (MSVC) and CMake, then on either platform:
+On Windows install the Visual Studio Build Tools (MSVC) and CMake, on macOS Xcode (its Metal
+compiler builds gpui's shaders) and CMake (`brew install cmake`), then on any platform:
 
 ```sh
 cargo build --release
@@ -229,6 +235,8 @@ The [`dist/`](dist) directory holds packaging templates:
 - [`PKGBUILD-git`](dist/PKGBUILD-git) — AUR `crabber-git`, compiled from source
 - [`PKGBUILD-bin`](dist/PKGBUILD-bin) — AUR `crabber-bin`, installed from release binaries
 - [`windows/installer.nsi`](dist/windows/installer.nsi) — NSIS installer script
+- [`macos/Info.plist`](dist/macos/Info.plist) and [`macos/crabber.icns`](dist/macos/crabber.icns) —
+  the `Crabber.app` bundle inside the `.dmg`
 - [`linux/crabber.desktop`](dist/linux/crabber.desktop) — desktop entry shared by the `.deb` and `.rpm`
   (their metadata is in [`Cargo.toml`](Cargo.toml))
 

@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Crabber.app; build.yml fills in @VERSION@. -->
+<plist version="1.0">
+<dict>
+	<key>CFBundleName</key>
+	<string>Crabber</string>
+	<key>CFBundleDisplayName</key>
+	<string>Crabber</string>
+	<key>CFBundleIdentifier</key>
+	<string>gg.auf.crabber</string>
+	<key>CFBundleExecutable</key>
+	<string>crabber</string>
+	<key>CFBundleIconFile</key>
+	<string>crabber</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>@VERSION@</string>
+	<key>CFBundleVersion</key>
+	<string>@VERSION@</string>
+	<key>LSApplicationCategoryType</key>
+	<string>public.app-category.social-networking</string>
+	<!-- ScreenCaptureKit audio; the screen picker needs macOS 14. -->
+	<key>LSMinimumSystemVersion</key>
+	<string>13.0</string>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Crabber uses the microphone for calls and voice messages.</string>
+	<key>NSCameraUsageDescription</key>
+	<string>Crabber uses the camera for video calls.</string>
+</dict>
+</plist>

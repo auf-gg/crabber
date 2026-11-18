@@ -1,6 +1,7 @@
 # Build artifacts for all platforms:
 #   Linux  x86_64 / aarch64 — tar.gz (binary, .desktop, icon, install.sh), .deb and .rpm
 #   Windows x86_64 / aarch64 — portable .zip + NSIS installer setup.exe
+#   macOS   aarch64 / x86_64 — .dmg with Crabber.app (ad-hoc signed, not notarized)
 # Runs on v* tags and manual dispatch only; a tag additionally creates a GitHub Release.
 
 name: Build
@@ -39,6 +40,14 @@ jobs:
             target: aarch64-pc-windows-msvc
             platform: windows
             arch: aarch64
+          - os: macos-15
+            target: aarch64-apple-darwin
+            platform: macos
+            arch: aarch64
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            platform: macos
+            arch: x86_64
     steps:
       - uses: actions/checkout@v4
 
@@ -154,6 +163,27 @@ jobs:
             "-DLICENSEFILE=$(Join-Path $PWD 'LICENSE')" `
             dist/windows/installer.nsi
 
+      - name: Package .dmg (macOS)
+        if: matrix.platform == 'macos'
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n1)"
+          app=dmg/Crabber.app
+          mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
+          cp target/release/crabber "$app/Contents/MacOS/"
+          cp dist/macos/crabber.icns "$app/Contents/Resources/"
+          sed "s/@VERSION@/${version}/g" dist/macos/Info.plist > "$app/Contents/Info.plist"
+          plutil -lint "$app/Contents/Info.plist"
+          # Ad-hoc: it seals Info.plist, whose usage strings the camera and microphone prompts need.
+          codesign --force --deep --sign - "$app"
+          ln -s /Applications dmg/Applications
+          # hdiutil now and then fails with "Resource busy" on the runners.
+          for attempt in 1 2 3; do
+            hdiutil create -volname Crabber -srcfolder dmg -ov -format UDZO "crabber-${version}-${{ matrix.arch }}-macos.dmg" && break
+            [ "$attempt" = 3 ] && exit 1
+            sleep 10
+          done
+
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -164,6 +194,7 @@ jobs:
             crabber-*-linux.rpm
             crabber-*-windows-portable.zip
             crabber-*-setup.exe
+            crabber-*-macos.dmg
           if-no-files-found: error
 
   release:
